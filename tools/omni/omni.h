@@ -267,6 +267,9 @@ struct omni_context {
     std::string omni_assistant_prompt = "";
     std::string audio_voice_clone_prompt = "";
     std::string audio_assistant_prompt = "";
+    
+    // 语言设置 (用于 prompt 生成)
+    std::string language = "zh";
 
     // text streaming queue for server
     std::mutex text_mtx;
@@ -340,7 +343,8 @@ struct omni_context {
     
     // 🔧 [Python Token2Wav] 使用 Python stepaudio2 库实现的 Token2Wav
     // 设置为 true 时使用 Python 实现（精度更高），false 时使用 C++ 实现
-    bool use_python_token2wav = true;
+    // macOS 上默认使用 C++ 实现（无 CUDA）
+    bool use_python_token2wav = false;
     std::string python_t2w_script_dir;  // Python Token2Wav 脚本目录
     std::string python_t2w_model_dir;   // Python Token2Wav 模型目录
     

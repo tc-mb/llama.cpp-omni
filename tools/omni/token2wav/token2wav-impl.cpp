@@ -2743,7 +2743,10 @@ ggml_tensor * ueMaskUtils::make_pad_mask(ggml_context * ctx, ggml_tensor * lengt
     ggml_tensor * len_minus_i_tb = ggml_sub(ctx, lengths_tb, seq_range_tb);
     ggml_tensor * valid_f32_tb   = ggml_step(ctx, len_minus_i_tb);
     ggml_tensor * one_f32    = ggml_arange(ctx, 1.0f, 2.0f, 1.0f);
-    ggml_tensor * pad_f32_tb = ggml_add1(ctx, ggml_neg(ctx, valid_f32_tb), one_f32);
+    // 🔧 用 ggml_add + ggml_repeat 替代 ggml_add1，支持 Metal 加速
+    ggml_tensor * neg_valid  = ggml_neg(ctx, valid_f32_tb);
+    ggml_tensor * one_rep    = ggml_repeat(ctx, one_f32, neg_valid);
+    ggml_tensor * pad_f32_tb = ggml_add(ctx, neg_valid, one_rep);
     ggml_tensor * mask_i32_tb = ggml_cast(ctx, pad_f32_tb, GGML_TYPE_I32);
     return ggml_reshape_2d(ctx, mask_i32_tb, max_len, B);
 }
@@ -3450,7 +3453,10 @@ ggml_tensor * ueMultiHeadedAttention::build_forward_attention(ggml_context * ctx
     if (mask != nullptr) {
         ggml_tensor * valid_bh      = ue_mha_prepare_valid_mask_bh(ctx, mask, T_k, T_q, B, (int) H);
         ggml_tensor * one_f32       = ggml_arange(ctx, 1.0f, 2.0f, 1.0f);
-        ggml_tensor * masked_bh     = ggml_add1(ctx, ggml_neg(ctx, valid_bh), one_f32);
+        // 🔧 用 ggml_add + ggml_repeat 替代 ggml_add1，支持 Metal 加速
+        ggml_tensor * neg_valid     = ggml_neg(ctx, valid_bh);
+        ggml_tensor * one_rep       = ggml_repeat(ctx, one_f32, neg_valid);
+        ggml_tensor * masked_bh     = ggml_add(ctx, neg_valid, one_rep);
         ggml_tensor * mask_add      = ggml_scale(ctx, masked_bh, -1e9f);
         ggml_tensor * scores_masked = ggml_add(ctx, scores_bh, mask_add);
         probs                       = ggml_soft_max(ctx, scores_masked);
@@ -4118,7 +4124,10 @@ ggml_tensor * ue_uce_make_valid_mask(ggml_context * ctx, ggml_tensor * lengths_b
     ggml_tensor * pad_f32_tb =
         (pad_i32_tb->type == GGML_TYPE_F32) ? pad_i32_tb : ggml_cast(ctx, pad_i32_tb, GGML_TYPE_F32);
     ggml_tensor * one_f32      = ggml_arange(ctx, 1.0f, 2.0f, 1.0f);
-    ggml_tensor * valid_f32_tb = ggml_add1(ctx, ggml_neg(ctx, pad_f32_tb), one_f32);
+    // 🔧 用 ggml_add + ggml_repeat 替代 ggml_add1，支持 Metal 加速
+    ggml_tensor * neg_pad      = ggml_neg(ctx, pad_f32_tb);
+    ggml_tensor * one_rep      = ggml_repeat(ctx, one_f32, neg_pad);
+    ggml_tensor * valid_f32_tb = ggml_add(ctx, neg_pad, one_rep);
     return ggml_cont(ctx, valid_f32_tb);
 }
 // 从张量中切片
@@ -4711,7 +4720,9 @@ ggml_tensor * hg2_f0_predictor::hg_f0_predictor_build_graph(ggml_context * ctx, 
         return nullptr;
     }
     ggml_tensor * bias_s = ggml_reshape_4d(ctx, linear_bias, 1, 1, 1, 1);
-    y_tb                 = ggml_add1(ctx, y_tb, bias_s);
+    // 🔧 用 ggml_add + ggml_repeat 替代 ggml_add1，支持 Metal 加速
+    ggml_tensor * bias_rep = ggml_repeat(ctx, bias_s, y_tb);
+    y_tb                 = ggml_add(ctx, y_tb, bias_rep);
     y_tb                 = ggml_abs(ctx, y_tb);
     y_tb                 = ggml_cont(ctx, y_tb);
     ggml_set_name(y_tb, "hg2.f0_predictor.f0_tb");
@@ -5028,8 +5039,18 @@ bool hg2_hift_generator::build_graph_forward(ggml_context * ctx,
     f0_tb = ggml_cont(ctx, f0_tb);
     const int64_t Tm       = f0_tb->ne[0];
     const int64_t T_audio  = Tm * HG2_SAMPLES_PER_MEL;
-    ggml_tensor * f0_4d    = ggml_reshape_4d(ctx, f0_tb, Tm, 1, 1, B);
-    ggml_tensor * f0_up_4d = ggml_interpolate(ctx, f0_4d, T_audio, 1, 1, B, GGML_SCALE_MODE_NEAREST);
+    // 🔧 用 ggml_repeat 替代 ggml_interpolate，支持 Metal 加速
+    // NEAREST 上采样：每个值重复 HG2_SAMPLES_PER_MEL 次
+    // f0_tb: [Tm, B] -> reshape -> [1, Tm, 1, B] -> repeat -> [scale, Tm, 1, B]
+    // -> permute -> [Tm, scale, 1, B] -> reshape -> [Tm*scale, 1, 1, B]
+    const int64_t scale = HG2_SAMPLES_PER_MEL;
+    ggml_tensor * f0_1tb = ggml_reshape_4d(ctx, f0_tb, 1, Tm, 1, B);
+    f0_1tb = ggml_cont(ctx, f0_1tb);
+    ggml_tensor * f0_rep = ggml_repeat_4d(ctx, f0_1tb, scale, Tm, 1, B);
+    f0_rep = ggml_cont(ctx, f0_rep);
+    ggml_tensor * f0_perm = ggml_permute(ctx, f0_rep, 1, 0, 2, 3);  // [Tm, scale, 1, B]
+    f0_perm = ggml_cont(ctx, f0_perm);
+    ggml_tensor * f0_up_4d = ggml_reshape_4d(ctx, f0_perm, T_audio, 1, 1, B);
     f0_up_4d               = ggml_cont(ctx, f0_up_4d);
     ggml_tensor * f0_t1_b  = ggml_reshape_3d(ctx, f0_up_4d, T_audio, 1, B);
     f0_t1_b                = ggml_cont(ctx, f0_t1_b);
@@ -5782,8 +5803,17 @@ bool hg2_sine_gen2::hg_sine_gen2_build_graph(ggml_context * ctx,
     ggml_tensor * fn_tdb = ggml_mul(ctx, f0_tdb, hm_tdb);
     ggml_tensor * rad_tdb = ggml_scale(ctx, fn_tdb, 1.0f / float(HG2_SAMPLING_RATE));
     rad_tdb               = ggml_cont(ctx, rad_tdb);
-    ggml_tensor * rad_t1db    = ggml_reshape_4d(ctx, rad_tdb, T, 1, dim, B);
-    ggml_tensor * rad_dn_t1db = ggml_interpolate(ctx, rad_t1db, Tm, 1, dim, B, GGML_SCALE_MODE_BILINEAR);
+    // 🔧 用 reshape + view 替代 ggml_interpolate 下采样，支持 Metal 加速
+    // 下采样 [T, dim, B] -> [Tm, dim, B]，取每 scale 个中的第一个
+    const int64_t scale_ds = HG2_UPSAMPLE_SCALE;
+    // reshape [T, dim, B] -> [scale, Tm, dim, B]
+    ggml_tensor * rad_4d = ggml_reshape_4d(ctx, rad_tdb, scale_ds, Tm, dim, B);
+    rad_4d = ggml_cont(ctx, rad_4d);
+    // 取 scale 维度的第一个切片 [1, Tm, dim, B]
+    ggml_tensor * rad_dn_4d = ggml_view_4d(ctx, rad_4d, 1, Tm, dim, B,
+                                            rad_4d->nb[1], rad_4d->nb[2], rad_4d->nb[3], 0);
+    rad_dn_4d = ggml_cont(ctx, rad_dn_4d);
+    ggml_tensor * rad_dn_t1db = ggml_reshape_4d(ctx, rad_dn_4d, Tm, 1, dim, B);
     rad_dn_t1db               = ggml_cont(ctx, rad_dn_t1db);
     ggml_tensor * rad_dn_tdb = ggml_reshape_3d(ctx, rad_dn_t1db, Tm, dim, B);
     rad_dn_tdb               = ggml_cont(ctx, rad_dn_tdb);
@@ -5804,7 +5834,18 @@ bool hg2_sine_gen2::hg_sine_gen2_build_graph(ggml_context * ctx,
     phase_tdb = ggml_cont(ctx, phase_tdb);
     ggml_tensor * phase_t1db    = ggml_reshape_4d(ctx, phase_tdb, Tm, 1, dim, B);
     ggml_tensor * phase_scaled  = ggml_scale(ctx, phase_t1db, float(HG2_UPSAMPLE_SCALE));
-    ggml_tensor * phase_up_t1db = ggml_interpolate(ctx, phase_scaled, T, 1, dim, B, GGML_SCALE_MODE_BILINEAR);
+    // 🔧 用 ggml_repeat 替代 ggml_interpolate 上采样，支持 Metal 加速
+    // 上采样 [Tm, 1, dim, B] -> [T, 1, dim, B]，scale = HG2_UPSAMPLE_SCALE
+    // reshape [Tm, 1, dim, B] -> [1, Tm, dim, B] -> repeat -> [scale, Tm, dim, B]
+    // -> permute -> [Tm, scale, dim, B] -> reshape -> [T, 1, dim, B]
+    const int64_t scale_up = HG2_UPSAMPLE_SCALE;
+    ggml_tensor * phase_1tdb = ggml_permute(ctx, phase_scaled, 1, 0, 2, 3);  // [1, Tm, dim, B]
+    phase_1tdb = ggml_cont(ctx, phase_1tdb);
+    ggml_tensor * phase_rep = ggml_repeat_4d(ctx, phase_1tdb, scale_up, Tm, dim, B);
+    phase_rep = ggml_cont(ctx, phase_rep);
+    ggml_tensor * phase_perm = ggml_permute(ctx, phase_rep, 1, 0, 2, 3);  // [Tm, scale, dim, B]
+    phase_perm = ggml_cont(ctx, phase_perm);
+    ggml_tensor * phase_up_t1db = ggml_reshape_4d(ctx, phase_perm, T, 1, dim, B);
     phase_up_t1db               = ggml_cont(ctx, phase_up_t1db);
     ggml_tensor * phase_up_tdb  = ggml_reshape_3d(ctx, phase_up_t1db, T, dim, B);
     phase_up_tdb                = ggml_cont(ctx, phase_up_tdb);
@@ -5910,7 +5951,9 @@ bool hg2_source_nsf2::hg_source_nsf2_build_graph(ggml_context * ctx,
     ggml_tensor * mm   = ggml_mul_mat(ctx, sine_2d, w);
     ggml_tensor * y_tb = ggml_reshape_2d(ctx, mm, T, B);
     ggml_tensor * b_s = ggml_reshape_4d(ctx, linear_bias, 1, 1, 1, 1);
-    y_tb              = ggml_add1(ctx, y_tb, b_s);
+    // 🔧 用 ggml_add + ggml_repeat 替代 ggml_add1，支持 Metal 加速
+    ggml_tensor * b_rep = ggml_repeat(ctx, b_s, y_tb);
+    y_tb              = ggml_add(ctx, y_tb, b_rep);
     y_tb              = ggml_tanh(ctx, y_tb);
     y_tb              = ggml_cont(ctx, y_tb);
     ggml_tensor * sine_merge_t1_b = ggml_reshape_3d(ctx, y_tb, T, 1, B);

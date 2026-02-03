@@ -150,18 +150,31 @@ static void print_model_paths(const OmniModelPaths & paths) {
 }
 
 void test_case(struct omni_context *ctx_omni, common_params& params, std::string audio_path_prefix, int cnt){
+    // 🔧 单工模式：先 prefill 所有音频输入，然后 decode 一次生成完整回复
+    // 使用同步模式 prefill 所有音频，避免 async 模式下的竞态条件
+    ctx_omni->system_prompt_initialized = false;
+    bool orig_async = ctx_omni->async;
+    ctx_omni->async = false;  // 使用同步模式 prefill，确保所有音频被处理
+    
     for (int il = 0; il < cnt; ++il) {
         char idx_str[16];
         snprintf(idx_str, sizeof(idx_str), "%04d", il);  // 格式化为4位数字，如 0000, 0001
         std::string aud_fname = audio_path_prefix + idx_str + ".wav";
 
         auto t0 = std::chrono::high_resolution_clock::now();
-        stream_prefill(ctx_omni, aud_fname, "", il + 1);
+        // index 从 0 开始，第一次 prefill (index=0) 初始化系统 prompt
+        // 后续 prefill 在同步模式下直接添加到 KV cache
+        stream_prefill(ctx_omni, aud_fname, "", il);
         auto t1 = std::chrono::high_resolution_clock::now();
         std::chrono::duration<double> elapsed_seconds = t1 - t0;
         double dt = elapsed_seconds.count();
         std::cout << "prefill " << il << " : " << dt << " s"<< std::endl;
     }
+    
+    // 所有音频同步 prefill 完成后，恢复 async 模式并调用 decode
+    // 注意：同步 prefill 不会启动线程，需要用 async=true 的方式调用 decode
+    // stream_decode 内部会检查 async 并启动 TTS/T2W 线程
+    ctx_omni->async = orig_async;
     stream_decode(ctx_omni, "./");
 }
 
@@ -288,6 +301,7 @@ int main(int argc, char ** argv) {
     printf("  TTS bin dir: %s\n", tts_bin_dir.c_str());
     printf("  Ref audio: %s\n", ref_audio_path.c_str());
     
+    // 🔧 Token2Wav 使用 GPU（Metal），已用 ggml_add+ggml_repeat 替代不支持的 ggml_add1
     auto ctx_omni = omni_init(&params, 1, use_tts, tts_bin_dir, -1, "gpu:0");
     if (ctx_omni == nullptr) {
         fprintf(stderr, "Error: Failed to initialize omni context\n");
