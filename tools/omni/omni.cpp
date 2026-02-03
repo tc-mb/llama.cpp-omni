@@ -6689,7 +6689,9 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
                 // 🔧 发送 is_final=true 到 T2W 队列，通知 T2W 重置 buffer
                 // 注意：T2W 端只在双工模式下调用 Token2WavSession::reset()
                 // 单工模式下只重置 token_buffer 为静音 tokens，不调用 reset()
-                if (ctx_omni->t2w_thread_info && !all_audio_tokens.empty()) {
+                // 🔧 [修复最后一个字没说完] 移除 !all_audio_tokens.empty() 条件
+                // 原因：is_final=true 必须发送，否则 T2W 不会 flush 最后的 buffer
+                if (ctx_omni->t2w_thread_info) {
                     T2WOut *t2w_out = new T2WOut();
                     t2w_out->audio_tokens.clear();  // 空tokens，只是通知final
                     t2w_out->is_final = true;
