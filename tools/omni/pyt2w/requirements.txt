@@ -1,0 +1,37 @@
+# Token2Wav Python 服务依赖
+# 安装: pip install -r requirements.txt
+
+# PyTorch (需要 CUDA 版本，根据实际 CUDA 版本选择)
+# CUDA 11.8: pip install torch==2.3.1 torchaudio==2.3.1 --index-url https://download.pytorch.org/whl/cu118
+# CUDA 12.1: pip install torch==2.3.1 torchaudio==2.3.1 --index-url https://download.pytorch.org/whl/cu121
+torch==2.3.1
+torchaudio==2.3.1
+
+# 核心依赖 - stepaudio2 (包含 Token2Wav)
+stepaudio2-minicpmo==0.1.1
+
+# stepaudio2 的依赖 (通常会自动安装，这里显式指定版本)
+numpy==1.25.2
+librosa==0.9.0
+soundfile==0.12.1
+scipy==1.15.3
+diffusers==0.35.2
+HyperPyYAML==1.2.2
+s3tokenizer==0.2.0
+transformers==4.51.0
+
+# ONNX Runtime (GPU 版本加速，可选)
+onnxruntime-gpu==1.23.2
+
+# ============================================================
+# Token2Wav 模型文件已包含在 ./token2wav/ 目录下:
+#   ./token2wav/
+#   ├── campplus.onnx          # 27MB  - 说话人编码器
+#   ├── flow.pt                # 595MB - Flow 模型
+#   ├── flow.yaml              # 配置文件
+#   ├── hift.pt                # 80MB  - HiFi-GAN 声码器
+#   └── speech_tokenizer_v2_25hz.onnx  # 474MB - 语音分词器
+#
+# C++ 代码默认从 ./tools/omni/t2w/token2wav/ 相对路径加载
+# 也可通过 --token2wav-dir 参数覆盖指定
+# ============================================================

@@ -1,0 +1,50 @@
+TTS 模块:
+MiniCPMTTS(
+  (emb_text): Embedding(152064, 768)
+  (model): LlamaModel(
+    (embed_tokens): Embedding(32000, 768)
+    (layers): ModuleList(
+      (0-19): 20 x LlamaDecoderLayer(
+        (self_attn): LlamaAttention(
+          (q_proj): Linear(in_features=768, out_features=768, bias=False)
+          (k_proj): Linear(in_features=768, out_features=768, bias=False)
+          (v_proj): Linear(in_features=768, out_features=768, bias=False)
+          (o_proj): Linear(in_features=768, out_features=768, bias=False)
+        )
+        (mlp): LlamaMLP(
+          (gate_proj): Linear(in_features=768, out_features=3072, bias=False)
+          (up_proj): Linear(in_features=768, out_features=3072, bias=False)
+          (down_proj): Linear(in_features=3072, out_features=768, bias=False)
+          (act_fn): SiLU()
+        )
+        (input_layernorm): LlamaRMSNorm((768,), eps=1e-06)
+        (post_attention_layernorm): LlamaRMSNorm((768,), eps=1e-06)
+      )
+    )
+    (norm): LlamaRMSNorm((768,), eps=1e-06)
+    (rotary_emb): LlamaRotaryEmbedding()
+  )
+  (projector_spk): MultiModalProjector(
+    (linear1): Linear(in_features=4096, out_features=768, bias=True)
+    (relu): ReLU()
+    (linear2): Linear(in_features=768, out_features=768, bias=True)
+  )
+  (projector_semantic): MultiModalProjector(
+    (linear1): Linear(in_features=4096, out_features=768, bias=True)
+    (relu): ReLU()
+    (linear2): Linear(in_features=768, out_features=768, bias=True)
+  )
+  (emb_code): ModuleList(
+    (0): Embedding(6562, 768)
+  )
+  (head_code): ModuleList(
+    (0): ParametrizedLinear(
+      in_features=768, out_features=6562, bias=False
+      (parametrizations): ModuleDict(
+        (weight): ParametrizationList(
+          (0): _WeightNorm()
+        )
+      )
+    )
+  )
+)

@@ -1,0 +1,192 @@
+MiniCPMO(
+  (llm): Qwen3ForCausalLM(
+    (model): Qwen3Model(
+      (embed_tokens): Embedding(151748, 4096)
+      (layers): ModuleList(
+        (0-35): 36 x Qwen3DecoderLayer(
+          (self_attn): Qwen3Attention(
+            (q_proj): Linear(in_features=4096, out_features=4096, bias=False)
+            (k_proj): Linear(in_features=4096, out_features=1024, bias=False)
+            (v_proj): Linear(in_features=4096, out_features=1024, bias=False)
+            (o_proj): Linear(in_features=4096, out_features=4096, bias=False)
+            (q_norm): Qwen3RMSNorm((128,), eps=1e-06)
+            (k_norm): Qwen3RMSNorm((128,), eps=1e-06)
+          )
+          (mlp): Qwen3MLP(
+            (gate_proj): Linear(in_features=4096, out_features=12288, bias=False)
+            (up_proj): Linear(in_features=4096, out_features=12288, bias=False)
+            (down_proj): Linear(in_features=12288, out_features=4096, bias=False)
+            (act_fn): SiLU()
+          )
+          (input_layernorm): Qwen3RMSNorm((4096,), eps=1e-06)
+          (post_attention_layernorm): Qwen3RMSNorm((4096,), eps=1e-06)
+        )
+      )
+      (norm): Qwen3RMSNorm((4096,), eps=1e-06)
+      (rotary_emb): Qwen3RotaryEmbedding()
+    )
+    (lm_head): Linear(in_features=4096, out_features=151748, bias=False)
+  )
+  (vpm): SiglipVisionTransformer(
+    (embeddings): SiglipVisionEmbeddings(
+      (patch_embedding): Conv2d(3, 1152, kernel_size=(14, 14), stride=(14, 14), padding=valid)
+      (position_embedding): Embedding(4900, 1152)
+    )
+    (encoder): SiglipEncoder(
+      (layers): ModuleList(
+        (0-25): 26 x SiglipEncoderLayer(
+          (self_attn): SiglipAttention(
+            (k_proj): Linear(in_features=1152, out_features=1152, bias=True)
+            (v_proj): Linear(in_features=1152, out_features=1152, bias=True)
+            (q_proj): Linear(in_features=1152, out_features=1152, bias=True)
+            (out_proj): Linear(in_features=1152, out_features=1152, bias=True)
+          )
+          (layer_norm1): LayerNorm((1152,), eps=1e-06, elementwise_affine=True)
+          (mlp): SiglipMLP(
+            (activation_fn): PytorchGELUTanh()
+            (fc1): Linear(in_features=1152, out_features=4304, bias=True)
+            (fc2): Linear(in_features=4304, out_features=1152, bias=True)
+          )
+          (layer_norm2): LayerNorm((1152,), eps=1e-06, elementwise_affine=True)
+        )
+      )
+    )
+    (post_layernorm): LayerNorm((1152,), eps=1e-06, elementwise_affine=True)
+  )
+  (apm): MiniCPMWhisperEncoder(
+    (conv1): Conv1d(80, 1024, kernel_size=(3,), stride=(1,), padding=(1,))
+    (conv2): Conv1d(1024, 1024, kernel_size=(3,), stride=(2,), padding=(1,))
+    (embed_positions): Embedding(1500, 1024)
+    (layers): ModuleList(
+      (0-23): 24 x MiniCPMWhisperEncoderLayer(
+        (self_attn): WhisperAttention(
+          (k_proj): Linear(in_features=1024, out_features=1024, bias=False)
+          (v_proj): Linear(in_features=1024, out_features=1024, bias=True)
+          (q_proj): Linear(in_features=1024, out_features=1024, bias=True)
+          (out_proj): Linear(in_features=1024, out_features=1024, bias=True)
+        )
+        (self_attn_layer_norm): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+        (activation_fn): GELUActivation()
+        (fc1): Linear(in_features=1024, out_features=4096, bias=True)
+        (fc2): Linear(in_features=4096, out_features=1024, bias=True)
+        (final_layer_norm): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+      )
+    )
+    (layer_norm): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+  )
+  (tts): MiniCPMTTS(
+    (emb_text): Embedding(152064, 768)
+    (model): LlamaModel(
+      (embed_tokens): Embedding(32000, 768)
+      (layers): ModuleList(
+        (0-19): 20 x LlamaDecoderLayer(
+          (self_attn): LlamaAttention(
+            (q_proj): Linear(in_features=768, out_features=768, bias=False)
+            (k_proj): Linear(in_features=768, out_features=768, bias=False)
+            (v_proj): Linear(in_features=768, out_features=768, bias=False)
+            (o_proj): Linear(in_features=768, out_features=768, bias=False)
+          )
+          (mlp): LlamaMLP(
+            (gate_proj): Linear(in_features=768, out_features=3072, bias=False)
+            (up_proj): Linear(in_features=768, out_features=3072, bias=False)
+            (down_proj): Linear(in_features=3072, out_features=768, bias=False)
+            (act_fn): SiLU()
+          )
+          (input_layernorm): LlamaRMSNorm((768,), eps=1e-06)
+          (post_attention_layernorm): LlamaRMSNorm((768,), eps=1e-06)
+        )
+      )
+      (norm): LlamaRMSNorm((768,), eps=1e-06)
+      (rotary_emb): LlamaRotaryEmbedding()
+    )
+    (projector_spk): MultiModalProjector(
+      (linear1): Linear(in_features=4096, out_features=768, bias=True)
+      (relu): ReLU()
+      (linear2): Linear(in_features=768, out_features=768, bias=True)
+    )
+    (projector_semantic): MultiModalProjector(
+      (linear1): Linear(in_features=4096, out_features=768, bias=True)
+      (relu): ReLU()
+      (linear2): Linear(in_features=768, out_features=768, bias=True)
+    )
+    (emb_code): ModuleList(
+      (0): Embedding(6562, 768)
+    )
+    (head_code): ModuleList(
+      (0): ParametrizedLinear(
+        in_features=768, out_features=6562, bias=False
+        (parametrizations): ModuleDict(
+          (weight): ParametrizationList(
+            (0): _WeightNorm()
+          )
+        )
+      )
+    )
+  )
+  (resampler): Resampler(
+    (kv_proj): Linear(in_features=1152, out_features=4096, bias=False)
+    (attn): MultiheadAttention(
+      (out_proj): Linear(in_features=4096, out_features=4096, bias=True)
+    )
+    (ln_q): LayerNorm((4096,), eps=1e-06, elementwise_affine=True)
+    (ln_kv): LayerNorm((4096,), eps=1e-06, elementwise_affine=True)
+    (ln_post): LayerNorm((4096,), eps=1e-06, elementwise_affine=True)
+  )
+  (audio_avg_pooler): AvgPool1d(kernel_size=(5,), stride=(5,), padding=(0,))
+  (audio_projection_layer): MultiModalProjector(
+    (linear1): Linear(in_features=1024, out_features=4096, bias=True)
+    (relu): ReLU()
+    (linear2): Linear(in_features=4096, out_features=4096, bias=True)
+  )
+)
+
+TTS 模块:
+MiniCPMTTS(
+  (emb_text): Embedding(152064, 768)
+  (model): LlamaModel(
+    (embed_tokens): Embedding(32000, 768)
+    (layers): ModuleList(
+      (0-19): 20 x LlamaDecoderLayer(
+        (self_attn): LlamaAttention(
+          (q_proj): Linear(in_features=768, out_features=768, bias=False)
+          (k_proj): Linear(in_features=768, out_features=768, bias=False)
+          (v_proj): Linear(in_features=768, out_features=768, bias=False)
+          (o_proj): Linear(in_features=768, out_features=768, bias=False)
+        )
+        (mlp): LlamaMLP(
+          (gate_proj): Linear(in_features=768, out_features=3072, bias=False)
+          (up_proj): Linear(in_features=768, out_features=3072, bias=False)
+          (down_proj): Linear(in_features=3072, out_features=768, bias=False)
+          (act_fn): SiLU()
+        )
+        (input_layernorm): LlamaRMSNorm((768,), eps=1e-06)
+        (post_attention_layernorm): LlamaRMSNorm((768,), eps=1e-06)
+      )
+    )
+    (norm): LlamaRMSNorm((768,), eps=1e-06)
+    (rotary_emb): LlamaRotaryEmbedding()
+  )
+  (projector_spk): MultiModalProjector(
+    (linear1): Linear(in_features=4096, out_features=768, bias=True)
+    (relu): ReLU()
+    (linear2): Linear(in_features=768, out_features=768, bias=True)
+  )
+  (projector_semantic): MultiModalProjector(
+    (linear1): Linear(in_features=4096, out_features=768, bias=True)
+    (relu): ReLU()
+    (linear2): Linear(in_features=768, out_features=768, bias=True)
+  )
+  (emb_code): ModuleList(
+    (0): Embedding(6562, 768)
+  )
+  (head_code): ModuleList(
+    (0): ParametrizedLinear(
+      in_features=768, out_features=6562, bias=False
+      (parametrizations): ModuleDict(
+        (weight): ParametrizationList(
+          (0): _WeightNorm()
+        )
+      )
+    )
+  )
+)
