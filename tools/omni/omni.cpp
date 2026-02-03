@@ -3572,20 +3572,14 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
         }
         print_with_timestamp("TTS: weights loaded successfully\n");
         
-        // Load Projector Semantic from GGUF file (精度验证版本)
-        // projector.gguf 放在 tts_bin_dir 的父目录 (gguf根目录)
-        std::string gguf_root_dir = tts_bin_dir;
-        size_t last_slash = gguf_root_dir.find_last_of('/');
-        if (last_slash != std::string::npos) {
-            gguf_root_dir = gguf_root_dir.substr(0, last_slash);
-        }
-        std::string projector_path = gguf_root_dir + "/projector.gguf";
+        // Load Projector Semantic from GGUF file
+        // 路径: {tts_bin_dir}/MiniCPM-o-4_5-projector-F16.gguf
+        std::string projector_path = tts_bin_dir + "/MiniCPM-o-4_5-projector-F16.gguf";
         print_with_timestamp("Projector: loading from %s\n", projector_path.c_str());
         if (projector_init(ctx_omni->projector, projector_path, true)) {
-            print_with_timestamp("Projector: loaded successfully (using ggml backend)\n");
+            print_with_timestamp("Projector: loaded successfully\n");
         } else {
-            // 不返回错误，将使用 legacy float* 实现作为 fallback
-            print_with_timestamp("Projector: failed to load from GGUF, will use fallback implementation\n");
+            print_with_timestamp("Projector: failed to load, will use fallback implementation\n");
         }
     }
 
@@ -3745,22 +3739,22 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
         // ==================== 初始化 Python Token2Wav ====================
         // 🔧 默认使用 Python Token2Wav（精度更高）
         // 设置 Python T2W 脚本目录和模型目录
-        // Python T2W 脚本目录：tools/omni/t2w/
+        // Python T2W 脚本目录：tools/omni/pyt2w/
         // Python T2W 模型目录：dependencies/token2wav/
         
         // 计算 Python T2W 脚本目录（相对于 tts_bin_dir）
         // tts_bin_dir 通常是 /xxx/tools/omni/convert/gguf/token2wav-gguf
-        // 我们需要 /xxx/tools/omni/t2w
+        // 我们需要 /xxx/tools/omni/pyt2w
         std::string t2w_script_dir = tts_bin_dir;  // /xxx/tools/omni/convert/gguf/token2wav-gguf
         // 回退到 tools/omni/
-        size_t convert_pos = t2w_script_dir.find("/convert/gguf/token2wav-gguf");
+        size_t convert_pos = t2w_script_dir.find("/convert/gguf/tts");
         if (convert_pos != std::string::npos) {
-            t2w_script_dir = t2w_script_dir.substr(0, convert_pos) + "/t2w";
+            t2w_script_dir = t2w_script_dir.substr(0, convert_pos) + "/pyt2w";
         } else if ((convert_pos = t2w_script_dir.find("/convert/gguf")) != std::string::npos) {
-            t2w_script_dir = t2w_script_dir.substr(0, convert_pos) + "/t2w";
+            t2w_script_dir = t2w_script_dir.substr(0, convert_pos) + "/pyt2w";
         } else {
             // 尝试从当前工作目录构建
-            t2w_script_dir = "./tools/omni/t2w";
+            t2w_script_dir = "./tools/omni/pyt2w";
         }
         ctx_omni->python_t2w_script_dir = t2w_script_dir;
         
@@ -4009,6 +4003,49 @@ void omni_free(struct omni_context * ctx_omni) {
     llama_backend_free();
 
     delete ctx_omni;
+}
+
+// ==================== 语言设置函数 ====================
+// 设置语言并更新 system prompt（zh=中文，en=英文）
+// 基于 Python MiniCPM-o-4_5 modeling_minicpmo.py 中的 audio_assistant 模式 prompt
+void omni_set_language(struct omni_context * ctx_omni, const std::string & lang) {
+    if (ctx_omni == nullptr) {
+        print_with_timestamp("omni_set_language: ctx_omni is null\n");
+        return;
+    }
+    
+    ctx_omni->language = lang;
+    print_with_timestamp("omni_set_language: setting language to '%s'\n", lang.c_str());
+    
+    if (ctx_omni->duplex_mode) {
+        // 双工模式：prompt 固定使用英文（与 Python 对齐）
+        ctx_omni->audio_voice_clone_prompt = "<|im_start|>system\nStreaming Duplex Conversation! You are a helpful assistant.\n<|audio_start|>";
+        ctx_omni->audio_assistant_prompt = "<|audio_end|><|im_end|>\n";
+        ctx_omni->omni_voice_clone_prompt = "<|im_start|>system\nStreaming Duplex Conversation! You are a helpful assistant.\n<|audio_start|>";
+        ctx_omni->omni_assistant_prompt = "<|audio_end|><|im_end|>\n";
+    } else {
+        // 非双工模式（audio_assistant 模式）：根据语言设置 prompt
+        if (lang == "en") {
+            // 英文 prompt（来自 Python modeling_minicpmo.py）
+            ctx_omni->audio_voice_clone_prompt = "<|im_start|>system\nClone the voice in the provided audio prompt.\n<|audio_start|>";
+            ctx_omni->audio_assistant_prompt = "<|audio_end|>Please assist users while maintaining this voice style. Please answer the user's questions seriously and in a high quality. Please chat with the user in a highly human-like and oral style. You are a helpful assistant developed by ModelBest: MiniCPM-Omni.<|im_end|>\n<|im_start|>user\n";
+            
+            ctx_omni->omni_voice_clone_prompt = "<|im_start|>system\nClone the voice in the provided audio prompt.\n<|audio_start|>";
+            ctx_omni->omni_assistant_prompt = "<|audio_end|>Please assist users while maintaining this voice style. Please answer the user's questions seriously and in a high quality. Please chat with the user in a highly human-like and oral style.<|im_end|>\n<|im_start|>user\n";
+        } else {
+            // 中文 prompt（默认，来自 Python modeling_minicpmo.py）
+            ctx_omni->audio_voice_clone_prompt = "<|im_start|>system\n模仿音频样本的音色并生成新的内容。\n<|audio_start|>";
+            ctx_omni->audio_assistant_prompt = "<|audio_end|>你的任务是用这种声音模式来当一个助手。请认真、高质量地回复用户的问题。请用高自然度的方式和用户聊天。你是由面壁智能开发的人工智能助手：面壁小钢炮。<|im_end|>\n<|im_start|>user\n";
+            
+            ctx_omni->omni_voice_clone_prompt = "<|im_start|>system\n模仿音频样本的音色并生成新的内容。\n<|audio_start|>";
+            ctx_omni->omni_assistant_prompt = "<|audio_end|>你的任务是用这种声音模式来当一个助手。请认真、高质量地回复用户的问题。请用高自然度的方式和用户聊天。<|im_end|>\n<|im_start|>user\n";
+        }
+    }
+    
+    // 🔧 [关键] 重置 system_prompt_initialized，让下次 stream_prefill(index=0) 重新 prefill system prompt
+    ctx_omni->system_prompt_initialized = false;
+    
+    print_with_timestamp("omni_set_language: prompts updated for language '%s', system_prompt_initialized reset to false\n", lang.c_str());
 }
 
 static void process_audio(struct omni_context * ctx_omni, struct omni_embed * embeds, common_params * params, bool save_spk_emb=false) {
@@ -8394,8 +8431,10 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
             // Python: sys_msgs = {"role": "system", "content": [vc_prompt_prefix, ref_audio, vc_prompt_suffix]}
             // 格式: <|im_start|>system\n{vc_prompt_prefix}\n<|audio_start|>[ref_audio_embed]<|audio_end|>{vc_prompt_suffix}<|im_end|>\n
             
-            // 确定 ref_audio 路径：使用 haitian_ref_audio（音色文件在 convert/gguf 目录下）
-            std::string system_ref_audio = ctx_omni->token2wav_model_dir + "/../haitian_ref_audio.wav";
+            // 确定 ref_audio 路径：优先使用配置的路径，否则使用默认路径
+            std::string system_ref_audio = ctx_omni->ref_audio_path.empty() 
+                ? "tools/omni/assets/default_ref_audio.wav" 
+                : ctx_omni->ref_audio_path;
             print_with_timestamp("system prompt ref_audio: %s\n", system_ref_audio.c_str());
             
             // Step 1: 评估 prefix (voice_clone_prompt，包含 <|audio_start|>)

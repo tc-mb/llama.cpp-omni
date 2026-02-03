@@ -248,6 +248,7 @@ struct omni_context {
     int media_type = 0;
     int use_tts = false;
     std::string tts_bin_dir = "";
+    std::string ref_audio_path = "";  // 参考音频路径（用于音色克隆）
     
     // 🔧 [高清/高刷模式] 
     // high_image: 高清模式，max_slice_nums 设置为 2，vision 可以看到更多细节
