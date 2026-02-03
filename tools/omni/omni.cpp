@@ -3637,7 +3637,7 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
         ctx_omni->t2w_thread_info = new T2WThreadInfo(25);  // Queue size of 10 chunks
         
         // Initialize C++ Token2Wav session
-        // Try to load token2wav GGUF models from tts_bin_dir (which should point to token2wav-gguf directory)
+        // Try to load token2wav GGUF models from tts_bin_dir, or fallback to tools/omni/token2wav-gguf
         ctx_omni->token2wav_model_dir = tts_bin_dir;
         ctx_omni->token2wav_initialized = false;
         
@@ -3646,6 +3646,16 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
         
         // Check if token2wav model files exist
         // File names match the actual GGUF files in token2wav-gguf directory
+        // 先检查 tts_bin_dir，如果不存在则尝试 tools/omni/token2wav-gguf
+        std::string encoder_test = ctx_omni->token2wav_model_dir + "/encoder.gguf";
+        {
+            std::ifstream f(encoder_test);
+            if (!f.good()) {
+                // 尝试备用路径
+                ctx_omni->token2wav_model_dir = "tools/omni/token2wav-gguf";
+                print_with_timestamp("Token2Wav: trying fallback path %s\n", ctx_omni->token2wav_model_dir.c_str());
+            }
+        }
         std::string encoder_gguf = ctx_omni->token2wav_model_dir + "/encoder.gguf";
         std::string flow_matching_gguf = ctx_omni->token2wav_model_dir + "/flow_matching.gguf";
         std::string flow_extra_gguf = ctx_omni->token2wav_model_dir + "/flow_extra.gguf";
@@ -3670,8 +3680,9 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
             
             // Device configuration - 使用 omni_init 传入的 token2wav_device 参数
             // 格式: "gpu", "gpu:0", "gpu:1", "cpu"
+            // 🔧 Token2Mel 用 GPU (Metal) 加速，Vocoder 用 CPU（因为 reshape/permute 开销太大）
             std::string device_token2mel = token2wav_device;
-            std::string device_vocoder = token2wav_device;
+            std::string device_vocoder = "cpu";  // Vocoder 强制用 CPU，避免 Metal 中大量小操作的开销
             
             // 🔧 优先使用 prompt_bundle (与测试音频一致)，否则使用 prompt_cache.gguf
             // 检查是否有 prompt_bundle_test1 目录（从测试音频生成的）
@@ -7483,8 +7494,8 @@ static bool start_python_t2w_service(struct omni_context * ctx_omni) {
             setenv("CUDA_VISIBLE_DEVICES", ctx_omni->python_t2w_gpu_id.c_str(), 1);
         }
         
-        // 执行 Python 脚本
-        execlp("python3", "python3", script_path.c_str(), (char*)NULL);
+        // 执行 Python 脚本 (使用 conda Python)
+        execlp("/Users/tianchi/software/miniconda3/bin/python", "python", script_path.c_str(), (char*)NULL);
         
         // 如果 execlp 失败
         _exit(1);
@@ -8690,6 +8701,23 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
     }
     
     if (ctx_omni->async){
+        // 🔧 确保线程已启动（如果 prefill 是同步模式执行的，线程可能还没启动）
+        if (!ctx_omni->tts_thread.joinable() && ctx_omni->use_tts) {
+            tts_thread_running = true;
+            if (ctx_omni->duplex_mode) {
+                ctx_omni->tts_thread = std::thread(tts_thread_func_duplex, ctx_omni, ctx_omni->params);
+                print_with_timestamp("stream_decode: create tts thread (duplex mode)\n");
+            } else {
+                ctx_omni->tts_thread = std::thread(tts_thread_func, ctx_omni, ctx_omni->params);
+                print_with_timestamp("stream_decode: create tts thread (simplex mode)\n");
+            }
+        }
+        if (!ctx_omni->t2w_thread.joinable() && ctx_omni->use_tts && ctx_omni->t2w_thread_info) {
+            t2w_thread_running = true;
+            ctx_omni->t2w_thread = std::thread(t2w_thread_func, ctx_omni, ctx_omni->params);
+            print_with_timestamp("stream_decode: create t2w thread\n");
+        }
+        
         ctx_omni->need_speek = true;
         //ctx_omni->llm_thread.join();
         ctx_omni->llm_thread_info->cv.notify_all();
