@@ -8040,7 +8040,8 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
     
     // 📌 last_round_idx：T2W 线程本地记录的「上一次使用的轮次」
     // 用于检测 simplex_round_idx 是否变化，如果变化则更新输出目录
-    int last_round_idx = ctx_omni->simplex_round_idx;
+    // 🔧 [修复第一轮无输出] 初始化为 -1，确保第一轮也会触发目录创建
+    int last_round_idx = -1;
     
     // WAV output settings (与 tts_thread_func 保持一致)
     std::string tts_wav_output_dir = get_wav_output_dir();
@@ -8511,24 +8512,13 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
         print_with_timestamp("🔒 n_keep 设置为 %d (system prompt tokens)，这部分永远不会被滑动窗口删除\n", ctx_omni->n_keep);
         eval_prefix(ctx_omni, ctx_omni->params);
         
-        // 🔧 [修复] index=0 时，system prompt 初始化完成后，也要处理传入的用户音频 aud_fname
-        // 之前的代码只处理了 ref_audio（用于 voice cloning），忽略了用户输入的测试音频
-        if (aud_fname.length() > 0 && !ctx_omni->duplex_mode) {
-            print_with_timestamp("stream_prefill(index=0): processing user audio: %s\n", aud_fname.c_str());
-            auto * user_audio_embeds = omni_audio_embed_make_with_filename(ctx_omni->ctx_audio, ctx_omni->params->cpuparams.n_threads, aud_fname);
-            if (user_audio_embeds != nullptr && user_audio_embeds->n_pos > 0) {
-                print_with_timestamp("stream_prefill(index=0): user audio embedding: n_pos=%d\n", user_audio_embeds->n_pos);
-                // 添加音频开始标记
-                eval_string(ctx_omni, ctx_omni->params, "<|audio_start|>", ctx_omni->params->n_batch, &ctx_omni->n_past, false);
-                prefill_with_emb(ctx_omni, ctx_omni->params, user_audio_embeds->embed, user_audio_embeds->n_pos, 
-                                ctx_omni->params->n_batch, &ctx_omni->n_past);
-                // 添加音频结束标记
-                eval_string(ctx_omni, ctx_omni->params, "<|audio_end|>", ctx_omni->params->n_batch, &ctx_omni->n_past, false);
-                omni_embed_free(user_audio_embeds);
-            } else {
-                print_with_timestamp("WARNING: failed to load user audio: %s\n", aud_fname.c_str());
-            }
-        }
+        // 🔧 [说明] index=0 时，aud_fname 通常是 ref_audio（用于 voice cloning）
+        // ref_audio 已经在上面的 system prompt 初始化中被正确 prefill 了
+        // 这里不需要再处理 aud_fname，因为：
+        // 1. 如果 aud_fname 是 ref_audio，它已经作为 system prompt 的一部分被处理了
+        // 2. 如果 aud_fname 是用户音频，用户音频应该从 index >= 1 开始传入
+        // 所以 index=0 阶段只负责 system prompt 初始化，不处理额外的音频输入
+        print_with_timestamp("stream_prefill(index=0): system prompt 初始化完成，ref_audio 已在其中 prefill\n");
         
         // 🔧 [#39 滑动窗口] 注册 system prompt 保护长度
         sliding_window_register_system_prompt(ctx_omni);

@@ -5780,10 +5780,12 @@ int main(int argc, char ** argv) {
         if (!model_dir_normalized.empty() && model_dir_normalized.back() != '/') {
             model_dir_normalized += '/';
         }
-        params.vpm_model = model_dir_normalized + "mmproj-model-f16.gguf";
-        params.apm_model = model_dir_normalized + "minicpmo-apm.gguf";
-        params.tts_model = model_dir_normalized + "Tts-445M-F16.gguf";
-        params.model.path = model_dir_normalized + "Llm-8.2B-Q8_0.gguf";
+        // 🔧 [修复] 使用正确的模型文件名格式 (MiniCPM-o-4_5)
+        params.vpm_model = model_dir_normalized + "vision/MiniCPM-o-4_5-vision-F16.gguf";
+        params.apm_model = model_dir_normalized + "audio/MiniCPM-o-4_5-audio-F16.gguf";
+        params.tts_model = model_dir_normalized + "tts/MiniCPM-o-4_5-tts-F16.gguf";
+        // LLM 模型路径由 llama-server 启动时的 --model 参数指定，这里不需要设置
+        // params.model.path 已经由 ctx_server.model 提供
 
         {
             std::lock_guard<std::mutex> lock(ctx_server.octx_mutex);
