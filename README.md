@@ -134,29 +134,29 @@ MiniCPM-o-4_5-gguf/
 ### Build
 
 ```bash
-# Configure with CMake
-cmake --preset arm64-apple-clang-release   # macOS Apple Silicon
-# or
-cmake --preset x64-linux-cuda-release      # Linux with CUDA
+# Configure
+cmake -B build -DCMAKE_BUILD_TYPE=Release
 
 # Build
-cmake --build build-arm64-apple-clang-release --target llama-omni-cli -j
+cmake --build build --target llama-omni-cli -j
 ```
+
+> CMake will auto-detect and enable Metal (macOS) or CUDA (Linux with NVIDIA GPU).
 
 ### Usage
 
 ```bash
 # Basic usage (auto-detect all model paths from LLM path)
-./build-arm64-apple-clang-release/bin/llama-omni-cli \
+./build/bin/llama-omni-cli \
     -m /path/to/MiniCPM-o-4_5-gguf/MiniCPM-o-4_5-Q4_K_M.gguf
 
 # With custom reference audio (voice cloning)
-./build-arm64-apple-clang-release/bin/llama-omni-cli \
+./build/bin/llama-omni-cli \
     -m /path/to/MiniCPM-o-4_5-gguf/MiniCPM-o-4_5-Q4_K_M.gguf \
     --ref-audio /path/to/your_voice.wav
 
 # Disable TTS (text-only output)
-./build-arm64-apple-clang-release/bin/llama-omni-cli \
+./build/bin/llama-omni-cli \
     -m /path/to/MiniCPM-o-4_5-gguf/MiniCPM-o-4_5-F16.gguf \
     --no-tts
 ```

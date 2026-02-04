@@ -198,3 +198,6 @@ poetry.toml
 # PyTorch
 *.pt
 *.safetensors
+# Output directories
+tools/omni/output/
+tools/omni/output_*/
