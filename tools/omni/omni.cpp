@@ -8075,6 +8075,7 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
         std::vector<llama_token> new_tokens;
         bool is_final = false;
         bool is_chunk_end = false;  // 标记 TTS chunk 结束
+        int received_round_idx = -1;  // 🔧 保存传入的 round_idx
         
         while (!queue.empty()) {
             T2WOut *t2w_out = queue.front();
@@ -8083,6 +8084,10 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
             new_tokens.insert(new_tokens.end(), t2w_out->audio_tokens.begin(), t2w_out->audio_tokens.end());
             is_final = is_final || t2w_out->is_final;  // 任何一个是 final 就是 final
             is_chunk_end = is_chunk_end || t2w_out->is_chunk_end;  // 任何一个是 chunk_end 就是 chunk_end
+            // 🔧 保存最后一个有效的 round_idx（优先使用非负值）
+            if (t2w_out->round_idx >= 0) {
+                received_round_idx = t2w_out->round_idx;
+            }
             delete t2w_out;
         }
         
@@ -8092,24 +8097,26 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
             continue;
         }
         
-        // 📌 [轮次切换检测] 检测 simplex_round_idx 是否与 last_round_idx 不同
-        // 如果不同，说明进入了新的对话轮次，需要切换到新的输出目录
-        // 
-        // simplex_round_idx 由 stream_decode 在开始时同步（通过传入的 round_idx 参数）
-        // 所以这里直接读取即可
-        if (!ctx_omni->duplex_mode && ctx_omni->simplex_round_idx != last_round_idx) {
+        // 📌 [轮次切换检测] 使用 T2WOut 传入的 round_idx 判断，而不是直接读取 ctx_omni->simplex_round_idx
+        // 原因：TTS 线程在发送 is_final 之前会递增 simplex_round_idx，导致竞态条件
+        // 现在 T2WOut.round_idx 保存的是递增前的值，确保 WAV 写入正确的目录
+        int effective_round_idx = (received_round_idx >= 0) ? received_round_idx : ctx_omni->simplex_round_idx;
+        
+        if (!ctx_omni->duplex_mode && effective_round_idx != last_round_idx) {
             print_with_timestamp("T2W线程(C++): 轮次切换 (%d -> %d)，更新输出目录\n",
-                                last_round_idx, ctx_omni->simplex_round_idx);
+                                last_round_idx, effective_round_idx);
             
             // 更新本地记录的轮次
-            last_round_idx = ctx_omni->simplex_round_idx;
+            last_round_idx = effective_round_idx;
             
-            // 更新输出目录
-            tts_wav_output_dir = get_wav_output_dir();
+            // 更新输出目录（基于 effective_round_idx）
+            tts_wav_output_dir = base_output_dir + "/round_" + 
+                                 (effective_round_idx < 100 ? (effective_round_idx < 10 ? "00" : "0") : "") + 
+                                 std::to_string(effective_round_idx) + "/tts_wav";
             
             // 重置轮次相关状态
             wav_idx = 0;                                                    // WAV 文件编号从 0 开始
-            ctx_omni->wav_turn_base = ctx_omni->simplex_round_idx * 1000;   // 更新全局 WAV 编号基数
+            ctx_omni->wav_turn_base = effective_round_idx * 1000;           // 更新全局 WAV 编号基数
             token_buffer = {4218, 4218, 4218};                              // 重置 token buffer（3个静音前缀）
             
             print_with_timestamp("T2W线程(C++): 新输出目录 %s\n", tts_wav_output_dir.c_str());
@@ -8483,6 +8490,25 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
         print_with_timestamp("🔒 n_keep 设置为 %d (system prompt tokens)，这部分永远不会被滑动窗口删除\n", ctx_omni->n_keep);
         eval_prefix(ctx_omni, ctx_omni->params);
         
+        // 🔧 [修复] index=0 时，system prompt 初始化完成后，也要处理传入的用户音频 aud_fname
+        // 之前的代码只处理了 ref_audio（用于 voice cloning），忽略了用户输入的测试音频
+        if (aud_fname.length() > 0 && !ctx_omni->duplex_mode) {
+            print_with_timestamp("stream_prefill(index=0): processing user audio: %s\n", aud_fname.c_str());
+            auto * user_audio_embeds = omni_audio_embed_make_with_filename(ctx_omni->ctx_audio, ctx_omni->params->cpuparams.n_threads, aud_fname);
+            if (user_audio_embeds != nullptr && user_audio_embeds->n_pos > 0) {
+                print_with_timestamp("stream_prefill(index=0): user audio embedding: n_pos=%d\n", user_audio_embeds->n_pos);
+                // 添加音频开始标记
+                eval_string(ctx_omni, ctx_omni->params, "<|audio_start|>", ctx_omni->params->n_batch, &ctx_omni->n_past, false);
+                prefill_with_emb(ctx_omni, ctx_omni->params, user_audio_embeds->embed, user_audio_embeds->n_pos, 
+                                ctx_omni->params->n_batch, &ctx_omni->n_past);
+                // 添加音频结束标记
+                eval_string(ctx_omni, ctx_omni->params, "<|audio_end|>", ctx_omni->params->n_batch, &ctx_omni->n_past, false);
+                omni_embed_free(user_audio_embeds);
+            } else {
+                print_with_timestamp("WARNING: failed to load user audio: %s\n", aud_fname.c_str());
+            }
+        }
+        
         // 🔧 [#39 滑动窗口] 注册 system prompt 保护长度
         sliding_window_register_system_prompt(ctx_omni);
 
@@ -8557,11 +8583,16 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
                 LOG_INF("%s: prefilled %d vision chunks (%d tokens each)\n", __func__, n_chunks, tokens_per_chunk);
             }
             if (aud_fname.length() > 0) {
+                print_with_timestamp("stream_prefill(index=%d): processing user audio: %s\n", index, aud_fname.c_str());
                 auto * embeds = omni_audio_embed_make_with_filename(ctx_omni->ctx_audio, ctx_omni->params->cpuparams.n_threads, aud_fname);
                 // 🔧 [修复] 音频太短时会在 audition_audio_preprocess 中自动 pad 静音到 100ms
                 // 这里做安全检查，如果仍然失败则跳过该帧音频
                 if (embeds != nullptr && embeds->n_pos > 0) {
+                    print_with_timestamp("stream_prefill(index=%d): user audio embedding: n_pos=%d\n", index, embeds->n_pos);
+                    // 🔧 添加音频标记，与 index=0 保持一致
+                    eval_string(ctx_omni, ctx_omni->params, "<|audio_start|>", ctx_omni->params->n_batch, &ctx_omni->n_past, false);
                     prefill_with_emb(ctx_omni, ctx_omni->params, embeds->embed, embeds->n_pos, ctx_omni->params->n_batch, &ctx_omni->n_past);
+                    eval_string(ctx_omni, ctx_omni->params, "<|audio_end|>", ctx_omni->params->n_batch, &ctx_omni->n_past, false);
                     omni_embed_free(embeds);
                 } else {
                     LOG_WRN("%s: audio encoding failed, skipping audio for this frame\n", __func__);
