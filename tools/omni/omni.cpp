@@ -7875,6 +7875,16 @@ void t2w_thread_func_python(struct omni_context * ctx_omni, common_params *param
         } else {
             need_flush = is_final;
         }
+
+        // 🔧 [修复双工模式最后一个字没说完] 当 is_final=true 但 token_buffer 为空时
+        // 也需要调用 reset_python_t2w_cache，否则 T2W 的流式缓存不会被重置
+        // 这会导致下一个 turn 的音频和上一个 turn 的尾音混在一起
+        if (is_final && token_buffer.empty()) {
+            print_with_timestamp("T2W(Python): is_final=true but token_buffer empty, calling reset directly\n");
+            reset_python_t2w_cache(ctx_omni);
+            // 不需要处理 token_buffer，直接继续等待下一个消息
+            continue;
+        }
         
         // Process windows using sliding window
         while (token_buffer.size() >= min_process_threshold || (need_flush && !token_buffer.empty())) {
