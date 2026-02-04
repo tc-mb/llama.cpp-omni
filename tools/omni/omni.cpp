@@ -3637,23 +3637,32 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
         ctx_omni->t2w_thread_info = new T2WThreadInfo(25);  // Queue size of 10 chunks
         
         // Initialize C++ Token2Wav session
-        // Try to load token2wav GGUF models from tts_bin_dir, or fallback to tools/omni/token2wav-gguf
-        ctx_omni->token2wav_model_dir = tts_bin_dir;
+        // Try to load token2wav GGUF models from {model_dir}/token2wav-gguf/
+        // Fallback to tools/omni/token2wav-gguf if not found
         ctx_omni->token2wav_initialized = false;
         
         // 🔧 如果使用 Python Token2Wav，跳过 C++ 的初始化以节省显存
         bool skip_cpp_token2wav = ctx_omni->use_python_token2wav;
         
         // Check if token2wav model files exist
-        // File names match the actual GGUF files in token2wav-gguf directory
-        // 先检查 tts_bin_dir，如果不存在则尝试 tools/omni/token2wav-gguf
+        // 优先检查 HF 模型目录下的 token2wav-gguf (tts_bin_dir 的父目录)
+        // 目录结构: {model_dir}/token2wav-gguf/
+        std::string gguf_root_dir = tts_bin_dir;
+        size_t last_slash = gguf_root_dir.find_last_of("/\\");
+        if (last_slash != std::string::npos) {
+            gguf_root_dir = gguf_root_dir.substr(0, last_slash);  // 获取 tts 的父目录
+        }
+        ctx_omni->token2wav_model_dir = gguf_root_dir + "/token2wav-gguf";
+        
         std::string encoder_test = ctx_omni->token2wav_model_dir + "/encoder.gguf";
         {
             std::ifstream f(encoder_test);
             if (!f.good()) {
-                // 尝试备用路径
+                // 尝试备用路径 (本地开发用)
                 ctx_omni->token2wav_model_dir = "tools/omni/token2wav-gguf";
                 print_with_timestamp("Token2Wav: trying fallback path %s\n", ctx_omni->token2wav_model_dir.c_str());
+            } else {
+                print_with_timestamp("Token2Wav: found models in %s\n", ctx_omni->token2wav_model_dir.c_str());
             }
         }
         std::string encoder_gguf = ctx_omni->token2wav_model_dir + "/encoder.gguf";
