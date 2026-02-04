@@ -408,6 +408,9 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
 
 void omni_free(struct omni_context * ctx_omni);
 
+// 停止所有线程（在 join 之前调用）
+void omni_stop_threads(struct omni_context * ctx_omni);
+
 bool stream_prefill(struct omni_context * ctx_omni,
                             std::string aud_fname,
                             std::string img_fname = "",

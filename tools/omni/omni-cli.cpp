@@ -320,10 +320,27 @@ int main(int argc, char ** argv) {
         test_case(ctx_omni, params, std::string("tools/omni/assets/test_case/audio_test_case/audio_test_case_"), 2);
     }
 
-    if(ctx_omni->async && ctx_omni->use_tts){
-        if(ctx_omni->tts_thread.joinable()) {
+    // 停止并等待所有线程结束
+    if(ctx_omni->async) {
+        // 发送停止信号
+        omni_stop_threads(ctx_omni);
+        
+        // 等待 LLM 线程
+        if(ctx_omni->llm_thread.joinable()) {
+            ctx_omni->llm_thread.join();
+            printf("llm thread end\n");
+        }
+        
+        // 等待 TTS 线程
+        if(ctx_omni->use_tts && ctx_omni->tts_thread.joinable()) {
             ctx_omni->tts_thread.join();
-            printf("tts end\n");
+            printf("tts thread end\n");
+        }
+        
+        // 等待 T2W 线程
+        if(ctx_omni->use_tts && ctx_omni->t2w_thread.joinable()) {
+            ctx_omni->t2w_thread.join();
+            printf("t2w thread end\n");
         }
     }
 

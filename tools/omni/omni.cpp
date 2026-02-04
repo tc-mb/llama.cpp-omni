@@ -3914,6 +3914,27 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
     return ctx_omni;
 }
 
+// 停止所有线程（发送信号，不等待）
+void omni_stop_threads(struct omni_context * ctx_omni) {
+    // 发送停止信号
+    llm_thread_running = false;
+    tts_thread_running = false;
+    t2w_thread_running = false;
+    
+    // 唤醒所有等待的线程
+    if (ctx_omni->llm_thread_info) {
+        ctx_omni->llm_thread_info->cv.notify_all();
+    }
+    if (ctx_omni->tts_thread_info) {
+        ctx_omni->tts_thread_info->cv.notify_all();
+    }
+    if (ctx_omni->t2w_thread_info) {
+        ctx_omni->t2w_thread_info->cv.notify_all();
+    }
+    
+    print_with_timestamp("omni_stop_threads: stop signals sent\n");
+}
+
 void omni_free(struct omni_context * ctx_omni) {
     
     // 等待 llm 和 tts thread 停止
