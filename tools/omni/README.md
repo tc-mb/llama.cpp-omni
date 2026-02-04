@@ -73,7 +73,19 @@ The core runtime pipeline of llama.cpp-omni consists of three stages:
 | TTS Generation | ~8.5ms/token | 25 tokens ~215ms |
 | Token2Wav | RTF ~0.15x | 25 tokens → 1s audio ~150ms |
 
-### Memory Usage
+### Inference Latency (Apple M4 Max, Metal)
+
+| Stage | Latency | Notes |
+|-------|---------|-------|
+| **Time to First Token (TTFT)** | **< 650ms** | First audio output |
+| Prefill (audio) | ~30ms | Audio-only |
+| Decode-LLM | ~12ms/token | Metal accelerated |
+| TTS Generation | ~10ms/token | Metal accelerated |
+| Token2Wav (Token2Mel) | ~235ms/chunk | Metal accelerated |
+| Token2Wav (Vocoder) | ~220ms/chunk | CPU (HiFiGAN) |
+| **Token2Wav Total** | RTF ~0.47x | 28 tokens → 1s audio ~450ms |
+
+### Memory Usage (NVIDIA GPU)
 
 | Configuration | LLM Quantization | Model Size | VRAM Estimate |
 |---------------|------------------|------------|---------------|
@@ -82,6 +94,16 @@ The core runtime pipeline of llama.cpp-omni consists of three stages:
 | Full Omni | Q4_K_M | ~8 GB | ~9 GB |
 | Vision Only | Q8_0 | ~9 GB | ~10 GB |
 | Audio Only | Q8_0 | ~10 GB | ~12 GB |
+
+### Memory Usage (Apple Silicon)
+
+| Configuration | LLM Quantization | Model Size | Unified Memory |
+|---------------|------------------|------------|----------------|
+| Full Omni | F16 | ~15 GB | ~19 GB |
+| Full Omni | Q8_0 | ~8.1 GB | ~12 GB |
+| Full Omni | Q4_K_M | ~4.7 GB | ~8.5 GB |
+
+> **Note**: Apple Silicon uses unified memory architecture. Recommended: 16GB Mac for Q4_K_M/Q8_0, 32GB+ Mac for F16.
 
 ---
 
