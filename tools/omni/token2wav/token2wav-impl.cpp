@@ -24,6 +24,7 @@
 #include <utility>
 #include "ggml-alloc.h"
 #include <algorithm>
+#include <random>
 
 #ifndef ENABLE_STDERR_LOG
 #define ENABLE_STDERR_LOG 0
@@ -563,7 +564,7 @@ int fmCausalConditionalCFM::out_channels() const {
 void fmCausalConditionalCFM::reset_stream_state() const {
     chunk_call_id_ = 0;
 }
-// 生成可复现的噪声张量
+// 生成噪声张量（使用真随机数）
 ggml_tensor * fmCausalConditionalCFM::deterministic_noise(ggml_context * ctx,
                                                           int64_t        C,
                                                           int64_t        T,
@@ -577,10 +578,11 @@ ggml_tensor * fmCausalConditionalCFM::deterministic_noise(ggml_context * ctx,
     if (!ggml_get_no_alloc(ctx)) {
         float *       data  = static_cast<float *>(noise->data);
         const int64_t total = C * T * B;
+        // 🔧 使用真随机数替代周期性伪噪声，避免音频伪影
+        static std::mt19937 gen(42);  // 固定种子保证可复现
+        std::normal_distribution<float> dist(0.0f, 1.0f);
         for (int64_t i = 0; i < total; ++i) {
-            const int64_t idx_global = offset_ct + i;
-            const float   base       = static_cast<float>((idx_global % 23) - 11);
-            data[i]                  = temperature * 0.01f * base;
+            data[i] = temperature * dist(gen);
         }
     }
     return noise;
@@ -2027,10 +2029,11 @@ void fmFlowMatchingGGUFModelLoader::fill_noise_ctb(std::vector<float> & noise_ct
                                                    int64_t              offset_ct) {
     noise_ctb.resize((size_t) C * (size_t) T * (size_t) B);
     const int64_t total = C * T * B;
+    // 🔧 使用真随机数替代周期性伪噪声，避免音频伪影
+    static std::mt19937 gen(42);  // 固定种子保证可复现
+    std::normal_distribution<float> dist(0.0f, 1.0f);
     for (int64_t i = 0; i < total; ++i) {
-        const int64_t idx_global = offset_ct + i;
-        const float   base       = (float) ((idx_global % 23) - 11);
-        noise_ctb[(size_t) i]    = temperature * 0.01f * base;
+        noise_ctb[(size_t) i] = temperature * dist(gen);
     }
 }
 void fmFlowMatchingGGUFModelLoader::fill_timestep_1d(std::vector<float> & t_host, int64_t B_total, float t_value) {
@@ -5803,15 +5806,17 @@ bool hg2_sine_gen2::hg_sine_gen2_build_graph(ggml_context * ctx,
     ggml_tensor * fn_tdb = ggml_mul(ctx, f0_tdb, hm_tdb);
     ggml_tensor * rad_tdb = ggml_scale(ctx, fn_tdb, 1.0f / float(HG2_SAMPLING_RATE));
     rad_tdb               = ggml_cont(ctx, rad_tdb);
-    // 🔧 用 reshape + view 替代 ggml_interpolate 下采样，支持 Metal 加速
-    // 下采样 [T, dim, B] -> [Tm, dim, B]，取每 scale 个中的第一个
+    // 🔧 用 reshape + sum + scale 替代 ggml_interpolate 下采样，支持 Metal 加速
+    // 下采样 [T, dim, B] -> [Tm, dim, B]，对每 scale 个值取平均
     const int64_t scale_ds = HG2_UPSAMPLE_SCALE;
     // reshape [T, dim, B] -> [scale, Tm, dim, B]
     ggml_tensor * rad_4d = ggml_reshape_4d(ctx, rad_tdb, scale_ds, Tm, dim, B);
     rad_4d = ggml_cont(ctx, rad_4d);
-    // 取 scale 维度的第一个切片 [1, Tm, dim, B]
-    ggml_tensor * rad_dn_4d = ggml_view_4d(ctx, rad_4d, 1, Tm, dim, B,
-                                            rad_4d->nb[1], rad_4d->nb[2], rad_4d->nb[3], 0);
+    // 在 dim=0 (scale 维度) 上求和，得到 [1, Tm, dim, B]
+    ggml_tensor * rad_sum_4d = ggml_sum_rows(ctx, rad_4d);
+    rad_sum_4d = ggml_cont(ctx, rad_sum_4d);
+    // 除以 scale 得到平均值
+    ggml_tensor * rad_dn_4d = ggml_scale(ctx, rad_sum_4d, 1.0f / float(scale_ds));
     rad_dn_4d = ggml_cont(ctx, rad_dn_4d);
     ggml_tensor * rad_dn_t1db = ggml_reshape_4d(ctx, rad_dn_4d, Tm, 1, dim, B);
     rad_dn_t1db               = ggml_cont(ctx, rad_dn_t1db);
@@ -5833,19 +5838,61 @@ bool hg2_sine_gen2::hg_sine_gen2_build_graph(ggml_context * ctx,
     phase_tdb = ggml_scale(ctx, phase_tdb, 2.0f * float(M_PI));
     phase_tdb = ggml_cont(ctx, phase_tdb);
     ggml_tensor * phase_t1db    = ggml_reshape_4d(ctx, phase_tdb, Tm, 1, dim, B);
-    ggml_tensor * phase_scaled  = ggml_scale(ctx, phase_t1db, float(HG2_UPSAMPLE_SCALE));
-    // 🔧 用 ggml_repeat 替代 ggml_interpolate 上采样，支持 Metal 加速
-    // 上采样 [Tm, 1, dim, B] -> [T, 1, dim, B]，scale = HG2_UPSAMPLE_SCALE
-    // reshape [Tm, 1, dim, B] -> [1, Tm, dim, B] -> repeat -> [scale, Tm, dim, B]
-    // -> permute -> [Tm, scale, dim, B] -> reshape -> [T, 1, dim, B]
+    // 🔧 用线性插值替代 ggml_interpolate BILINEAR，支持 Metal 加速
+    // 关键：相位需要平滑过渡，不能用 repeat（会产生电音）
+    // 方法：对每个 frame 的相位差进行线性展开
+    // phase[i] 到 phase[i+1] 之间的 scale 个点应该是线性递增的
     const int64_t scale_up = HG2_UPSAMPLE_SCALE;
-    ggml_tensor * phase_1tdb = ggml_permute(ctx, phase_scaled, 1, 0, 2, 3);  // [1, Tm, dim, B]
+    // 1. 计算相邻 frame 的相位差 delta_phase[i] = phase[i+1] - phase[i]
+    //    对最后一个 frame，使用前一个差值
+    ggml_tensor * phase_shift = ggml_view_4d(ctx, phase_t1db, Tm-1, 1, dim, B,
+                                             phase_t1db->nb[0], phase_t1db->nb[1], phase_t1db->nb[2],
+                                             phase_t1db->nb[0]);  // phase[1:Tm]
+    phase_shift = ggml_cont(ctx, phase_shift);
+    ggml_tensor * phase_base = ggml_view_4d(ctx, phase_t1db, Tm-1, 1, dim, B,
+                                            phase_t1db->nb[0], phase_t1db->nb[1], phase_t1db->nb[2], 0);  // phase[0:Tm-1]
+    phase_base = ggml_cont(ctx, phase_base);
+    ggml_tensor * delta = ggml_sub(ctx, phase_shift, phase_base);  // [Tm-1, 1, dim, B]
+    delta = ggml_cont(ctx, delta);
+    // 获取最后一个差值并拼接，得到完整的 delta [Tm, 1, dim, B]
+    ggml_tensor * last_delta = ggml_view_4d(ctx, delta, 1, 1, dim, B,
+                                            delta->nb[0], delta->nb[1], delta->nb[2],
+                                            (Tm-2) * delta->nb[0]);  // delta[-1]
+    last_delta = ggml_cont(ctx, last_delta);
+    ggml_tensor * delta_full = ggml_concat(ctx, delta, last_delta, 0);  // [Tm, 1, dim, B]
+    delta_full = ggml_cont(ctx, delta_full);
+    // 2. 创建 [0, 1, 2, ..., scale-1] / scale 的斜坡，用于线性插值
+    ggml_tensor * ramp = ggml_arange(ctx, 0.0f, (float)scale_up, 1.0f);  // [scale]
+    ramp = ggml_scale(ctx, ramp, 1.0f / (float)scale_up);  // [0, 1/scale, 2/scale, ...]
+    ramp = ggml_cont(ctx, ramp);
+    // 3. phase_up[t*scale + k] = phase[t] + delta[t] * (k / scale)
+    //    先重复 phase_t1db 和 delta_full 到 [scale, Tm, dim, B]
+    //    然后加上 ramp * delta
+    ggml_tensor * phase_1tdb = ggml_permute(ctx, phase_t1db, 1, 0, 2, 3);  // [1, Tm, dim, B]
     phase_1tdb = ggml_cont(ctx, phase_1tdb);
-    ggml_tensor * phase_rep = ggml_repeat_4d(ctx, phase_1tdb, scale_up, Tm, dim, B);
+    ggml_tensor * phase_rep = ggml_repeat_4d(ctx, phase_1tdb, scale_up, Tm, dim, B);  // [scale, Tm, dim, B]
     phase_rep = ggml_cont(ctx, phase_rep);
-    ggml_tensor * phase_perm = ggml_permute(ctx, phase_rep, 1, 0, 2, 3);  // [Tm, scale, dim, B]
+    ggml_tensor * delta_1tdb = ggml_permute(ctx, delta_full, 1, 0, 2, 3);  // [1, Tm, dim, B]
+    delta_1tdb = ggml_cont(ctx, delta_1tdb);
+    ggml_tensor * delta_rep = ggml_repeat_4d(ctx, delta_1tdb, scale_up, Tm, dim, B);  // [scale, Tm, dim, B]
+    delta_rep = ggml_cont(ctx, delta_rep);
+    // ramp 需要扩展到 [scale, Tm, dim, B]
+    ggml_tensor * ramp_4d = ggml_reshape_4d(ctx, ramp, scale_up, 1, 1, 1);
+    ramp_4d = ggml_cont(ctx, ramp_4d);
+    ggml_tensor * ramp_rep = ggml_repeat_4d(ctx, ramp_4d, scale_up, Tm, dim, B);
+    ramp_rep = ggml_cont(ctx, ramp_rep);
+    // 线性插值：phase_up = phase + delta * ramp
+    ggml_tensor * interp_add = ggml_mul(ctx, delta_rep, ramp_rep);
+    interp_add = ggml_cont(ctx, interp_add);
+    ggml_tensor * phase_interp = ggml_add(ctx, phase_rep, interp_add);  // [scale, Tm, dim, B]
+    phase_interp = ggml_cont(ctx, phase_interp);
+    // 4. permute 回 [Tm, scale, dim, B] 然后 reshape 到 [T, 1, dim, B]
+    ggml_tensor * phase_perm = ggml_permute(ctx, phase_interp, 1, 0, 2, 3);  // [Tm, scale, dim, B]
     phase_perm = ggml_cont(ctx, phase_perm);
-    ggml_tensor * phase_up_t1db = ggml_reshape_4d(ctx, phase_perm, T, 1, dim, B);
+    // 5. 最后乘以 scale（因为原来 phase_scaled = phase * scale）
+    ggml_tensor * phase_scaled_perm = ggml_scale(ctx, phase_perm, float(HG2_UPSAMPLE_SCALE));
+    phase_scaled_perm = ggml_cont(ctx, phase_scaled_perm);
+    ggml_tensor * phase_up_t1db = ggml_reshape_4d(ctx, phase_scaled_perm, T, 1, dim, B);
     phase_up_t1db               = ggml_cont(ctx, phase_up_t1db);
     ggml_tensor * phase_up_tdb  = ggml_reshape_3d(ctx, phase_up_t1db, T, dim, B);
     phase_up_tdb                = ggml_cont(ctx, phase_up_tdb);
@@ -7036,10 +7083,11 @@ void runner_fill_noise_ctb(std::vector<float> & noise_ctb,
                     int64_t              offset_ct) {
     noise_ctb.resize((size_t) C * (size_t) T * (size_t) B);
     const int64_t total = C * T * B;
+    // 🔧 使用真随机数替代周期性伪噪声，避免音频伪影
+    static std::mt19937 gen(42);  // 固定种子保证可复现
+    std::normal_distribution<float> dist(0.0f, 1.0f);
     for (int64_t i = 0; i < total; ++i) {
-        const int64_t idx_global = offset_ct + i;
-        const float   base       = (float) ((idx_global % 23) - 11);
-        noise_ctb[(size_t) i]    = temperature * 0.01f * base;
+        noise_ctb[(size_t) i] = temperature * dist(gen);
     }
 }
 void runner_fill_timestep_1d(std::vector<float> & t_host, int64_t B_total, float t_value) {
