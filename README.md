@@ -194,6 +194,83 @@ tools/omni/output/
 
 ---
 
+<details>
+<summary><h2>🐳 WebRTC Demo (macOS Docker Deployment)</h2></summary>
+
+Full-duplex real-time video interaction demo based on WebRTC. One-click deployment with pre-built Docker images.
+
+### Requirements
+
+- **Hardware**: Apple Silicon Mac (M1/M2/M3/M4), **M4 recommended** for optimal performance
+- **Software**: Docker Desktop, Python 3.10+
+- **Models**: MiniCPM-o 4.5 GGUF models (see directory structure above)
+
+### Quick Start
+
+**1. Download Docker Package**
+
+📦 [Download Docker Image (macOS)](https://drive.google.com/file/d/1vOi2T_l-MED7-q7fW-G1GHiHoDDcObxJ/view?usp=sharing)
+
+**2. Build llama-server**
+
+```bash
+cd /path/to/llama.cpp-omni
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target llama-server -j
+```
+
+**3. Deploy**
+
+```bash
+# Extract and enter directory
+unzip omni_docker.zip && cd omni_docker
+
+# Load Docker images
+docker load -i o45-frontend.tar
+docker load -i omini_backend_code/omni_backend.tar
+
+# One-click deployment
+./deploy_all.sh \
+    --cpp-dir /path/to/llama.cpp-omni \
+    --model-dir /path/to/MiniCPM-o-4_5-gguf
+
+# For duplex mode
+./deploy_all.sh \
+    --cpp-dir /path/to/llama.cpp-omni \
+    --model-dir /path/to/MiniCPM-o-4_5-gguf \
+    --duplex
+```
+
+**4. Access Web Interface**
+
+```bash
+open http://localhost:3000
+```
+
+### Service Ports
+
+| Service | Port | Description |
+|---------|------|-------------|
+| Frontend | 3000 | Web UI |
+| Backend | 8021 | Backend API |
+| LiveKit | 7880 | Real-time communication |
+| Inference | 9060 | Python HTTP API |
+
+### Troubleshooting
+
+| Issue | Solution |
+|-------|----------|
+| Port conflict | Use `--port 9060` (recommended, avoids Cursor IDE conflicts) |
+| "Experience quota full" | Check `model_type` and `session_type` in registration |
+| Model loading timeout | Wait 2-3 minutes for large models |
+| LiveKit connection failed | Update `node_ip` in `livekit.yaml` |
+
+📖 **Full Documentation**: [tools/omni/release_cpp/README.md](./tools/omni/release_cpp/README.md)
+
+</details>
+
+---
+
 ## Coming Soon
 
 Deployment and usage documentation is still being prepared, including:
