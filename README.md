@@ -159,6 +159,11 @@ cmake --build build --target llama-omni-cli -j
 ./build/bin/llama-omni-cli \
     -m /path/to/MiniCPM-o-4_5-gguf/MiniCPM-o-4_5-F16.gguf \
     --no-tts
+
+# Text input mode (no audio input required)
+./build/bin/llama-omni-cli \
+    -m /path/to/MiniCPM-o-4_5-gguf/MiniCPM-o-4_5-Q4_K_M.gguf \
+    --text "Hello, please introduce yourself"
 ```
 
 ### CLI Options
@@ -175,6 +180,7 @@ cmake --build build --target llama-omni-cli -j
 | `-ngl <n>` | Number of GPU layers (default: 99) |
 | `--no-tts` | Disable TTS output |
 | `--test <prefix> <n>` | Run test with audio files |
+| `--text <text>` | Run with text input (no audio input required) |
 
 ### Output
 

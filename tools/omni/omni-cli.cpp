@@ -63,11 +63,13 @@ static void show_usage(const char * prog_name) {
         "  -ngl <n>            Number of GPU layers (default: 99)\n"
         "  --no-tts            Disable TTS output\n"
         "  --test <prefix> <n> Run test case with audio prefix and count\n"
+        "  --text <text>       Run with text input (no audio input)\n"
         "  -h, --help          Show this help message\n\n"
         "Example:\n"
         "  %s -m ./models/MiniCPM-o-4_5-gguf/MiniCPM-o-4_5-Q4_K_M.gguf\n"
-        "  %s -m ./models/MiniCPM-o-4_5-gguf/MiniCPM-o-4_5-F16.gguf --no-tts\n",
-        prog_name, prog_name, prog_name
+        "  %s -m ./models/MiniCPM-o-4_5-gguf/MiniCPM-o-4_5-F16.gguf --no-tts\n"
+        "  %s -m ./models/MiniCPM-o-4_5-gguf/MiniCPM-o-4_5-Q4_K_M.gguf --text \"你好\"\n",
+        prog_name, prog_name, prog_name, prog_name
     );
 }
 
@@ -149,6 +151,64 @@ static void print_model_paths(const OmniModelPaths & paths) {
     printf("===================\n");
 }
 
+// 辅助函数：评估文本字符串
+static bool eval_text_string(struct omni_context * ctx_omni, const char* str, int n_batch, int * n_past) {
+    std::string str_s(str);
+    std::vector<llama_token> tokens = common_tokenize(ctx_omni->ctx_llama, str_s, false, true);
+
+    if (tokens.empty()) {
+        return true;
+    }
+
+    // 使用 llama_batch_init 创建 batch
+    llama_batch batch = llama_batch_init(n_batch, 0, 1);
+
+    for (size_t i = 0; i < tokens.size(); i += n_batch) {
+        batch.n_tokens = 0;
+        int n_eval = std::min((int)tokens.size() - (int)i, n_batch);
+
+        for (int j = 0; j < n_eval; j++) {
+            common_batch_add(batch, tokens[i + j], *n_past + j, {0}, false);
+        }
+        // 只在最后一个 token 获取 logits
+        batch.logits[batch.n_tokens - 1] = true;
+
+        if (llama_decode(ctx_omni->ctx_llama, batch)) {
+            fprintf(stderr, "%s : failed to eval\n", __func__);
+            llama_batch_free(batch);
+            return false;
+        }
+        *n_past += n_eval;
+    }
+
+    llama_batch_free(batch);
+    return true;
+}
+
+// 文本输入测试模式
+void test_case_text(struct omni_context *ctx_omni, common_params& params, std::string text_input){
+    // 初始化系统 prompt（不需要音频输入，只需要 ref_audio 作为声音参考）
+    ctx_omni->system_prompt_initialized = false;
+    bool orig_async = ctx_omni->async;
+    ctx_omni->async = false;
+
+    // 第一次 prefill 初始化系统 prompt（使用空音频，只初始化参考音频）
+    auto t0 = std::chrono::high_resolution_clock::now();
+    stream_prefill(ctx_omni, "", "", 0);
+    auto t1 = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> elapsed_seconds = t1 - t0;
+    std::cout << "system prompt init: " << elapsed_seconds.count() << " s" << std::endl;
+
+    // 直接将用户文本添加到上下文
+    std::string user_text = text_input + "<|im_end|>\n";
+    eval_text_string(ctx_omni, user_text.c_str(), ctx_omni->params->n_batch, &ctx_omni->n_past);
+    std::cout << "User input: " << text_input << std::endl;
+
+    // 恢复 async 模式并调用 decode
+    ctx_omni->async = orig_async;
+    stream_decode(ctx_omni, "./");
+}
+
 void test_case(struct omni_context *ctx_omni, common_params& params, std::string audio_path_prefix, int cnt){
     // 🔧 单工模式：先 prefill 所有音频输入，然后 decode 一次生成完整回复
     // 使用同步模式 prefill 所有音频，避免 async 模式下的竞态条件
@@ -194,6 +254,8 @@ int main(int argc, char ** argv) {
     bool run_test = false;
     std::string test_audio_prefix;
     int test_count = 0;
+    bool run_text = false;
+    std::string text_input;
     
     // 解析命令行参数
     for (int i = 1; i < argc; i++) {
@@ -234,6 +296,10 @@ int main(int argc, char ** argv) {
             run_test = true;
             test_audio_prefix = argv[++i];
             test_count = std::atoi(argv[++i]);
+        }
+        else if (arg == "--text" && i + 1 < argc) {
+            run_text = true;
+            text_input = argv[++i];
         }
         else {
             fprintf(stderr, "Unknown argument: %s\n", arg.c_str());
@@ -310,7 +376,11 @@ int main(int argc, char ** argv) {
     ctx_omni->async = true;
     ctx_omni->ref_audio_path = ref_audio_path;  // 设置参考音频路径
 
-    if (run_test) {
+    if (run_text) {
+        printf("=== Running text input mode ===\n");
+        printf("  Text: %s\n", text_input.c_str());
+        test_case_text(ctx_omni, params, text_input);
+    } else if (run_test) {
         printf("=== Running test case ===\n");
         printf("  Audio prefix: %s\n", test_audio_prefix.c_str());
         printf("  Count: %d\n", test_count);
@@ -322,21 +392,53 @@ int main(int argc, char ** argv) {
 
     // 停止并等待所有线程结束
     if(ctx_omni->async) {
+        // 🔧 [修复] 等待 TTS 完成当前工作再发送停止信号
+        // 问题：之前 omni_stop_threads 太早被调用，导致 TTS/T2W 线程在完成工作前就被停止
+        if(ctx_omni->use_tts) {
+            printf("Waiting for TTS to finish...\n");
+            // 等待 TTS 线程处理完毕（speek_done 变为 true 表示 TTS 完成）
+            int wait_count = 0;
+            while(!ctx_omni->speek_done && wait_count < 300) {  // 最多等待 30 秒
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                wait_count++;
+            }
+            printf("TTS finished (speek_done=%d)\n", ctx_omni->speek_done ? 1 : 0);
+
+            // 再等待 T2W 线程处理完队列中的所有数据
+            if(ctx_omni->t2w_thread_info) {
+                printf("Waiting for T2W to finish...\n");
+                wait_count = 0;
+                while(wait_count < 100) {  // 最多等待 10 秒
+                    {
+                        std::lock_guard<std::mutex> lock(ctx_omni->t2w_thread_info->mtx);
+                        if(ctx_omni->t2w_thread_info->queue.empty()) {
+                            break;
+                        }
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    wait_count++;
+                }
+                // 额外等待让 T2W 完成最后一批处理
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                printf("T2W queue empty\n");
+            }
+        }
+
         // 发送停止信号
         omni_stop_threads(ctx_omni);
-        
+
         // 等待 LLM 线程
         if(ctx_omni->llm_thread.joinable()) {
             ctx_omni->llm_thread.join();
             printf("llm thread end\n");
         }
-        
+
         // 等待 TTS 线程
         if(ctx_omni->use_tts && ctx_omni->tts_thread.joinable()) {
             ctx_omni->tts_thread.join();
             printf("tts thread end\n");
         }
-        
+
         // 等待 T2W 线程
         if(ctx_omni->use_tts && ctx_omni->t2w_thread.joinable()) {
             ctx_omni->t2w_thread.join();
