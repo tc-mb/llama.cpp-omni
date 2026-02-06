@@ -124,19 +124,12 @@ static bool is_end_token(struct omni_context * ctx, llama_token token) {
     OmniTokenType type = get_token_type(ctx, token);
     
     if (ctx->duplex_mode) {
-        // 双工模式: 只使用 chunk_terminator，不使用 turn_terminator
-        // Python (MiniCPMODuplex):
-        //   chunk_terminator_token_ids = [listen, chunk_eos, chunk_tts_eos]
-        //   turn_terminator_token_ids = [turn_eos]  -- 不作为 is_end_token
-        // 🔧 [关键修复] TTS_EOS/TURN_EOS/EOS 不作为 LLM 的结束 token
-        // 这些 token 会通过 is_end_of_turn 标志传递给 TTS 线程处理
+        // 双工模式:
+        // - chunk_eos/chunk_tts_eos: 在 stream_decode 内层循环中单独处理（不设 llm_finish，只跳出内层）
+        // - listen: 结束当前发言段（设 llm_finish）
+        // - turn_eos/tts_eos/eos: 在 stream_decode 内层循环中单独处理（设 llm_finish + is_end_of_turn）
         return 
-            // type == OmniTokenType::TTS_EOS || 
-            // type == OmniTokenType::TURN_EOS ||
-            // type == OmniTokenType::EOS ||
-            type == OmniTokenType::LISTEN ||      // 双工模式下 <|listen|> 结束当前发言
-            type == OmniTokenType::CHUNK_EOS ||   // <|chunk_eos|> 结束当前 chunk
-            type == OmniTokenType::CHUNK_TTS_EOS; // <|chunk_tts_eos|> 结束当前 TTS chunk
+            type == OmniTokenType::LISTEN;        // 双工模式下 <|listen|> 结束当前发言
     } else {
         // 单工流式 TTS 模式: 
         // Python (ChunkPrefillChunkGenerate): terminators=["<|tts_eos|>", "<|im_end|>", "</s>"]
@@ -4480,23 +4473,13 @@ static bool generate_audio_tokens_local_simplex(
     std::vector<float> condition_with_bos = merged_embeddings;  // 复制一份
     int extra_tokens = 0;  // 额外添加的 tokens 数量
     
-    // 🔧 [与 Python 对齐] 如果是最后一个 text chunk，先添加 text_eos_embed
-    // Python: if text_finished: condition = torch.cat([condition, self.text_eos_embed], dim=1)
+    // 🔧 [修复 text_eos_embed 时机] text_eos_embed 不再在 condition 构建阶段添加
+    // 原因：一个 text chunk 会生成多个 audio chunk，text_eos_embed 放在 condition 中
+    // 会导致所有 audio chunk 都受到影响。正确做法是在第一轮 audio 生成结束（EOS）后，
+    // 再注入 text_eos_embed + audio_bos 做第二轮生成，这样只影响最后一批 audio tokens。
     const int text_eos_token_id = 151692;  // TTS 的 text_eos_token_id
-    if (is_final_text_chunk) {
-        std::vector<float> text_eos_embed(tts_n_embd, 0.0f);
-        if (tts_emb_text(ctx_omni, text_eos_token_id, text_eos_embed.data(), tts_n_embd)) {
-            condition_with_bos.insert(condition_with_bos.end(), 
-                                      text_eos_embed.begin(), text_eos_embed.end());
-            extra_tokens++;
-            print_with_timestamp("TTS Simplex: is_final_text_chunk=true, 添加 text_eos_embed (chunk_idx=%d, new_size=%zu)\n", 
-                                chunk_idx, condition_with_bos.size() / tts_n_embd);
-        } else {
-            LOG_WRN("TTS Simplex: failed to get text_eos embedding\n");
-        }
-    }
     
-    // 🔧 [与 Python 对齐] 然后添加 audio_bos（总是添加）
+    // 🔧 [与 Python 对齐] 只添加 audio_bos（总是添加）
     // Python: condition = torch.cat([condition, self.audio_bos_embeds], dim=1)
     std::vector<float> audio_bos_embed(tts_n_embd, 0.0f);
     if (tts_emb_text(ctx_omni, audio_bos_token_id, audio_bos_embed.data(), tts_n_embd)) {
@@ -4508,7 +4491,7 @@ static bool generate_audio_tokens_local_simplex(
     } else {
         LOG_ERR("TTS Simplex: failed to get audio_bos embedding\n");
     }
-    int n_tokens_with_bos = n_tokens + extra_tokens;  // 包含 text_eos_embed（如果有）和 audio_bos
+    int n_tokens_with_bos = n_tokens + extra_tokens;  // 包含 audio_bos
     
     // Save condition embeddings (包含 audio_bos)
     ctx_omni->tts_condition_embeddings = condition_with_bos;
@@ -4569,6 +4552,13 @@ static bool generate_audio_tokens_local_simplex(
     // 🔧 [与 Python 对齐] 不强制最小生成数量，让 TTS 自然决定何时结束
     const int min_new_tokens = 0;
     
+    // 🔧 [修复 text_eos_embed 时机] 两阶段生成：
+    // Phase 1: 不带 text_eos_embed，正常生成 audio tokens 直到 EOS
+    // Phase 2 (仅 is_final_text_chunk): 注入 text_eos_embed + audio_bos，生成最后一批 audio tokens
+    // 这样 text_eos_embed 只影响最后一批 audio tokens，而非整个 text chunk 的所有 audio
+    bool need_phase2 = false;  // 是否需要第二阶段生成
+    
+    // ===== Phase 1: 正常生成（不带 text_eos_embed） =====
     for (int t = 0; t < max_audio_tokens; ++t) {
         // 🔧 [P0-立即打断] 检测 break_event，立即停止 TTS 生成
         if (ctx_omni->break_event.load()) {
@@ -4579,8 +4569,7 @@ static bool generate_audio_tokens_local_simplex(
         // 🔧 [修复过早EOS] 如果还没达到 min_new_tokens，阻止 EOS 被采样
         bool force_no_eos = (t < min_new_tokens);
         
-        // 🔧 [与旧版本对齐] 使用 all_generated_tokens 做 repetition penalty
-        // 🔧 [与 Python 对齐] 传入 is_final_text_chunk，控制 EOS 是否 prefill
+        // Phase 1 始终使用 is_final_text_chunk=false：EOS 不 prefill，保持 KV cache 干净
         llama_token sampled_token_abs = sample_tts_token_simplex(
             tts_sampler,
             ctx_omni,
@@ -4589,7 +4578,7 @@ static bool generate_audio_tokens_local_simplex(
             &ctx_omni->tts_all_generated_tokens,
             t,
             force_no_eos,
-            is_final_text_chunk  // 🔧 [与 Python 对齐] 只有 final chunk 才 prefill EOS
+            false  // Phase 1: 不 prefill EOS，留给 Phase 2 处理
         );
         
         if (sampled_token_abs == 0) {
@@ -4609,24 +4598,26 @@ static bool generate_audio_tokens_local_simplex(
         // 🔧 [与 Python 对齐] EOS token 检测
         bool is_eos = (relative_idx == num_audio_tokens - 1);
         if (is_eos) {
-            print_with_timestamp("TTS Simplex: EOS token at step %d\n", t + 1);
+            print_with_timestamp("TTS Simplex Phase1: EOS token at step %d\n", t + 1);
             output_audio_tokens.pop_back();
             ctx_omni->tts_all_generated_tokens.pop_back();
-            // 继续执行后续逻辑（处理 buffer 中的剩余 tokens）
+            // 如果是最后一个 text chunk，需要进入 Phase 2
+            if (is_final_text_chunk) {
+                need_phase2 = true;
+                print_with_timestamp("TTS Simplex: is_final_text_chunk=true, will enter Phase 2 for text_eos_embed\n");
+            }
         } else {
             // 🔧 [与 Python 对齐] 非 EOS token 加入 tts_token_buffer
-            // Python: self._token_buffer.append(next_tok)
             ctx_omni->tts_token_buffer.push_back(relative_idx);
         }
         
         // 🔧 [与 Python 对齐] 当 buffer >= chunk_size 时，yield 出 chunk_size 个
-        // Python: if len(self._token_buffer) >= self.chunk_size: yield batch; buffer = buffer[chunk_size:]
         while ((int)ctx_omni->tts_token_buffer.size() >= CHUNK_SIZE && ctx_omni->t2w_thread_info) {
             T2WOut *t2w_out = new T2WOut();
             t2w_out->audio_tokens.assign(ctx_omni->tts_token_buffer.begin(), 
                                          ctx_omni->tts_token_buffer.begin() + CHUNK_SIZE);
             t2w_out->is_final = false;
-            t2w_out->round_idx = ctx_omni->simplex_round_idx;  // 🔧 传递轮次索引
+            t2w_out->round_idx = ctx_omni->simplex_round_idx;
             
             {
                 std::lock_guard<std::mutex> lock(ctx_omni->t2w_thread_info->mtx);
@@ -4634,19 +4625,111 @@ static bool generate_audio_tokens_local_simplex(
             }
             ctx_omni->t2w_thread_info->cv.notify_one();
             
-            print_with_timestamp("TTS Simplex: yield %d tokens 到 T2W (step %d, buffer=%zu)\n", 
+            print_with_timestamp("TTS Simplex Phase1: yield %d tokens 到 T2W (step %d, buffer=%zu)\n", 
                                 CHUNK_SIZE, t + 1, ctx_omni->tts_token_buffer.size());
             ctx_omni->tts_token_buffer.erase(ctx_omni->tts_token_buffer.begin(), 
                                               ctx_omni->tts_token_buffer.begin() + CHUNK_SIZE);
         }
         
         if (t < 5 || (t + 1) % 25 == 0) {
-            print_with_timestamp("TTS Simplex: token %d/%d: rel_id=%d\n", t + 1, max_audio_tokens, relative_idx);
+            print_with_timestamp("TTS Simplex Phase1: token %d/%d: rel_id=%d\n", t + 1, max_audio_tokens, relative_idx);
         }
         
-        // 如果是 EOS，退出循环
+        // 如果是 EOS，退出 Phase 1 循环
         if (is_eos) {
             break;
+        }
+    }
+    
+    // ===== Phase 2: 注入 text_eos_embed，生成最后一批 audio tokens =====
+    // 仅在 is_final_text_chunk 且 Phase 1 正常结束（EOS）时执行
+    if (need_phase2 && !ctx_omni->break_event.load()) {
+        print_with_timestamp("TTS Simplex Phase2: injecting text_eos_embed + audio_bos at n_past=%d\n", n_past_tts);
+        
+        // 注入 text_eos_embed 到 TTS KV cache
+        std::vector<float> text_eos_embed(tts_n_embd, 0.0f);
+        bool inject_ok = false;
+        if (tts_emb_text(ctx_omni, text_eos_token_id, text_eos_embed.data(), tts_n_embd)) {
+            if (prefill_with_emb_tts(ctx_omni, params, text_eos_embed.data(), 1, 1, &n_past_tts)) {
+                print_with_timestamp("TTS Simplex Phase2: text_eos_embed injected, n_past=%d\n", n_past_tts);
+                
+                // 再注入 audio_bos，开始新一轮 audio 生成
+                std::vector<float> audio_bos_embed2(tts_n_embd, 0.0f);
+                if (tts_emb_text(ctx_omni, audio_bos_token_id, audio_bos_embed2.data(), tts_n_embd)) {
+                    if (prefill_with_emb_tts(ctx_omni, params, audio_bos_embed2.data(), 1, 1, &n_past_tts)) {
+                        print_with_timestamp("TTS Simplex Phase2: audio_bos injected, n_past=%d, starting final generation\n", n_past_tts);
+                        inject_ok = true;
+                    }
+                }
+            }
+        }
+        
+        if (inject_ok) {
+            // Phase 2 生成循环：text_eos_embed 已注入，生成最后的 audio tokens
+            for (int t2 = 0; t2 < max_audio_tokens; ++t2) {
+                if (ctx_omni->break_event.load()) {
+                    print_with_timestamp("TTS Simplex Phase2: break_event at step %d\n", t2);
+                    break;
+                }
+                
+                // Phase 2 使用 is_final_text_chunk=true：EOS 会被 prefill
+                llama_token sampled_token_abs = sample_tts_token_simplex(
+                    tts_sampler,
+                    ctx_omni,
+                    params,
+                    &n_past_tts,
+                    &ctx_omni->tts_all_generated_tokens,
+                    t2,
+                    false,  // 不强制阻止 EOS
+                    true    // Phase 2: is_final，EOS 会被 prefill
+                );
+                
+                if (sampled_token_abs == 0) {
+                    LOG_ERR("TTS Simplex Phase2: sample failed at step %d\n", t2);
+                    break;
+                }
+                
+                int relative_idx = sampled_token_abs - audio_bos_token_id;
+                if (relative_idx < 0 || relative_idx >= num_audio_tokens) {
+                    LOG_ERR("TTS Simplex Phase2: invalid token %d at step %d\n", sampled_token_abs, t2);
+                    break;
+                }
+                
+                output_audio_tokens.push_back(relative_idx);
+                ctx_omni->tts_all_generated_tokens.push_back(sampled_token_abs);
+                
+                bool is_eos = (relative_idx == num_audio_tokens - 1);
+                if (is_eos) {
+                    print_with_timestamp("TTS Simplex Phase2: EOS at step %d (final end)\n", t2 + 1);
+                    output_audio_tokens.pop_back();
+                    ctx_omni->tts_all_generated_tokens.pop_back();
+                } else {
+                    ctx_omni->tts_token_buffer.push_back(relative_idx);
+                }
+                
+                // yield audio chunks
+                while ((int)ctx_omni->tts_token_buffer.size() >= CHUNK_SIZE && ctx_omni->t2w_thread_info) {
+                    T2WOut *t2w_out = new T2WOut();
+                    t2w_out->audio_tokens.assign(ctx_omni->tts_token_buffer.begin(), 
+                                                 ctx_omni->tts_token_buffer.begin() + CHUNK_SIZE);
+                    t2w_out->is_final = false;
+                    t2w_out->round_idx = ctx_omni->simplex_round_idx;
+                    {
+                        std::lock_guard<std::mutex> lock(ctx_omni->t2w_thread_info->mtx);
+                        ctx_omni->t2w_thread_info->queue.push(t2w_out);
+                    }
+                    ctx_omni->t2w_thread_info->cv.notify_one();
+                    print_with_timestamp("TTS Simplex Phase2: yield %d tokens 到 T2W\n", CHUNK_SIZE);
+                    ctx_omni->tts_token_buffer.erase(ctx_omni->tts_token_buffer.begin(), 
+                                                      ctx_omni->tts_token_buffer.begin() + CHUNK_SIZE);
+                }
+                
+                if (is_eos) {
+                    break;
+                }
+            }
+        } else {
+            LOG_ERR("TTS Simplex Phase2: failed to inject text_eos_embed/audio_bos\n");
         }
     }
     
@@ -8974,10 +9057,29 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
                 }
 
                 if (ctx_omni->duplex_mode) {
+                    // 🔧 [与 Python 对齐] chunk_eos 提前输出机制：
+                    // Python 双工模式下，LLM 每次靠 <|chunk_eos|>/<|chunk_tts_eos|> 来跳出，
+                    // 把已累积的 tokens（可能 < step_size）立刻推给 TTS，不必等凑够 10 个。
+                    // 注意：chunk_eos 不设 llm_finish，外层 for 循环继续生成下一个 chunk。
+                    if (token_type == OmniTokenType::CHUNK_EOS ||
+                        token_type == OmniTokenType::CHUNK_TTS_EOS) {
+                        print_with_timestamp("LLM Duplex: chunk_eos detected (type=%d), "
+                                            "flushing %d tokens immediately (no llm_finish)\n",
+                                            (int)token_type, jl);
+                        break;  // 只跳出内层 while，不设 llm_finish，外层继续
+                    }
+                    
+                    // turn_eos / tts_eos / eos：轮次真正结束
                     if (token_type == OmniTokenType::TURN_EOS || 
                         token_type == OmniTokenType::TTS_EOS ||
                         token_type == OmniTokenType::EOS) {
                         local_is_end_of_turn = true;
+                        llm_finish = true;
+                        ctx_omni->current_turn_ended = true;
+                        print_with_timestamp("LLM Duplex: turn_eos detected (type=%d), "
+                                            "flushing %d tokens immediately, set llm_finish=true\n",
+                                            (int)token_type, jl);
+                        break;  // 跳出内层 while 并结束生成
                     }
                 }
                 
