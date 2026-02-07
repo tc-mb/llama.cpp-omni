@@ -125,11 +125,13 @@ static bool is_end_token(struct omni_context * ctx, llama_token token) {
     
     if (ctx->duplex_mode) {
         // 双工模式:
-        // - chunk_eos/chunk_tts_eos: 在 stream_decode 内层循环中单独处理（不设 llm_finish，只跳出内层）
-        // - listen: 结束当前发言段（设 llm_finish）
+        // - chunk_eos/chunk_tts_eos: 结束当前 stream_decode 调用，Python server 管理多轮
+        // - listen: 结束当前发言段
         // - turn_eos/tts_eos/eos: 在 stream_decode 内层循环中单独处理（设 llm_finish + is_end_of_turn）
         return 
-            type == OmniTokenType::LISTEN;        // 双工模式下 <|listen|> 结束当前发言
+            type == OmniTokenType::LISTEN ||      // 双工模式下 <|listen|> 结束当前发言
+            type == OmniTokenType::CHUNK_EOS ||   // <|chunk_eos|> 结束当前 chunk
+            type == OmniTokenType::CHUNK_TTS_EOS; // <|chunk_tts_eos|> 结束当前 TTS chunk
     } else {
         // 单工流式 TTS 模式: 
         // Python (ChunkPrefillChunkGenerate): terminators=["<|tts_eos|>", "<|im_end|>", "</s>"]
@@ -6300,25 +6302,9 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
         }
         fflush(stdout);
             
-        // TTS Processing using llama model
-        // 1. Tokenize text input
-        print_with_timestamp("TTS: about to tokenize response (len=%zu, llm_finish=%d)\n", response.size(), llm_finish);
-        fflush(stdout);
-        std::vector<llama_token> text_tokens = common_tokenize(ctx_omni->ctx_tts_llama, response, false, true);
-        fflush(stdout);
-        
-        // 🔧 [诊断日志] 打印 tokenization 结果
-        print_with_timestamp("TTS: tokenized response '%s' -> %zu text_tokens, llm_finish=%d, chunk_idx=%d\n",
-                            response.substr(0, 50).c_str(), text_tokens.size(), llm_finish, chunk_idx);
-        
-        // If response is empty but llm_finish is true, we should still process to generate final audio
-        if (text_tokens.empty() && !llm_finish) {
-            LOG_WRN("Text too short to tokenize: '%s' for chunk_idx{%d}, llm_finish = %d", response.c_str(), chunk_idx, llm_finish);
-            continue;
-        }
-        
-        // If both text_tokens and response are empty but llm_finish is true, mark as finished
-        if (text_tokens.empty() && response.empty() && llm_finish) {
+        // 🔧 [修复] 空 response + llm_finish 的提前检查
+        // 必须在 tokenize 之前检查，因为空字符串 tokenize 可能返回非空结果（BOS token）
+        if (response.empty() && llm_finish) {
             // 🔧 [修复] 当收到 llm_finish=true 但没有新数据时，
             // 需要 flush tts_token_buffer 中剩余的 tokens，并发送 is_final=true 到 T2W
             print_with_timestamp("TTS: received llm_finish=true with no data, finalizing (tts_token_buffer=%zu)\n",
@@ -9087,29 +9073,20 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
                 }
 
                 if (ctx_omni->duplex_mode) {
-                    // 🔧 [与 Python 对齐] chunk_eos 提前输出机制：
-                    // Python 双工模式下，LLM 每次靠 <|chunk_eos|>/<|chunk_tts_eos|> 来跳出，
-                    // 把已累积的 tokens（可能 < step_size）立刻推给 TTS，不必等凑够 10 个。
-                    // 注意：chunk_eos 不设 llm_finish，外层 for 循环继续生成下一个 chunk。
-                    if (token_type == OmniTokenType::CHUNK_EOS ||
-                        token_type == OmniTokenType::CHUNK_TTS_EOS) {
-                        print_with_timestamp("LLM Duplex: chunk_eos detected (type=%d), "
-                                            "flushing %d tokens immediately (no llm_finish)\n",
-                                            (int)token_type, jl);
-                        break;  // 只跳出内层 while，不设 llm_finish，外层继续
-                    }
-                    
-                    // turn_eos / tts_eos / eos：轮次真正结束
+                    // 🔧 [与 Python 对齐] turn_eos 处理：
+                    // Python 中 turn_eos 不触发 LLM 跳出，它只是标记 is_end_of_turn。
+                    // LLM 继续生成直到 chunk_eos/listen 通过 is_end_token() 正常跳出。
+                    // turn_eos 本身作为 special token 被过滤掉（不加入文本 response）。
+                    // is_end_of_turn 传递给 TTS 线程，让 TTS 知道这是最后一个 chunk。
                     if (token_type == OmniTokenType::TURN_EOS || 
                         token_type == OmniTokenType::TTS_EOS ||
                         token_type == OmniTokenType::EOS) {
                         local_is_end_of_turn = true;
-                        llm_finish = true;
                         ctx_omni->current_turn_ended = true;
                         print_with_timestamp("LLM Duplex: turn_eos detected (type=%d), "
-                                            "flushing %d tokens immediately, set llm_finish=true\n",
-                                            (int)token_type, jl);
-                        break;  // 跳出内层 while 并结束生成
+                                            "set is_end_of_turn=true (not breaking, wait for chunk_eos)\n",
+                                            (int)token_type);
+                        // 不 break，不设 llm_finish，继续生成直到 chunk_eos/listen
                     }
                 }
                 
