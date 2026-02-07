@@ -57,21 +57,6 @@ endif()
 target_link_libraries  (${TARGET} PRIVATE common omni Threads::Threads)
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
 
-# # TTS 推理测试程序
-# add_executable(test_tts_inference test/test_tts_inference.cpp)
-# target_link_libraries(test_tts_inference PRIVATE common omni Threads::Threads)
-# target_compile_features(test_tts_inference PRIVATE cxx_std_17)
-
-# # Test TTS hidden states
-# add_executable(test_tts_hidden_states test/test_tts_hidden_states.cpp)
-# target_link_libraries(test_tts_hidden_states PRIVATE common omni Threads::Threads)
-# target_compile_features(test_tts_hidden_states PRIVATE cxx_std_17)
-
-# # 纯文本输入测试 - 完整 C++ TTS 流程
-# add_executable(omni-text-test test/omni-cli-text-test.cpp)
-# target_link_libraries(omni-text-test PRIVATE common omni Threads::Threads)
-# target_compile_features(omni-text-test PRIVATE cxx_std_17)
-
 # # Token2Wav 测试程序 - 完整 C++ 语音合成
 # add_executable(token2wav-example token2wav/token2wav-example.cpp)
 # target_link_libraries(token2wav-example PRIVATE common omni Threads::Threads)
