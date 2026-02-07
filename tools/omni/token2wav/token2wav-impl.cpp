@@ -8101,16 +8101,81 @@ bool Token2Mel::start_stream_with_prompt(const PromptBundle & prompt, int n_time
     temperature_ = temperature;
     spk_bc_      = prompt.spk_bc;
 
+    // 临时开启 cache 导出以获取 host 数据
+    runner_.set_export_caches_to_host(true);
     flowStreamCacheHost cache0;
     if (!runner_.setup_cache(prompt.prompt_tokens_bt.data(), 1, prompt.T_prompt_token, prompt.prompt_mel_btc.data(),
                              prompt.T_prompt_mel, kMelChannels, spk_bc_.data(), kSpkDim, n_timesteps_, temperature_,
                              cache0)) {
         LOG_ERROR( "Token2Mel.start_stream_with_prompt: runner.setup_cache failed\n");
+        runner_.set_export_caches_to_host(false);
         return false;
     }
+    runner_.set_export_caches_to_host(false);
 
     cache_in_       = cache0;
     stream_started_ = true;
+
+    // 自动导出 prompt_cache.gguf (如果 cache 有效且同目录没有新版 GGUF)
+    // 这样下次启动可以直接用 init_from_host_caches 加载，省去 setup_cache 实时计算
+    if (!cache0.empty()) {
+        // 查找 prompt_bundle_dir 的父目录下的 prompt_cache_v2.gguf
+        // 使用环境变量或约定路径
+        const char * export_dir = ::getenv("T2W_EXPORT_CACHE_DIR");
+        if (export_dir && export_dir[0] != '\0') {
+            std::string out_path = std::string(export_dir) + "/prompt_cache_v2.gguf";
+            std::ifstream probe(out_path);
+            if (!probe.good()) {
+                // 写 GGUF
+                gguf_context * guf = gguf_init_empty();
+                if (guf) {
+                    gguf_set_val_i32(guf, "mtmd.prompt_cache.version", 2);
+                    gguf_set_val_i32(guf, "mtmd.prompt_cache.n_timesteps", n_timesteps);
+                    gguf_set_val_f32(guf, "mtmd.prompt_cache.temperature", temperature);
+                    gguf_set_val_i32(guf, "mtmd.prompt_cache.pre_lookahead", kPreLookahead);
+                    gguf_set_val_i32(guf, "mtmd.prompt_cache.chunk_main", kChunkMain);
+                    gguf_set_val_i32(guf, "mtmd.prompt_cache.chunk_total", kDt);
+                    gguf_set_val_i32(guf, "mtmd.prompt_cache.up_rate", 2);
+
+                    // spk_cb: 直接用 BC layout (就是 spk_bc_ 的数据)
+                    ggml_init_params p = { 256 * 1024, nullptr, true };
+                    ggml_context * tmp = ggml_init(p);
+                    if (tmp) {
+                        ggml_tensor * spk = ggml_new_tensor_1d(tmp, GGML_TYPE_F32, kSpkDim);
+                        ggml_set_name(spk, "prompt_cache.spk_cb");
+                        spk->data = (void *) spk_bc_.data();
+                        gguf_add_tensor(guf, spk);
+
+                        auto add_cache = [&](const char * name, const std::vector<uint8_t> & bytes,
+                                             const std::vector<int64_t> & ne) {
+                            int ndims = (int) ne.size();
+                            ggml_tensor * t = nullptr;
+                            if (ndims == 3)
+                                t = ggml_new_tensor_3d(tmp, GGML_TYPE_F32, ne[0], ne[1], ne[2]);
+                            else if (ndims == 4)
+                                t = ggml_new_tensor_4d(tmp, GGML_TYPE_F32, ne[0], ne[1], ne[2], ne[3]);
+                            else
+                                return;
+                            ggml_set_name(t, name);
+                            t->data = (void *) bytes.data();
+                            gguf_add_tensor(guf, t);
+                        };
+                        add_cache("prompt_cache.conformer_cnn_cache", cache0.conformer_cnn_cache, cache0.conformer_cnn_ne);
+                        add_cache("prompt_cache.conformer_att_cache", cache0.conformer_att_cache, cache0.conformer_att_ne);
+                        add_cache("prompt_cache.estimator_cnn_cache", cache0.estimator_cnn_cache, cache0.estimator_cnn_ne);
+                        add_cache("prompt_cache.estimator_att_cache", cache0.estimator_att_cache, cache0.estimator_att_ne);
+
+                        if (gguf_write_to_file(guf, out_path.c_str(), false)) {
+                            std::fprintf(stderr, "[Token2Mel] exported prompt_cache_v2.gguf: %s\n", out_path.c_str());
+                        }
+                        ggml_free(tmp);
+                    }
+                    gguf_free(guf);
+                }
+            }
+        }
+    }
+
     return true;
 }
 

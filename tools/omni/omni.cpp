@@ -3706,37 +3706,25 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
             }
             
             bool init_ok = false;
-            if (use_prompt_bundle) {
-                // 使用 prompt_bundle (与测试音频一致的声音)
-                print_with_timestamp("Token2Wav: using prompt_bundle from %s\n", prompt_bundle_dir.c_str());
+            // 优先级: prompt_cache.gguf > prompt_bundle (实时计算 fallback)
+            print_with_timestamp("Token2Wav: using prompt_cache from %s\n", prompt_cache_gguf.c_str());
+            init_ok = ctx_omni->token2wav_session->init_from_prompt_cache_gguf(
+                    encoder_gguf, flow_matching_gguf, flow_extra_gguf, prompt_cache_gguf,
+                    vocoder_gguf, device_token2mel, device_vocoder, 5, 1.0f);
+            if (!init_ok && use_prompt_bundle) {
+                print_with_timestamp("Token2Wav: prompt_cache failed, fallback to prompt_bundle from %s\n", prompt_bundle_dir.c_str());
                 init_ok = ctx_omni->token2wav_session->init_from_prompt_bundle(
                         encoder_gguf, flow_matching_gguf, flow_extra_gguf, prompt_bundle_dir,
-                        vocoder_gguf, device_token2mel, device_vocoder, 10, 1.0f);
-                
-                // Fallback to CPU if GPU fails
-                if (!init_ok) {
-                    ctx_omni->token2wav_session.reset();
-                    ctx_omni->token2wav_session = std::make_unique<omni::flow::Token2WavSession>();
-                    init_ok = ctx_omni->token2wav_session->init_from_prompt_bundle(
-                            encoder_gguf, flow_matching_gguf, flow_extra_gguf, prompt_bundle_dir,
-                            vocoder_gguf, "cpu", "cpu", 10, 1.0f);
-                }
-            } else {
-                // 使用 prompt_cache.gguf (默认的预缓存声音)
-                print_with_timestamp("Token2Wav: using prompt_cache from %s\n", prompt_cache_gguf.c_str());
+                        vocoder_gguf, device_token2mel, device_vocoder, 5, 1.0f);
+            }
+            // Fallback to CPU
+            if (!init_ok) {
+                print_with_timestamp("Token2Wav: GPU init failed, trying CPU mode...\n");
+                ctx_omni->token2wav_session.reset();
+                ctx_omni->token2wav_session = std::make_unique<omni::flow::Token2WavSession>();
                 init_ok = ctx_omni->token2wav_session->init_from_prompt_cache_gguf(
                         encoder_gguf, flow_matching_gguf, flow_extra_gguf, prompt_cache_gguf,
-                        vocoder_gguf, device_token2mel, device_vocoder, 10, 1.0f);
-                
-                // Fallback to CPU if GPU fails
-                if (!init_ok) {
-                    print_with_timestamp("Token2Wav: GPU init failed, trying CPU mode...\n");
-                    ctx_omni->token2wav_session.reset();
-                    ctx_omni->token2wav_session = std::make_unique<omni::flow::Token2WavSession>();
-                    init_ok = ctx_omni->token2wav_session->init_from_prompt_cache_gguf(
-                            encoder_gguf, flow_matching_gguf, flow_extra_gguf, prompt_cache_gguf,
-                            vocoder_gguf, "cpu", "cpu", 10, 1.0f);
-                }
+                        vocoder_gguf, "cpu", "cpu", 5, 1.0f);
             }
             
             if (init_ok) {
