@@ -2,6 +2,9 @@
 
 find_package(Threads REQUIRED)
 
+# CoreML / ANE support option
+option(ENABLE_COREML "Enable CoreML/ANE support for vision encoder" OFF)
+
 add_library(omni
             omni.cpp
             omni.h
@@ -16,12 +19,38 @@ add_library(omni
             token2wav/token2wav.h
             )
 
+# Add CoreML related files when enabled
+if(ENABLE_COREML)
+    target_sources(omni PRIVATE
+        coreml/omni_coreml.h
+        coreml/omni_coreml.mm
+        coreml/coreml_minicpmo45_vit_all_f16.h
+        coreml/coreml_minicpmo45_vit_all_f16.m
+    )
+    # Define compile-time macro for code guards
+    target_compile_definitions(omni PRIVATE ENABLE_COREML)
+
+    # Enable ARC for Objective-C files
+    set_source_files_properties(coreml/omni_coreml.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+    set_source_files_properties(coreml/coreml_minicpmo45_vit_all_f16.m PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+endif()
+
 target_link_libraries     (omni PUBLIC ggml llama common)
 target_link_libraries     (omni PRIVATE Threads::Threads)
 target_include_directories(omni PUBLIC  .)
 target_include_directories(omni PRIVATE ../..)
 target_include_directories(omni PRIVATE ../../vendor)
 target_compile_features   (omni PRIVATE cxx_std_17)
+
+# Link CoreML and Accelerate frameworks when CoreML is enabled
+if(ENABLE_COREML)
+    target_link_libraries(omni PRIVATE
+        "-framework Foundation"
+        "-framework CoreML"
+        "-framework Accelerate"
+        "-ObjC"
+    )
+endif()
 
 if (BUILD_SHARED_LIBS)
     set_target_properties     (omni PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -56,21 +85,6 @@ if(LLAMA_TOOLS_INSTALL)
 endif()
 target_link_libraries  (${TARGET} PRIVATE common omni Threads::Threads)
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
-
-# # TTS 推理测试程序
-# add_executable(test_tts_inference test/test_tts_inference.cpp)
-# target_link_libraries(test_tts_inference PRIVATE common omni Threads::Threads)
-# target_compile_features(test_tts_inference PRIVATE cxx_std_17)
-
-# # Test TTS hidden states
-# add_executable(test_tts_hidden_states test/test_tts_hidden_states.cpp)
-# target_link_libraries(test_tts_hidden_states PRIVATE common omni Threads::Threads)
-# target_compile_features(test_tts_hidden_states PRIVATE cxx_std_17)
-
-# # 纯文本输入测试 - 完整 C++ TTS 流程
-# add_executable(omni-text-test test/omni-cli-text-test.cpp)
-# target_link_libraries(omni-text-test PRIVATE common omni Threads::Threads)
-# target_compile_features(omni-text-test PRIVATE cxx_std_17)
 
 # # Token2Wav 测试程序 - 完整 C++ 语音合成
 # add_executable(token2wav-example token2wav/token2wav-example.cpp)

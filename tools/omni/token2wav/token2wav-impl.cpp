@@ -223,7 +223,7 @@ int64_t fm_attn_cache_max_t_default() {
             return (int64_t) v;
         }
     }
-    return 150;
+    return 600;
 }
 // 从时间维尾部截取一段 view
 ggml_tensor * fm_attn_tail_view_time_dim(ggml_context * ctx, ggml_tensor * x_dhtb, int64_t t_keep) {
@@ -5042,21 +5042,19 @@ bool hg2_hift_generator::build_graph_forward(ggml_context * ctx,
     f0_tb = ggml_cont(ctx, f0_tb);
     const int64_t Tm       = f0_tb->ne[0];
     const int64_t T_audio  = Tm * HG2_SAMPLES_PER_MEL;
-    // 🔧 用 ggml_repeat 替代 ggml_interpolate，支持 Metal 加速
-    // NEAREST 上采样：每个值重复 HG2_SAMPLES_PER_MEL 次
-    // f0_tb: [Tm, B] -> reshape -> [1, Tm, 1, B] -> repeat -> [scale, Tm, 1, B]
-    // -> permute -> [Tm, scale, 1, B] -> reshape -> [Tm*scale, 1, 1, B]
+    // NEAREST 上采样：每个 f0 值重复 HG2_SAMPLES_PER_MEL 次
+    // f0_tb: [Tm, B] -> [Tm, 1, B] -> repeat ne[1] -> [Tm, scale, B]
+    // -> permute(1,0,2,3) -> [scale, Tm, B] -> reshape -> [T_audio, 1, B]
     const int64_t scale = HG2_SAMPLES_PER_MEL;
-    ggml_tensor * f0_1tb = ggml_reshape_4d(ctx, f0_tb, 1, Tm, 1, B);
-    f0_1tb = ggml_cont(ctx, f0_1tb);
-    ggml_tensor * f0_rep = ggml_repeat_4d(ctx, f0_1tb, scale, Tm, 1, B);
+    ggml_tensor * f0_t1b = ggml_reshape_3d(ctx, f0_tb, Tm, 1, B);
+    f0_t1b = ggml_cont(ctx, f0_t1b);
+    ggml_tensor * f0_tmpl = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, Tm, scale, B);
+    ggml_tensor * f0_rep  = ggml_repeat(ctx, f0_t1b, f0_tmpl);
     f0_rep = ggml_cont(ctx, f0_rep);
-    ggml_tensor * f0_perm = ggml_permute(ctx, f0_rep, 1, 0, 2, 3);  // [Tm, scale, 1, B]
+    ggml_tensor * f0_perm = ggml_permute(ctx, f0_rep, 1, 0, 2, 3);
     f0_perm = ggml_cont(ctx, f0_perm);
-    ggml_tensor * f0_up_4d = ggml_reshape_4d(ctx, f0_perm, T_audio, 1, 1, B);
-    f0_up_4d               = ggml_cont(ctx, f0_up_4d);
-    ggml_tensor * f0_t1_b  = ggml_reshape_3d(ctx, f0_up_4d, T_audio, 1, B);
-    f0_t1_b                = ggml_cont(ctx, f0_t1_b);
+    ggml_tensor * f0_t1_b = ggml_reshape_3d(ctx, f0_perm, T_audio, 1, B);
+    f0_t1_b = ggml_cont(ctx, f0_t1_b);
     ggml_tensor * s_t1_b     = nullptr;
     ggml_tensor * noise_t1_b = nullptr;
     ggml_tensor * uv_t1_b    = nullptr;
@@ -5866,28 +5864,25 @@ bool hg2_sine_gen2::hg_sine_gen2_build_graph(ggml_context * ctx,
     ramp = ggml_scale(ctx, ramp, 1.0f / (float)scale_up);  // [0, 1/scale, 2/scale, ...]
     ramp = ggml_cont(ctx, ramp);
     // 3. phase_up[t*scale + k] = phase[t] + delta[t] * (k / scale)
-    //    先重复 phase_t1db 和 delta_full 到 [scale, Tm, dim, B]
-    //    然后加上 ramp * delta
-    ggml_tensor * phase_1tdb = ggml_permute(ctx, phase_t1db, 1, 0, 2, 3);  // [1, Tm, dim, B]
-    phase_1tdb = ggml_cont(ctx, phase_1tdb);
-    ggml_tensor * phase_rep = ggml_repeat_4d(ctx, phase_1tdb, scale_up, Tm, dim, B);  // [scale, Tm, dim, B]
+    //    repeat phase_t1db [Tm,1,dim,B] -> [Tm,scale,dim,B] (element repeat in ne[1])
+    //    repeat delta_full [Tm,1,dim,B] -> [Tm,scale,dim,B]
+    //    ramp [1,scale,1,1] -> [Tm,scale,dim,B]
+    ggml_tensor * phase_tmpl = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, Tm, scale_up, dim, B);
+    ggml_tensor * phase_rep  = ggml_repeat(ctx, phase_t1db, phase_tmpl);
     phase_rep = ggml_cont(ctx, phase_rep);
-    ggml_tensor * delta_1tdb = ggml_permute(ctx, delta_full, 1, 0, 2, 3);  // [1, Tm, dim, B]
-    delta_1tdb = ggml_cont(ctx, delta_1tdb);
-    ggml_tensor * delta_rep = ggml_repeat_4d(ctx, delta_1tdb, scale_up, Tm, dim, B);  // [scale, Tm, dim, B]
+    ggml_tensor * delta_rep = ggml_repeat(ctx, delta_full, phase_tmpl);
     delta_rep = ggml_cont(ctx, delta_rep);
-    // ramp 需要扩展到 [scale, Tm, dim, B]
-    ggml_tensor * ramp_4d = ggml_reshape_4d(ctx, ramp, scale_up, 1, 1, 1);
+    ggml_tensor * ramp_4d = ggml_reshape_4d(ctx, ramp, 1, scale_up, 1, 1);
     ramp_4d = ggml_cont(ctx, ramp_4d);
-    ggml_tensor * ramp_rep = ggml_repeat_4d(ctx, ramp_4d, scale_up, Tm, dim, B);
+    ggml_tensor * ramp_rep = ggml_repeat(ctx, ramp_4d, phase_tmpl);
     ramp_rep = ggml_cont(ctx, ramp_rep);
-    // 线性插值：phase_up = phase + delta * ramp
+    // 线性插值：phase_up = phase + delta * ramp  (all [Tm, scale, dim, B])
     ggml_tensor * interp_add = ggml_mul(ctx, delta_rep, ramp_rep);
     interp_add = ggml_cont(ctx, interp_add);
-    ggml_tensor * phase_interp = ggml_add(ctx, phase_rep, interp_add);  // [scale, Tm, dim, B]
+    ggml_tensor * phase_interp = ggml_add(ctx, phase_rep, interp_add);
     phase_interp = ggml_cont(ctx, phase_interp);
-    // 4. permute 回 [Tm, scale, dim, B] 然后 reshape 到 [T, 1, dim, B]
-    ggml_tensor * phase_perm = ggml_permute(ctx, phase_interp, 1, 0, 2, 3);  // [Tm, scale, dim, B]
+    // 4. permute(1,0,2,3) -> [scale,Tm,dim,B], then reshape -> [T,dim,B]
+    ggml_tensor * phase_perm = ggml_permute(ctx, phase_interp, 1, 0, 2, 3);
     phase_perm = ggml_cont(ctx, phase_perm);
     // 5. 最后乘以 scale（因为原来 phase_scaled = phase * scale）
     ggml_tensor * phase_scaled_perm = ggml_scale(ctx, phase_perm, float(HG2_UPSAMPLE_SCALE));
@@ -8106,16 +8101,81 @@ bool Token2Mel::start_stream_with_prompt(const PromptBundle & prompt, int n_time
     temperature_ = temperature;
     spk_bc_      = prompt.spk_bc;
 
+    // 临时开启 cache 导出以获取 host 数据
+    runner_.set_export_caches_to_host(true);
     flowStreamCacheHost cache0;
     if (!runner_.setup_cache(prompt.prompt_tokens_bt.data(), 1, prompt.T_prompt_token, prompt.prompt_mel_btc.data(),
                              prompt.T_prompt_mel, kMelChannels, spk_bc_.data(), kSpkDim, n_timesteps_, temperature_,
                              cache0)) {
         LOG_ERROR( "Token2Mel.start_stream_with_prompt: runner.setup_cache failed\n");
+        runner_.set_export_caches_to_host(false);
         return false;
     }
+    runner_.set_export_caches_to_host(false);
 
     cache_in_       = cache0;
     stream_started_ = true;
+
+    // 自动导出 prompt_cache.gguf (如果 cache 有效且同目录没有新版 GGUF)
+    // 这样下次启动可以直接用 init_from_host_caches 加载，省去 setup_cache 实时计算
+    if (!cache0.empty()) {
+        // 导出 prompt_cache.gguf 到指定目录
+        // 设置环境变量 T2W_EXPORT_CACHE_DIR 触发导出
+        const char * export_dir = ::getenv("T2W_EXPORT_CACHE_DIR");
+        if (export_dir && export_dir[0] != '\0') {
+            std::string out_path = std::string(export_dir) + "/prompt_cache.gguf";
+            std::ifstream probe(out_path);
+            if (!probe.good()) {
+                // 写 GGUF
+                gguf_context * guf = gguf_init_empty();
+                if (guf) {
+                    gguf_set_val_i32(guf, "mtmd.prompt_cache.version", 2);
+                    gguf_set_val_i32(guf, "mtmd.prompt_cache.n_timesteps", n_timesteps);
+                    gguf_set_val_f32(guf, "mtmd.prompt_cache.temperature", temperature);
+                    gguf_set_val_i32(guf, "mtmd.prompt_cache.pre_lookahead", kPreLookahead);
+                    gguf_set_val_i32(guf, "mtmd.prompt_cache.chunk_main", kChunkMain);
+                    gguf_set_val_i32(guf, "mtmd.prompt_cache.chunk_total", kDt);
+                    gguf_set_val_i32(guf, "mtmd.prompt_cache.up_rate", 2);
+
+                    // spk_cb: 直接用 BC layout (就是 spk_bc_ 的数据)
+                    ggml_init_params p = { 256 * 1024, nullptr, true };
+                    ggml_context * tmp = ggml_init(p);
+                    if (tmp) {
+                        ggml_tensor * spk = ggml_new_tensor_1d(tmp, GGML_TYPE_F32, kSpkDim);
+                        ggml_set_name(spk, "prompt_cache.spk_cb");
+                        spk->data = (void *) spk_bc_.data();
+                        gguf_add_tensor(guf, spk);
+
+                        auto add_cache = [&](const char * name, const std::vector<uint8_t> & bytes,
+                                             const std::vector<int64_t> & ne) {
+                            int ndims = (int) ne.size();
+                            ggml_tensor * t = nullptr;
+                            if (ndims == 3)
+                                t = ggml_new_tensor_3d(tmp, GGML_TYPE_F32, ne[0], ne[1], ne[2]);
+                            else if (ndims == 4)
+                                t = ggml_new_tensor_4d(tmp, GGML_TYPE_F32, ne[0], ne[1], ne[2], ne[3]);
+                            else
+                                return;
+                            ggml_set_name(t, name);
+                            t->data = (void *) bytes.data();
+                            gguf_add_tensor(guf, t);
+                        };
+                        add_cache("prompt_cache.conformer_cnn_cache", cache0.conformer_cnn_cache, cache0.conformer_cnn_ne);
+                        add_cache("prompt_cache.conformer_att_cache", cache0.conformer_att_cache, cache0.conformer_att_ne);
+                        add_cache("prompt_cache.estimator_cnn_cache", cache0.estimator_cnn_cache, cache0.estimator_cnn_ne);
+                        add_cache("prompt_cache.estimator_att_cache", cache0.estimator_att_cache, cache0.estimator_att_ne);
+
+                        if (gguf_write_to_file(guf, out_path.c_str(), false)) {
+                            std::fprintf(stderr, "[Token2Mel] exported prompt_cache.gguf: %s\n", out_path.c_str());
+                        }
+                        ggml_free(tmp);
+                    }
+                    gguf_free(guf);
+                }
+            }
+        }
+    }
+
     return true;
 }
 

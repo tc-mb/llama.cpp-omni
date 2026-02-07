@@ -8,6 +8,10 @@
 #include "ggml-backend.h"
 #include "gguf.h"
 
+#if defined(ENABLE_COREML)
+#include "coreml/omni_coreml.h"
+#endif
+
 #include <cassert>
 #include <cmath>
 #include <cstdlib>
@@ -177,6 +181,10 @@ struct vision_ctx {
     
     // 🔧 [高清模式] 运行时覆盖 max_slice_nums，-1 表示使用模型默认值
     int max_slice_nums_override = -1;
+
+    // CoreML / ANE model path
+    std::string coreml_model_path;
+
     ggml_backend_sched_ptr sched;
 
     // for debugging
@@ -2035,6 +2043,12 @@ bool vision_image_encode(struct vision_ctx * ctx, const int n_threads, vision_im
     *img_copy = *img;
     imgs.entries.push_back(std::move(img_copy));
 
+#if defined(ENABLE_COREML)
+    if (!ctx->coreml_model_path.empty()) {
+        LOG_INF("vision use CoreML (ANE)\n");
+        return vision_image_batch_encode_coreml(ctx, &imgs, vec);
+    }
+#endif
     return vision_image_batch_encode(ctx, n_threads, &imgs, vec);
 }
 
@@ -2044,4 +2058,174 @@ void vision_set_max_slice_nums(struct vision_ctx * ctx, int max_slice_nums) {
         ctx->max_slice_nums_override = max_slice_nums;
         LOG_INF("%s: max_slice_nums_override set to %d\n", __func__, max_slice_nums);
     }
+}
+
+//
+// CoreML / ANE support
+//
+void vision_set_coreml_model_path(struct vision_ctx * ctx, const char * coreml_model_path) {
+    if (ctx && coreml_model_path) {
+        ctx->coreml_model_path = std::string(coreml_model_path);
+        LOG_INF("%s: CoreML model path set to: %s\n", __func__, coreml_model_path);
+    }
+}
+
+// forward declaration of the static coreml encode function (defined below)
+#if defined(__APPLE__) && defined(ENABLE_COREML)
+static bool vision_image_encode_coreml(float * pixel_values, int32_t * position_ids, float * pos_embed_2d, float * vec, const char * coreml_model_path);
+#endif
+
+bool vision_coreml_warmup(struct vision_ctx * ctx) {
+#if defined(__APPLE__) && defined(ENABLE_COREML)
+    if (!ctx || ctx->coreml_model_path.empty()) {
+        return false;
+    }
+
+    LOG_INF("%s: warming up vision CoreML/ANE model...\n", __func__);
+    const int64_t t_start_us = ggml_time_us();
+
+    // ANE model fixed input shapes:
+    //   pixel_values:  [1, 3, 14, 14336]
+    //   position_ids:  [1, 1024]
+    //   pos_embed_2d:  [1024, 1, embed_dim]
+    //   output:        [1, n_query, embed_dim]
+    const int embed_dim = vision_n_mmproj_embd(ctx);
+    const int n_query   = vision_n_output_tokens(ctx);
+    const int n_pixels  = 3 * 14 * 14336;
+    const int n_pos     = 1024;
+
+    std::vector<float>   dummy_pixels(n_pixels, 0.0f);
+    std::vector<int32_t> dummy_pos_ids(n_pos, 0);
+    std::vector<float>   dummy_pos_embed(n_pos * embed_dim, 0.0f);
+    std::vector<float>   dummy_output(n_query * embed_dim, 0.0f);
+
+    // run a full dummy inference to trigger ANE model loading & compilation
+    bool ok = vision_image_encode_coreml(
+        dummy_pixels.data(), dummy_pos_ids.data(), dummy_pos_embed.data(),
+        dummy_output.data(), ctx->coreml_model_path.c_str()
+    );
+
+    const int64_t t_end_us = ggml_time_us();
+    if (ok) {
+        LOG_INF("%s: vision CoreML/ANE warmup done in %.2f ms\n", __func__, (t_end_us - t_start_us) / 1000.0);
+    } else {
+        LOG_WRN("%s: vision CoreML/ANE warmup failed\n", __func__);
+    }
+    return ok;
+#else
+    (void)ctx;
+    return false;
+#endif
+}
+
+#if defined(ENABLE_COREML)
+static bool vision_image_encode_coreml(float * pixel_values, int32_t * position_ids, float * pos_embed_2d, float * vec, const char * coreml_model_path) {
+    static int flag = 0;
+    static const void* coremlEncoder = NULL;
+    static std::string cached_model_path = "";
+
+    // Check if we need to load a new model
+    if (flag == 0 || (coreml_model_path && cached_model_path != coreml_model_path)) {
+        if (coremlEncoder) {
+            omni_coreml_closeModel(coremlEncoder);
+        }
+        coremlEncoder = omni_coreml_loadModel(coreml_model_path);
+        if (!coremlEncoder) {
+            printf("Failed to load CoreML model from: %s\n", coreml_model_path ? coreml_model_path : "null");
+            return false;
+        }
+        cached_model_path = coreml_model_path ? coreml_model_path : "";
+        flag = 1;
+    }
+    omni_coreml_predictWith(coremlEncoder, pixel_values, position_ids, pos_embed_2d, vec);
+    return true;
+}
+#endif
+
+bool vision_image_batch_encode_coreml(vision_ctx * ctx, const vision_image_f32_batch * imgs_c_ptr, float * vec) {
+#if defined(ENABLE_COREML)
+    const vision_image_f32_batch & imgs = *imgs_c_ptr;
+    int batch_size = imgs.entries.size();
+
+    if (batch_size != 1) {
+        return false; // only support batch size of 1
+    }
+
+    const auto & model   = ctx->model;
+    const auto & hparams = model.hparams;
+
+    const int image_size_width  = imgs.entries[0]->nx;
+    const int image_size_height = imgs.entries[0]->ny;
+    const int patch_size    = hparams.patch_size;
+    const int pos_w = image_size_width  / patch_size;
+    const int pos_h = image_size_height / patch_size;
+
+    std::vector<float> inp_raw;
+    std::vector<int32_t> positions;
+    std::vector<float> pos_embed;
+
+    // prepare inp_raw: rearrange image pixels into patch layout for ANE
+    // ANE model expects [1, 3, 14, 14336] where patches are laid out horizontally
+    {
+        const int max_patches = 1024;
+        const int nx = max_patches * patch_size;
+        const int ny = patch_size;
+        const int n = nx * ny;
+        inp_raw.assign(3 * n, 0.0f);
+
+        int patch_index = 0;
+        for (int i = 0; i < image_size_height && patch_index < max_patches; i += patch_size) {
+            for (int j = 0; j < image_size_width && patch_index < max_patches; j += patch_size) {
+                for (int pi = 0; pi < patch_size; ++pi) {
+                    for (int pj = 0; pj < patch_size; ++pj) {
+                        int src_index = ((i + pi) * image_size_width + (j + pj)) * 3;
+                        int dst_index = nx * pi + patch_index * patch_size + pj;
+                        inp_raw[dst_index]         = imgs.entries[0]->buf[src_index];
+                        inp_raw[n + dst_index]     = imgs.entries[0]->buf[src_index + 1];
+                        inp_raw[2 * n + dst_index] = imgs.entries[0]->buf[src_index + 2];
+                    }
+                }
+                patch_index++;
+            }
+        }
+    }
+
+    // prepare position_ids
+    {
+        positions.assign(std::max(pos_h * pos_w, 1024), 0);
+        int bucket_coords_h[1024];
+        int bucket_coords_w[1024];
+        for (int i = 0; i < pos_h; i++){
+            bucket_coords_h[i] = std::floor(70.0*i/pos_h);
+        }
+        for (int i = 0; i < pos_w; i++){
+            bucket_coords_w[i] = std::floor(70.0*i/pos_w);
+        }
+        for (int i = 0, id = 0; i < pos_h; i++){
+            for (int j = 0; j < pos_w; j++){
+                positions[id++] = bucket_coords_h[i]*70 + bucket_coords_w[j];
+            }
+        }
+    }
+
+    // prepare pos_embed_2d
+    {
+        int embed_dim = vision_n_mmproj_embd(ctx);
+
+        auto pos_embed_t = get_2d_sincos_pos_embed(embed_dim, std::make_pair(pos_w, pos_h));
+
+        pos_embed.assign(embed_dim * std::max(pos_w * pos_h, 1024), 0.0f);
+        for(int i = 0; i < pos_w * pos_h; ++i){
+            for(int j = 0; j < embed_dim; ++j){
+                pos_embed[i * embed_dim + j] = pos_embed_t[i][j];
+            }
+        }
+    }
+
+    return vision_image_encode_coreml(inp_raw.data(), positions.data(), pos_embed.data(), vec, ctx->coreml_model_path.c_str());
+#else
+    (void)ctx; (void)imgs_c_ptr; (void)vec;
+    LOG_ERR("%s: CoreML support not compiled. Rebuild with -DENABLE_COREML=ON\n", __func__);
+    return false;
+#endif
 }

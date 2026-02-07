@@ -3614,8 +3614,20 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
     if (media_type == 2) {
         LOG_INF("init vision....");
         const char * vision_path = ctx_omni->params->vpm_model.c_str();
-        auto * ctx_vision = vision_init(vision_path, vision_context_params{true, GGML_LOG_LEVEL_INFO});
+        auto * ctx_vision = vision_init(vision_path, vision_context_params{true, GGML_LOG_LEVEL_INFO, nullptr});
         ctx_omni->ctx_vision = ctx_vision;
+
+        // Set CoreML model path if available (for vision ANE acceleration)
+        if (ctx_vision && !ctx_omni->params->vision_coreml_model_path.empty()) {
+            std::ifstream coreml_file(ctx_omni->params->vision_coreml_model_path);
+            if (coreml_file.good()) {
+                coreml_file.close();
+                vision_set_coreml_model_path(ctx_vision, ctx_omni->params->vision_coreml_model_path.c_str());
+                LOG_INF("Vision CoreML model path set to: %s\n", ctx_omni->params->vision_coreml_model_path.c_str());
+            } else {
+                LOG_WRN("Vision CoreML model file does not exist: %s, skipping ANE\n", ctx_omni->params->vision_coreml_model_path.c_str());
+            }
+        }
     }
     
     ctx_omni->llm_thread_info = new LLMThreadInfo(1000);
@@ -3686,9 +3698,8 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
             std::string device_token2mel = token2wav_device;
             std::string device_vocoder = "cpu";  // Vocoder 强制用 CPU，避免 Metal 中大量小操作的开销
             
-            // 🔧 优先使用 prompt_bundle (与测试音频一致)，否则使用 prompt_cache.gguf
-            // 检查是否有 prompt_bundle_test1 目录（从测试音频生成的）
-            std::string prompt_bundle_dir = ctx_omni->token2wav_model_dir + "/haitian_ref_audio";
+            // 🔧 优先使用 prompt_bundle (setup_cache 路径)，否则 fallback 到 prompt_cache.gguf
+            std::string prompt_bundle_dir = "tools/omni/assets/default_ref_audio";
             std::string spk_file = prompt_bundle_dir + "/spk_f32.bin";
             std::string tokens_file = prompt_bundle_dir + "/prompt_tokens_i32.bin";
             std::string mel_file = prompt_bundle_dir + "/prompt_mel_btc_f32.bin";
@@ -3700,37 +3711,25 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
             }
             
             bool init_ok = false;
-            if (use_prompt_bundle) {
-                // 使用 prompt_bundle (与测试音频一致的声音)
-                print_with_timestamp("Token2Wav: using prompt_bundle from %s\n", prompt_bundle_dir.c_str());
+            // 优先级: prompt_cache.gguf > prompt_bundle (实时计算 fallback)
+            print_with_timestamp("Token2Wav: using prompt_cache from %s\n", prompt_cache_gguf.c_str());
+            init_ok = ctx_omni->token2wav_session->init_from_prompt_cache_gguf(
+                    encoder_gguf, flow_matching_gguf, flow_extra_gguf, prompt_cache_gguf,
+                    vocoder_gguf, device_token2mel, device_vocoder, 5, 1.0f);
+            if (!init_ok && use_prompt_bundle) {
+                print_with_timestamp("Token2Wav: prompt_cache failed, fallback to prompt_bundle from %s\n", prompt_bundle_dir.c_str());
                 init_ok = ctx_omni->token2wav_session->init_from_prompt_bundle(
                         encoder_gguf, flow_matching_gguf, flow_extra_gguf, prompt_bundle_dir,
-                        vocoder_gguf, device_token2mel, device_vocoder, 10, 1.0f);
-                
-                // Fallback to CPU if GPU fails
-                if (!init_ok) {
-                    ctx_omni->token2wav_session.reset();
-                    ctx_omni->token2wav_session = std::make_unique<omni::flow::Token2WavSession>();
-                    init_ok = ctx_omni->token2wav_session->init_from_prompt_bundle(
-                            encoder_gguf, flow_matching_gguf, flow_extra_gguf, prompt_bundle_dir,
-                            vocoder_gguf, "cpu", "cpu", 10, 1.0f);
-                }
-            } else {
-                // 使用 prompt_cache.gguf (默认的预缓存声音)
-                print_with_timestamp("Token2Wav: using prompt_cache from %s\n", prompt_cache_gguf.c_str());
+                        vocoder_gguf, device_token2mel, device_vocoder, 5, 1.0f);
+            }
+            // Fallback to CPU
+            if (!init_ok) {
+                print_with_timestamp("Token2Wav: GPU init failed, trying CPU mode...\n");
+                ctx_omni->token2wav_session.reset();
+                ctx_omni->token2wav_session = std::make_unique<omni::flow::Token2WavSession>();
                 init_ok = ctx_omni->token2wav_session->init_from_prompt_cache_gguf(
                         encoder_gguf, flow_matching_gguf, flow_extra_gguf, prompt_cache_gguf,
-                        vocoder_gguf, device_token2mel, device_vocoder, 10, 1.0f);
-                
-                // Fallback to CPU if GPU fails
-                if (!init_ok) {
-                    print_with_timestamp("Token2Wav: GPU init failed, trying CPU mode...\n");
-                    ctx_omni->token2wav_session.reset();
-                    ctx_omni->token2wav_session = std::make_unique<omni::flow::Token2WavSession>();
-                    init_ok = ctx_omni->token2wav_session->init_from_prompt_cache_gguf(
-                            encoder_gguf, flow_matching_gguf, flow_extra_gguf, prompt_cache_gguf,
-                            vocoder_gguf, "cpu", "cpu", 10, 1.0f);
-                }
+                        vocoder_gguf, "cpu", "cpu", 5, 1.0f);
             }
             
             if (init_ok) {
@@ -3775,8 +3774,8 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
         // 默认路径：相对于 script_dir 的 token2wav 子目录
         ctx_omni->python_t2w_model_dir = t2w_script_dir + "/token2wav";
         
-        // 参考音频路径（从 tts_bin_dir 获取，音色文件在 convert/gguf 目录下）
-        std::string ref_audio_path = tts_bin_dir + "/../haitian_ref_audio.wav";
+        // 参考音频路径
+        std::string ref_audio_path = "tools/omni/assets/default_ref_audio/default_ref_audio.wav";
         
         print_with_timestamp("Python T2W: script_dir=%s, model_dir=%s\n", 
                              ctx_omni->python_t2w_script_dir.c_str(),
@@ -3903,8 +3902,39 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
         ctx_omni->special_token_tts_pad = find_token("<|tts_pad|>");
     }
         
+    // ANE/CoreML warmup: pre-load models into NPU to avoid first-inference latency
+    omni_warmup_ane(ctx_omni);
+
     print_with_timestamp("=== omni_init success: ctx_llama = %p\n", (void*)ctx_omni->ctx_llama);
     return ctx_omni;
+}
+
+//
+// ANE/CoreML warmup — pre-load models into NPU to avoid first-inference latency
+//
+void omni_warmup_ane(struct omni_context * ctx_omni) {
+#if defined(__APPLE__)
+    if (!ctx_omni) return;
+
+    LOG_INF("%s: starting ANE/CoreML warmup...\n", __func__);
+
+    // 1. Vision ANE warmup
+    if (ctx_omni->ctx_vision) {
+        vision_coreml_warmup(ctx_omni->ctx_vision);
+    }
+
+    // 2. Future: audio ANE warmup
+    // if (ctx_omni->ctx_audio) {
+    //     audition_coreml_warmup(ctx_omni->ctx_audio);
+    // }
+
+    // 3. Future: other module ANE warmup
+    // ...
+
+    LOG_INF("%s: ANE/CoreML warmup finished\n", __func__);
+#else
+    (void)ctx_omni;
+#endif
 }
 
 // 停止所有线程（发送信号，不等待）
@@ -8575,7 +8605,7 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
             
             // 确定 ref_audio 路径：优先使用配置的路径，否则使用默认路径
             std::string system_ref_audio = ctx_omni->ref_audio_path.empty() 
-                ? "tools/omni/assets/default_ref_audio.wav" 
+                ? "tools/omni/assets/default_ref_audio/default_ref_audio.wav" 
                 : ctx_omni->ref_audio_path;
             print_with_timestamp("system prompt ref_audio: %s\n", system_ref_audio.c_str());
             

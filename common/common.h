@@ -412,6 +412,9 @@ struct common_params {
     std::string apm_model            = ""; // model path
     std::string vpm_model            = ""; // model path
 
+    // Apple Neural Engine (CoreML) support
+    std::string vision_coreml_model_path = ""; // path to CoreML .mlmodelc for vision ANE
+
     // finetune
     struct lr_opt lr;
     enum ggml_opt_optimizer_type optimizer = GGML_OPT_OPTIMIZER_TYPE_ADAMW;
