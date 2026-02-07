@@ -58,7 +58,7 @@ static void show_usage(const char * prog_name) {
         "  --audio <path>      Override audio model path\n"
         "  --tts <path>        Override TTS model path\n"
         "  --projector <path>  Override projector model path\n"
-        "  --ref-audio <path>  Reference audio for voice cloning (default: tools/omni/assets/default_ref_audio.wav)\n"
+        "  --ref-audio <path>  Reference audio for voice cloning (default: tools/omni/assets/default_ref_audio/default_ref_audio.wav)\n"
         "  -c, --ctx-size <n>  Context size (default: 4096)\n"
         "  -ngl <n>            Number of GPU layers (default: 99)\n"
         "  --no-tts            Disable TTS output\n"
@@ -150,30 +150,36 @@ static void print_model_paths(const OmniModelPaths & paths) {
 }
 
 void test_case(struct omni_context *ctx_omni, common_params& params, std::string audio_path_prefix, int cnt){
-    // 🔧 单工模式：先 prefill 所有音频输入，然后 decode 一次生成完整回复
-    // 使用同步模式 prefill 所有音频，避免 async 模式下的竞态条件
+    // 单工模式：
+    //   1. stream_prefill("", "", 0) — 初始化 system prompt (ref_audio 在内部自动处理)
+    //   2. stream_prefill(user_audio, "", 1) — 用户音频输入
+    //   3. stream_decode — 生成回复
     ctx_omni->system_prompt_initialized = false;
     bool orig_async = ctx_omni->async;
-    ctx_omni->async = false;  // 使用同步模式 prefill，确保所有音频被处理
-    
+    ctx_omni->async = false;
+
+    // Step 1: 初始化 system prompt (index=0, 不传用户音频)
+    {
+        auto t0 = std::chrono::high_resolution_clock::now();
+        stream_prefill(ctx_omni, "", "", 0);
+        auto t1 = std::chrono::high_resolution_clock::now();
+        double dt = std::chrono::duration<double>(t1 - t0).count();
+        printf("prefill 0 (system prompt): %.3f s\n", dt);
+    }
+
+    // Step 2: prefill 所有用户音频 (index >= 1)
     for (int il = 0; il < cnt; ++il) {
         char idx_str[16];
-        snprintf(idx_str, sizeof(idx_str), "%04d", il);  // 格式化为4位数字，如 0000, 0001
+        snprintf(idx_str, sizeof(idx_str), "%04d", il);
         std::string aud_fname = audio_path_prefix + idx_str + ".wav";
 
         auto t0 = std::chrono::high_resolution_clock::now();
-        // index 从 0 开始，第一次 prefill (index=0) 初始化系统 prompt
-        // 后续 prefill 在同步模式下直接添加到 KV cache
-        stream_prefill(ctx_omni, aud_fname, "", il);
+        stream_prefill(ctx_omni, aud_fname, "", il + 1);  // index 从 1 开始
         auto t1 = std::chrono::high_resolution_clock::now();
-        std::chrono::duration<double> elapsed_seconds = t1 - t0;
-        double dt = elapsed_seconds.count();
-        std::cout << "prefill " << il << " : " << dt << " s"<< std::endl;
+        double dt = std::chrono::duration<double>(t1 - t0).count();
+        printf("prefill %d (%s): %.3f s\n", il + 1, aud_fname.c_str(), dt);
     }
-    
-    // 所有音频同步 prefill 完成后，恢复 async 模式并调用 decode
-    // 注意：同步 prefill 不会启动线程，需要用 async=true 的方式调用 decode
-    // stream_decode 内部会检查 async 并启动 TTS/T2W 线程
+
     ctx_omni->async = orig_async;
     stream_decode(ctx_omni, "./");
 }
@@ -187,7 +193,7 @@ int main(int argc, char ** argv) {
     std::string audio_path_override;
     std::string tts_path_override;
     std::string projector_path_override;
-    std::string ref_audio_path = "tools/omni/assets/default_ref_audio.wav";  // 默认参考音频
+    std::string ref_audio_path = "tools/omni/assets/default_ref_audio/default_ref_audio.wav";
     int n_ctx = 4096;
     int n_gpu_layers = 99;  // GPU 层数，默认 99
     bool use_tts = true;
@@ -320,28 +326,22 @@ int main(int argc, char ** argv) {
         test_case(ctx_omni, params, std::string("tools/omni/assets/test_case/audio_test_case/audio_test_case_"), 2);
     }
 
-    // 停止并等待所有线程结束
+    // 等待 T2W 完成所有音频生成后再停止线程
+    if(ctx_omni->async && ctx_omni->use_tts) {
+        std::string done_flag = std::string(ctx_omni->base_output_dir) + "/round_000/tts_wav/generation_done.flag";
+        fprintf(stderr, "Waiting for audio generation to complete...\n");
+        for (int i = 0; i < 1200; ++i) {  // 最多等 120 秒
+            FILE * f = fopen(done_flag.c_str(), "r");
+            if (f) { fclose(f); fprintf(stderr, "Audio generation completed.\n"); break; }
+            usleep(100000);  // 100ms
+        }
+    }
+
     if(ctx_omni->async) {
-        // 发送停止信号
         omni_stop_threads(ctx_omni);
-        
-        // 等待 LLM 线程
-        if(ctx_omni->llm_thread.joinable()) {
-            ctx_omni->llm_thread.join();
-            printf("llm thread end\n");
-        }
-        
-        // 等待 TTS 线程
-        if(ctx_omni->use_tts && ctx_omni->tts_thread.joinable()) {
-            ctx_omni->tts_thread.join();
-            printf("tts thread end\n");
-        }
-        
-        // 等待 T2W 线程
-        if(ctx_omni->use_tts && ctx_omni->t2w_thread.joinable()) {
-            ctx_omni->t2w_thread.join();
-            printf("t2w thread end\n");
-        }
+        if(ctx_omni->llm_thread.joinable()) { ctx_omni->llm_thread.join(); printf("llm thread end\n"); }
+        if(ctx_omni->use_tts && ctx_omni->tts_thread.joinable()) { ctx_omni->tts_thread.join(); printf("tts thread end\n"); }
+        if(ctx_omni->use_tts && ctx_omni->t2w_thread.joinable()) { ctx_omni->t2w_thread.join(); printf("t2w thread end\n"); }
     }
 
     llama_perf_context_print(ctx_omni->ctx_llama);
