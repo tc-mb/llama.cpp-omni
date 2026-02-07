@@ -8119,11 +8119,11 @@ bool Token2Mel::start_stream_with_prompt(const PromptBundle & prompt, int n_time
     // 自动导出 prompt_cache.gguf (如果 cache 有效且同目录没有新版 GGUF)
     // 这样下次启动可以直接用 init_from_host_caches 加载，省去 setup_cache 实时计算
     if (!cache0.empty()) {
-        // 查找 prompt_bundle_dir 的父目录下的 prompt_cache_v2.gguf
-        // 使用环境变量或约定路径
+        // 导出 prompt_cache.gguf 到指定目录
+        // 设置环境变量 T2W_EXPORT_CACHE_DIR 触发导出
         const char * export_dir = ::getenv("T2W_EXPORT_CACHE_DIR");
         if (export_dir && export_dir[0] != '\0') {
-            std::string out_path = std::string(export_dir) + "/prompt_cache_v2.gguf";
+            std::string out_path = std::string(export_dir) + "/prompt_cache.gguf";
             std::ifstream probe(out_path);
             if (!probe.good()) {
                 // 写 GGUF
@@ -8166,7 +8166,7 @@ bool Token2Mel::start_stream_with_prompt(const PromptBundle & prompt, int n_time
                         add_cache("prompt_cache.estimator_att_cache", cache0.estimator_att_cache, cache0.estimator_att_ne);
 
                         if (gguf_write_to_file(guf, out_path.c_str(), false)) {
-                            std::fprintf(stderr, "[Token2Mel] exported prompt_cache_v2.gguf: %s\n", out_path.c_str());
+                            std::fprintf(stderr, "[Token2Mel] exported prompt_cache.gguf: %s\n", out_path.c_str());
                         }
                         ggml_free(tmp);
                     }
