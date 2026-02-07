@@ -3693,9 +3693,8 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
             std::string device_token2mel = token2wav_device;
             std::string device_vocoder = "cpu";  // Vocoder 强制用 CPU，避免 Metal 中大量小操作的开销
             
-            // 🔧 优先使用 prompt_bundle (与测试音频一致)，否则使用 prompt_cache.gguf
-            // 检查是否有 prompt_bundle_test1 目录（从测试音频生成的）
-            std::string prompt_bundle_dir = ctx_omni->token2wav_model_dir + "/haitian_ref_audio";
+            // 🔧 优先使用 prompt_bundle (setup_cache 路径)，否则 fallback 到 prompt_cache.gguf
+            std::string prompt_bundle_dir = "tools/omni/assets/default_ref_audio";
             std::string spk_file = prompt_bundle_dir + "/spk_f32.bin";
             std::string tokens_file = prompt_bundle_dir + "/prompt_tokens_i32.bin";
             std::string mel_file = prompt_bundle_dir + "/prompt_mel_btc_f32.bin";
@@ -3782,8 +3781,8 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
         // 默认路径：相对于 script_dir 的 token2wav 子目录
         ctx_omni->python_t2w_model_dir = t2w_script_dir + "/token2wav";
         
-        // 参考音频路径（从 tts_bin_dir 获取，音色文件在 convert/gguf 目录下）
-        std::string ref_audio_path = tts_bin_dir + "/../haitian_ref_audio.wav";
+        // 参考音频路径
+        std::string ref_audio_path = "tools/omni/assets/default_ref_audio/default_ref_audio.wav";
         
         print_with_timestamp("Python T2W: script_dir=%s, model_dir=%s\n", 
                              ctx_omni->python_t2w_script_dir.c_str(),
@@ -8492,7 +8491,7 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
             
             // 确定 ref_audio 路径：优先使用配置的路径，否则使用默认路径
             std::string system_ref_audio = ctx_omni->ref_audio_path.empty() 
-                ? "tools/omni/assets/default_ref_audio.wav" 
+                ? "tools/omni/assets/default_ref_audio/default_ref_audio.wav" 
                 : ctx_omni->ref_audio_path;
             print_with_timestamp("system prompt ref_audio: %s\n", system_ref_audio.c_str());
             
