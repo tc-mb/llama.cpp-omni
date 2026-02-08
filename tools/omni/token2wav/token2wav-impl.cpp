@@ -6318,6 +6318,12 @@ bool voc_hg2_model::voc_hg2_model_init_from_gguf(const std::string & gguf_path_i
         return false;
     }
 
+    // ⚡ [性能关键] 设置 CPU backend 线程数（之前漏掉导致 vocoder 单线程运行）
+    if (ggml_backend_buft_is_host(ggml_backend_get_default_buffer_type(backend))) {
+        ggml_backend_cpu_set_n_threads(backend, num_threads);
+        std::fprintf(stderr, "voc_hg2_model: set CPU n_threads=%d\n", num_threads);
+    }
+
     auto loader = std::make_shared<hifigan2::hg2_gguf_model_loader>();
     if (!loader->hg_gguf_model_loader_load_from_file(gguf_path, backend)) {
         LOG_ERROR( "voc_hg2_model_init_from_gguf: failed to load gguf: %s\n", gguf_path.c_str());
@@ -8541,13 +8547,31 @@ bool Token2Wav::load_models(const std::string & encoder_gguf,
                             const std::string & device_vocoder) {
     reset_stream();
 
-    constexpr int kDefaultThreads = 8;
-    if (!t2m_.load_model(encoder_gguf, flow_matching_gguf, flow_extra_gguf, device_token2mel, kDefaultThreads)) {
+    // ⚡ [实测最优] vocoder CPU 线程数可通过环境变量 VOCODER_THREADS 动态配置
+    //   实测数据 (Apple Silicon M-series):
+    //     2线程: 稳态 RTF=1.10 (慢于实时)
+    //     4线程: 稳态 RTF=0.81 ✅ (默认值，P-core only)
+    //     8线程: 稳态 RTF=0.95 (P+E混合调度 + 热节流更严重)
+    //   token2mel 跑 Metal GPU，不受此值影响
+    //   用法: VOCODER_THREADS=4 python server.py
+    constexpr int kDefaultVocoderThreads = 4;
+    int vocoder_threads = kDefaultVocoderThreads;
+    const char * env_voc_threads = std::getenv("VOCODER_THREADS");
+    if (env_voc_threads && std::strlen(env_voc_threads) > 0) {
+        int parsed = std::atoi(env_voc_threads);
+        if (parsed > 0 && parsed <= 64) {
+            vocoder_threads = parsed;
+        }
+    }
+    std::fprintf(stderr, "Token2Wav: vocoder_threads=%d (env VOCODER_THREADS=%s)\n",
+                 vocoder_threads, env_voc_threads ? env_voc_threads : "<unset>");
+
+    if (!t2m_.load_model(encoder_gguf, flow_matching_gguf, flow_extra_gguf, device_token2mel, vocoder_threads)) {
         LOG_ERROR( "Token2Wav.load_models: Token2Mel.load_model failed\n");
         models_loaded_ = false;
         return false;
     }
-    if (!voc_model_.voc_hg2_model_init_from_gguf(vocoder_gguf, device_vocoder, kDefaultThreads)) {
+    if (!voc_model_.voc_hg2_model_init_from_gguf(vocoder_gguf, device_vocoder, vocoder_threads)) {
         LOG_ERROR( "Token2Wav.load_models: voc_hg2_model_init_from_gguf failed\n");
         models_loaded_ = false;
         return false;
