@@ -502,10 +502,12 @@ async def streaming_generate(request: Request):
                 break
 
         # 等待剩余音频（decode 结束后 T2W 线程可能还在产出）
-        deadline = time.time() + 3.0
-        while time.time() < deadline:
+        # idle-timeout: 收到事件就续期，连续 2s 无事件才退出，最长等 60s
+        tail_max = time.time() + 60.0
+        idle_timeout = 2.0
+        while time.time() < tail_max:
             try:
-                item = await asyncio.wait_for(queue.get(), timeout=0.1)
+                item = await asyncio.wait_for(queue.get(), timeout=idle_timeout)
                 if item[0] == "audio":
                     pcm_bytes = item[1]
                     n_input_tokens = item[3]
@@ -533,8 +535,7 @@ async def streaming_generate(request: Request):
                 elif item[0] == "done":
                     break
             except asyncio.TimeoutError:
-                if queue.empty():
-                    break
+                break  # 连续 idle_timeout 秒无事件，T2W 已完成
 
         yield "data: [DONE]\n\n"
 
@@ -566,6 +567,19 @@ async def break_generation():
     """打断当前生成（等同于 /omni/stop）"""
     if STATE.engine is not None:
         STATE.engine.break_generation()
+    return JSONResponse({"success": True})
+
+
+@app.post("/omni/reset")
+async def reset_conversation():
+    """重置对话（清 KV cache，不重新加载模型）
+
+    用于开始新一轮对话，保留模型权重，只清除上下文。
+    """
+    if STATE.engine is None:
+        return JSONResponse({"error": "engine not initialized"}, status_code=400)
+    STATE.engine.clear_kv_cache()
+    logger.info("对话已重置 (KV cache cleared)")
     return JSONResponse({"success": True})
 
 
