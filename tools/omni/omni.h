@@ -293,9 +293,15 @@ struct omni_context {
     // text_callback: stream_decode 产出文本/控制消息时调用
     //   参数: (message: string) — 普通文本、"__IS_LISTEN__"、"__END_OF_TURN__"
     // wav_callback: T2W 线程产出 PCM 音频时调用，替代写 WAV 文件
-    //   参数: (pcm_data: int16_t*, num_samples: size_t, wav_index: int)
+    //   参数: (pcm_data: int16_t*, num_samples: size_t, wav_index: int, n_input_tokens: int)
+    //   n_input_tokens = 本次 T2W window 输入的 speech token 数（通常 28, 最后一窗可能更少）
+    // tts_chunk_callback: TTS 完成一个 text chunk 的 speech token 生成时调用
+    //   参数: (text: string, n_speech_tokens: int, chunk_idx: int)
+    //   text = 该 chunk 对应的 LLM 文本（~10 tokens 解码），
+    //   n_speech_tokens = 生成的 speech token 数（每个 40ms 音频）
     std::function<void(const std::string&)> text_callback;
-    std::function<void(const int16_t*, size_t, int)> wav_callback;
+    std::function<void(const int16_t*, size_t, int, int)> wav_callback;
+    std::function<void(const std::string&, int, int)> tts_chunk_callback;
 
     // llama inference mutex - 保护 ctx_llama 的推理操作
     std::mutex llama_mtx;

@@ -5912,6 +5912,11 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
                                                 audio_tokens_out, is_end_of_turn, tts_wav_output_dir);
                 
                 if (tts_gen_success) {
+                    // 🔧 [tts_chunk_callback] 双工模式同样触发
+                    if (ctx_omni->tts_chunk_callback) {
+                        ctx_omni->tts_chunk_callback(response, (int)audio_tokens_out.size(), current_chunk_idx);
+                    }
+                    
                     all_audio_tokens.insert(all_audio_tokens.end(), audio_tokens_out.begin(), audio_tokens_out.end());
                     
                     if (is_end_of_turn && ctx_omni->duplex_mode) {
@@ -6826,6 +6831,12 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
                                                 audio_tokens, tts_wav_output_dir, is_final_text_chunk);
                 if (tts_gen_success) {
                     tts_success = true;
+                    
+                    // 🔧 [tts_chunk_callback] TTS 完成一个 text chunk 的 speech token 生成
+                    // 回调参数: text, n_speech_tokens, chunk_idx
+                    if (ctx_omni->tts_chunk_callback) {
+                        ctx_omni->tts_chunk_callback(response, (int)audio_tokens.size(), current_chunk_idx);
+                    }
                     
                     // Save audio tokens for external token2wav processing (backup)
                     // token2wav expects relative token IDs (0-6561)
@@ -8383,7 +8394,7 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
                     
                     if (ctx_omni->wav_callback) {
                         // 🔧 [pybind11 直连路径] 通过回调直接传递 PCM 数据，零文件 I/O
-                        ctx_omni->wav_callback(pcm.data(), pcm.size(), current_wav_idx);
+                        ctx_omni->wav_callback(pcm.data(), pcm.size(), current_wav_idx, (int)process_size);
                         print_with_timestamp("T2W线程: wav_%d (callback) | %.2fs audio | %.1fms inference | RTF=%.2f | t=%lldms\n",
                                             current_wav_idx, audio_duration, t2w_ms, rtf, (long long)elapsed_ms);
                     } else {

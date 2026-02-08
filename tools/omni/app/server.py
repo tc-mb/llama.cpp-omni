@@ -408,9 +408,13 @@ async def streaming_generate(request: Request):
         """C++ text_callback（从 C++ 线程调用，GIL 已获取）"""
         loop.call_soon_threadsafe(queue.put_nowait, ("text", text))
 
-    def on_audio(pcm_bytes: bytes, wav_idx: int) -> None:
+    def on_audio(pcm_bytes: bytes, wav_idx: int, n_input_tokens: int) -> None:
         """C++ wav_callback（从 C++ T2W 线程调用，GIL 已获取）"""
-        loop.call_soon_threadsafe(queue.put_nowait, ("audio", pcm_bytes, wav_idx))
+        loop.call_soon_threadsafe(queue.put_nowait, ("audio", pcm_bytes, wav_idx, n_input_tokens))
+
+    def on_tts_chunk(text: str, n_speech_tokens: int, chunk_idx: int) -> None:
+        """C++ tts_chunk_callback（TTS 完成一个 text chunk 的 speech token 生成）"""
+        loop.call_soon_threadsafe(queue.put_nowait, ("tts_chunk", text, n_speech_tokens, chunk_idx))
 
     # 在后台线程中运行 stream_decode（阻塞调用）
     decode_done = asyncio.Event()
@@ -420,6 +424,7 @@ async def streaming_generate(request: Request):
             STATE.engine.decode(
                 on_text=on_text,
                 on_audio=on_audio,
+                on_tts_chunk=on_tts_chunk,
                 debug_dir=STATE.output_dir,
                 round_idx=-1,
             )
@@ -437,75 +442,57 @@ async def streaming_generate(request: Request):
     async def event_generator():
         """SSE 事件生成器
 
-        文本-音频对应策略:
-          C++ 回调产出 text 和 audio 两种事件。在单工模式下 LLM 先完整生成
-          所有文本（多次 text 回调），然后 TTS 逐 chunk 产出音频。
-
-          每个 audio chunk ≈ 1s，中文语速 ≈ 3 字/秒。将累积的文本按
-          ~3 字/chunk 的粒度逐步随 audio 发出，实现文本与音频的均匀对应。
-
-          在双工模式下 text/audio 自然交替，效果一致。
+        三种独立事件流，各自到达时立即发送:
+        - text 事件: LLM 每生成 10 个有效 token 触发一次
+        - tts_chunk 事件: TTS 完成一个 text chunk 的 speech token 生成时触发
+        - audio 事件: T2W 每产出 ~1s PCM 触发一次
         """
-        # 中文 TTS 语速约 3 字/秒，每个 audio chunk 约 1 秒
-        CHARS_PER_AUDIO_CHUNK = 3
-        text_buffer: str = ""  # 待分配给 audio chunk 的文本
-
-        def _drain_text() -> str:
-            """从 text_buffer 中取出一小段文本（约 CHARS_PER_AUDIO_CHUNK 字）"""
-            nonlocal text_buffer
-            if not text_buffer:
-                return ""
-            cut = min(CHARS_PER_AUDIO_CHUNK, len(text_buffer))
-            chunk_text = text_buffer[:cut]
-            text_buffer = text_buffer[cut:]
-            return chunk_text
-
         while True:
-            # 等待新事件或 decode 完成
             try:
                 item = await asyncio.wait_for(queue.get(), timeout=0.05)
             except asyncio.TimeoutError:
-                # 没有新事件，检查是否还有音频在队列中
                 if decode_done.is_set() and queue.empty():
                     break
                 continue
 
             if item[0] == "done":
-                # 发送缓冲中剩余的文本（如果有）
-                if text_buffer:
-                    event = json.dumps({
-                        "chunk_data": {"text": text_buffer, "wav": "", "sample_rate": 24000}
-                    }, ensure_ascii=False)
-                    yield f"data: {event}\n\n"
-                    text_buffer = ""
                 break
 
             elif item[0] == "text":
                 text = item[1]
                 if text == "__IS_LISTEN__":
-                    # 先发缓冲中剩余文本
-                    if text_buffer:
-                        event = json.dumps({
-                            "chunk_data": {"text": text_buffer, "wav": "", "sample_rate": 24000}
-                        }, ensure_ascii=False)
-                        yield f"data: {event}\n\n"
-                        text_buffer = ""
                     yield f"data: {json.dumps({'is_listen': True})}\n\n"
                 elif text == "__END_OF_TURN__":
                     pass  # 由 "done" 信号处理
                 else:
-                    text_buffer += text
+                    event = json.dumps({
+                        "chunk_data": {"text": text, "wav": "", "sample_rate": 24000}
+                    }, ensure_ascii=False)
+                    yield f"data: {event}\n\n"
+
+            elif item[0] == "tts_chunk":
+                # TTS 层: 10 LLM tokens → N speech tokens (至 chunk EOS)
+                tts_text = item[1]
+                n_speech_tokens = item[2]
+                chunk_idx = item[3]
+                event = json.dumps({
+                    "tts_chunk": {
+                        "text": tts_text,
+                        "n_speech_tokens": n_speech_tokens,
+                        "chunk_idx": chunk_idx,
+                        "audio_duration_ms": n_speech_tokens * 40,
+                    }
+                }, ensure_ascii=False)
+                yield f"data: {event}\n\n"
 
             elif item[0] == "audio":
                 pcm_bytes = item[1]
+                n_input_tokens = item[3]
                 wav_b64 = base64.b64encode(pcm_bytes).decode("ascii")
-                # 从 text 缓冲中按字符粒度取出一段，与此 audio chunk 对应
-                chunk_text = _drain_text()
                 event = json.dumps({
                     "chunk_data": {
-                        "wav": wav_b64,
-                        "sample_rate": 24000,
-                        "text": chunk_text,
+                        "wav": wav_b64, "sample_rate": 24000, "text": "",
+                        "n_input_tokens": n_input_tokens,
                     }
                 }, ensure_ascii=False)
                 yield f"data: {event}\n\n"
@@ -515,17 +502,32 @@ async def streaming_generate(request: Request):
                 break
 
         # 等待剩余音频（decode 结束后 T2W 线程可能还在产出）
-        # 给 T2W 线程最多 3 秒收尾
         deadline = time.time() + 3.0
         while time.time() < deadline:
             try:
                 item = await asyncio.wait_for(queue.get(), timeout=0.1)
                 if item[0] == "audio":
                     pcm_bytes = item[1]
+                    n_input_tokens = item[3]
                     wav_b64 = base64.b64encode(pcm_bytes).decode("ascii")
-                    chunk_text = _drain_text()
                     event = json.dumps({
-                        "chunk_data": {"wav": wav_b64, "sample_rate": 24000, "text": chunk_text}
+                        "chunk_data": {
+                            "wav": wav_b64, "sample_rate": 24000, "text": "",
+                            "n_input_tokens": n_input_tokens,
+                        }
+                    }, ensure_ascii=False)
+                    yield f"data: {event}\n\n"
+                elif item[0] == "tts_chunk":
+                    tts_text = item[1]
+                    n_speech_tokens = item[2]
+                    chunk_idx = item[3]
+                    event = json.dumps({
+                        "tts_chunk": {
+                            "text": tts_text,
+                            "n_speech_tokens": n_speech_tokens,
+                            "chunk_idx": chunk_idx,
+                            "audio_duration_ms": n_speech_tokens * 40,
+                        }
                     }, ensure_ascii=False)
                     yield f"data: {event}\n\n"
                 elif item[0] == "done":

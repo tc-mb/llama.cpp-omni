@@ -243,7 +243,9 @@ public:
      *
      * Args:
      *   on_text: 文本回调 (str,) — 普通文本片段、"__IS_LISTEN__"、"__END_OF_TURN__"
-     *   on_audio: 音频回调 (bytes, int) — (PCM int16 LE bytes, wav_index)
+     *   on_audio: 音频回调 (bytes, int, int) — (PCM int16 LE bytes, wav_index, n_input_tokens)
+     *   on_tts_chunk: TTS chunk 完成回调 (str, int, int) — (text, n_speech_tokens, chunk_idx)
+     *                 可选，传 None 则不触发
      *   debug_dir: 调试输出目录
      *   round_idx: 轮次索引 (-1=使用内部计数)
      *
@@ -253,6 +255,7 @@ public:
     void decode(
         py::function on_text,
         py::function on_audio,
+        py::object on_tts_chunk,
         const std::string & debug_dir,
         int round_idx
     ) {
@@ -264,12 +267,23 @@ public:
             on_text(text);
         };
 
-        ctx_->wav_callback = [on_audio](const int16_t * pcm, size_t num_samples, int wav_idx) {
+        ctx_->wav_callback = [on_audio](const int16_t * pcm, size_t num_samples, int wav_idx, int n_input_tokens) {
             py::gil_scoped_acquire acquire;
             // 将 PCM 数据包装为 bytes 对象（拷贝，安全跨线程）
             py::bytes audio_bytes(reinterpret_cast<const char*>(pcm), num_samples * sizeof(int16_t));
-            on_audio(audio_bytes, wav_idx);
+            on_audio(audio_bytes, wav_idx, n_input_tokens);
         };
+
+        // tts_chunk_callback: 可选，传 None 则不设置
+        if (!on_tts_chunk.is_none()) {
+            py::function tts_cb = on_tts_chunk.cast<py::function>();
+            ctx_->tts_chunk_callback = [tts_cb](const std::string & text, int n_speech_tokens, int chunk_idx) {
+                py::gil_scoped_acquire acquire;
+                tts_cb(text, n_speech_tokens, chunk_idx);
+            };
+        } else {
+            ctx_->tts_chunk_callback = nullptr;
+        }
 
         bool ok;
         {
@@ -294,6 +308,7 @@ public:
         if (ctx_ != nullptr) {
             ctx_->text_callback = nullptr;
             ctx_->wav_callback = nullptr;
+            ctx_->tts_chunk_callback = nullptr;
         }
     }
 
@@ -423,9 +438,14 @@ PYBIND11_MODULE(omni_engine, m) {
         .def("decode", &OmniEngine::decode,
             py::arg("on_text"),
             py::arg("on_audio"),
+            py::arg("on_tts_chunk") = py::none(),
             py::arg("debug_dir") = "./tools/omni/output",
             py::arg("round_idx") = -1,
-            "启动 decode，通过回调流式输出文本和音频")
+            "启动 decode，通过回调流式输出文本和音频\n\n"
+            "Args:\n"
+            "  on_text: 文本回调 (str,)\n"
+            "  on_audio: 音频回调 (bytes, int)\n"
+            "  on_tts_chunk: TTS chunk 回调 (str, int, int) — (text, n_speech_tokens, chunk_idx)，可选")
         .def("stop", &OmniEngine::stop,
             "中断当前生成")
         .def("clear_kv_cache", &OmniEngine::clear_kv_cache,
