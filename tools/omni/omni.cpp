@@ -590,20 +590,58 @@ struct omni_embed * omni_audio_embed_make_with_bytes(audition_ctx * ctx_audio, i
 
 struct omni_embed * omni_audio_embed_make_with_filename(struct audition_ctx * ctx_audio, int n_threads, std::string audio_path) {
     audition_audio_u8 * audio = audition_audio_u8_init();
-    // printf("omni_audio_embed_make_with_filename 1 :%s\n", audio_path.c_str());
     if (!audition_read_binary_file(audio_path.c_str(), &audio->buf)) {
         LOG_ERR("%s: failed to read audio file %s\n", __func__,  audio_path.c_str());
         return NULL;
     }
-    // printf("omni_audio_embed_make_with_filename 2 :%s\n", audio_path.c_str());
     omni_embed *embed = omni_audio_embed_make_with_bytes(ctx_audio, n_threads, audio);
     if (embed == NULL) {
         LOG_ERR("%s: failed to preprocess audio file, %s\n", __func__, audio_path.c_str());
     }
-
     audition_audio_u8_free(audio);
-    // printf("omni_audio_embed_make_with_filename 3 :%s\n", audio_path.c_str());
     return embed;
+}
+
+// 🔧 [pybind11 内存路径] 从 WAV 字节直接创建 audio embedding，无文件 I/O
+struct omni_embed * omni_audio_embed_from_wav_bytes(
+    struct audition_ctx * ctx_audio, int n_threads,
+    const unsigned char * audio_wav_bytes, size_t audio_wav_bytes_len)
+{
+    if (!audio_wav_bytes || audio_wav_bytes_len == 0) {
+        LOG_ERR("%s: audio_wav_bytes is null or empty\n", __func__);
+        return NULL;
+    }
+    audition_audio_u8 * audio = audition_audio_u8_init();
+    // 将 WAV 字节拷贝到 audition_audio_u8（函数返回后调用方可安全释放 buffer）
+    audio->buf.assign(audio_wav_bytes, audio_wav_bytes + audio_wav_bytes_len);
+    omni_embed * embed = omni_audio_embed_make_with_bytes(ctx_audio, n_threads, audio);
+    audition_audio_u8_free(audio);
+    return embed;
+}
+
+// 🔧 [pybind11 内存路径] 从图像字节直接创建 vision chunks，无文件 I/O
+bool omni_image_embed_make_chunks_from_bytes(
+    struct vision_ctx * ctx_vision, int n_threads,
+    const unsigned char * image_bytes, int image_bytes_length,
+    std::vector<std::vector<float>> & vision_chunks)
+{
+    if (!image_bytes || image_bytes_length == 0) {
+        LOG_ERR("%s: image_bytes is null or empty\n", __func__);
+        return false;
+    }
+    vision_image_u8 * img = vision_image_u8_init();
+    if (!vision_image_load_from_bytes(image_bytes, image_bytes_length, img)) {
+        vision_image_u8_free(img);
+        LOG_ERR("%s: can't decode image from bytes\n", __func__);
+        return false;
+    }
+    bool success = encode_image_with_vision_chunks(ctx_vision, n_threads, img, vision_chunks);
+    vision_image_u8_free(img);
+    if (success) {
+        LOG_INF("%s: created %d vision chunks from memory buffer (%d bytes)\n",
+                __func__, (int)vision_chunks.size(), image_bytes_length);
+    }
+    return success;
 }
 
 //
@@ -3644,29 +3682,22 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
         ctx_omni->t2w_thread_info = new T2WThreadInfo(25);  // Queue size of 10 chunks
         
         // Initialize C++ Token2Wav session
-        // Try to load token2wav GGUF models from {model_dir}/token2wav-gguf/
-        // Fallback to tools/omni/token2wav-gguf if not found
+        // 🔧 加载 token2wav 模型: 优先 tts_bin_dir (由 py_omni.cpp 传入)，回退到相对路径
         ctx_omni->token2wav_initialized = false;
         
         // 🔧 如果使用 Python Token2Wav，跳过 C++ 的初始化以节省显存
         bool skip_cpp_token2wav = ctx_omni->use_python_token2wav;
         
-        // Check if token2wav model files exist
-        // 优先检查 HF 模型目录下的 token2wav-gguf (tts_bin_dir 的父目录)
-        // 目录结构: {model_dir}/token2wav-gguf/
-        std::string gguf_root_dir = tts_bin_dir;
-        size_t last_slash = gguf_root_dir.find_last_of("/\\");
-        if (last_slash != std::string::npos) {
-            gguf_root_dir = gguf_root_dir.substr(0, last_slash);  // 获取 tts 的父目录
-        }
-        ctx_omni->token2wav_model_dir = gguf_root_dir + "/token2wav-gguf";
+        // tts_bin_dir 由调用方传入，通常是 {model_dir}/token2wav/
+        // 回退路径适用于本地开发: tools/omni/models/token2wav/
+        ctx_omni->token2wav_model_dir = tts_bin_dir;
         
         std::string encoder_test = ctx_omni->token2wav_model_dir + "/encoder.gguf";
         {
             std::ifstream f(encoder_test);
             if (!f.good()) {
                 // 尝试备用路径 (本地开发用)
-                ctx_omni->token2wav_model_dir = "tools/omni/token2wav-gguf";
+                ctx_omni->token2wav_model_dir = "tools/omni/models/token2wav";
                 print_with_timestamp("Token2Wav: trying fallback path %s\n", ctx_omni->token2wav_model_dir.c_str());
             } else {
                 print_with_timestamp("Token2Wav: found models in %s\n", ctx_omni->token2wav_model_dir.c_str());
@@ -3696,9 +3727,12 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
             
             // Device configuration - 使用 omni_init 传入的 token2wav_device 参数
             // 格式: "gpu", "gpu:0", "gpu:1", "cpu"
-            // 🔧 Token2Mel 用 GPU (Metal) 加速，Vocoder 用 CPU（因为 reshape/permute 开销太大）
+            // 🔧 Token2Mel 用 GPU (Metal) 加速，Vocoder 用 CPU
+            // [实测] Vocoder 走 Metal 单次 55891ms vs CPU 430ms（130x 慢）
+            // 原因：vocoder 由大量小 kernel (conv_transpose_1d, elu, sin, pad_reflect_1d...) 组成
+            // 每个 Metal dispatch 有固定开销，累积远超 CPU 直接计算
             std::string device_token2mel = token2wav_device;
-            std::string device_vocoder = "cpu";  // Vocoder 强制用 CPU，避免 Metal 中大量小操作的开销
+            std::string device_vocoder = "cpu";
             
             // 🔧 优先使用 prompt_bundle (setup_cache 路径)，否则 fallback 到 prompt_cache.gguf
             std::string prompt_bundle_dir = "tools/omni/assets/default_ref_audio";
@@ -3714,10 +3748,13 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
             
             bool init_ok = false;
             // 优先级: prompt_cache.gguf > prompt_bundle (实时计算 fallback)
+            // 🔧 [修复] n_timesteps 使用 -1 表示自动匹配 prompt_cache.gguf 中保存的值
+            // 之前硬编码为 5，但 prompt_cache.gguf 是用 n_timesteps=10 生成的，
+            // 导致 runner_.init_from_host_caches 中 n_timesteps 不匹配校验失败
             print_with_timestamp("Token2Wav: using prompt_cache from %s\n", prompt_cache_gguf.c_str());
             init_ok = ctx_omni->token2wav_session->init_from_prompt_cache_gguf(
                     encoder_gguf, flow_matching_gguf, flow_extra_gguf, prompt_cache_gguf,
-                    vocoder_gguf, device_token2mel, device_vocoder, 5, 1.0f);
+                    vocoder_gguf, device_token2mel, device_vocoder, -1, 1.0f);
             if (!init_ok && use_prompt_bundle) {
                 print_with_timestamp("Token2Wav: prompt_cache failed, fallback to prompt_bundle from %s\n", prompt_bundle_dir.c_str());
                 init_ok = ctx_omni->token2wav_session->init_from_prompt_bundle(
@@ -3731,7 +3768,7 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
                 ctx_omni->token2wav_session = std::make_unique<omni::flow::Token2WavSession>();
                 init_ok = ctx_omni->token2wav_session->init_from_prompt_cache_gguf(
                         encoder_gguf, flow_matching_gguf, flow_extra_gguf, prompt_cache_gguf,
-                        vocoder_gguf, "cpu", "cpu", 5, 1.0f);
+                        vocoder_gguf, "cpu", "cpu", -1, 1.0f);
             }
             
             if (init_ok) {
@@ -3757,9 +3794,9 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
         // Python T2W 模型目录：dependencies/token2wav/
         
         // 计算 Python T2W 脚本目录（相对于 tts_bin_dir）
-        // tts_bin_dir 通常是 /xxx/tools/omni/convert/gguf/token2wav-gguf
+        // tts_bin_dir 通常是 {model_dir}/token2wav/
         // 我们需要 /xxx/tools/omni/pyt2w
-        std::string t2w_script_dir = tts_bin_dir;  // /xxx/tools/omni/convert/gguf/token2wav-gguf
+        std::string t2w_script_dir = tts_bin_dir;  // 通常是 {model_dir}/token2wav/
         // 回退到 tools/omni/
         size_t convert_pos = t2w_script_dir.find("/convert/gguf/tts");
         if (convert_pos != std::string::npos) {
@@ -4209,6 +4246,17 @@ void llm_thread_func(omni_context* ctx_omni, common_params* params){
             
             // 通知等待的生产者线程，队列有空间了
             ctx_omni->llm_thread_info->cv.notify_all();
+
+            // 🔧 [并行优化] 等待当前 decode loop 结束
+            // prefill_with_emb / eval_string 内部调用 llama_decode(ctx_llama)，
+            // 不能与 stream_decode 的 decode loop 并发（同一个 ctx_llama）
+            {
+                std::unique_lock<std::mutex> da_lock(ctx_omni->decode_active_mtx);
+                ctx_omni->decode_active_cv.wait(da_lock, [&] {
+                    return !ctx_omni->decode_active.load() || !llm_thread_running;
+                });
+            }
+            if (!llm_thread_running) break;
 
             // 🔧 [与 Python 对齐] 只有非双工模式才添加 <|im_start|>user\n
             // 双工模式: 直接用 <unit> 标记用户输入开始，不需要 <|im_start|>user\n
@@ -8312,14 +8360,7 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
                 double t2w_ms = std::chrono::duration<double, std::milli>(t2w_end - t2w_start).count();
                 
                 if (!chunk_wav.empty()) {
-                    // Write WAV file
-                    std::string wav_path = tts_wav_output_dir + "/wav_" + std::to_string(ctx_omni->wav_turn_base + wav_idx) + ".wav";
-                    
-                    const int16_t num_channels = 1;
-                    const int16_t bits_per_sample = 16;
-                    const int16_t block_align = num_channels * (bits_per_sample / 8);
-                    const int32_t byte_rate = sample_rate * block_align;
-                    
+                    // 🔧 [pybind11] float → int16 PCM 转换（两条路径共用）
                     std::vector<int16_t> pcm(chunk_wav.size());
                     for (size_t i = 0; i < chunk_wav.size(); ++i) {
                         float x = chunk_wav[i];
@@ -8328,43 +8369,59 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
                         pcm[i] = (int16_t)(x * 32767.0f);
                     }
                     
-                    uint32_t data_bytes = (uint32_t)(pcm.size() * sizeof(int16_t));
-                    uint32_t riff_size = 36u + data_bytes;
+                    float audio_duration = chunk_wav.size() / (float)sample_rate;
+                    float rtf = (float)(t2w_ms / 1000.0) / audio_duration;
+                    auto wav_complete_time = std::chrono::high_resolution_clock::now();
+                    auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        wav_complete_time - ctx_omni->stream_decode_start_time).count();
                     
-                    FILE* f_wav = fopen(wav_path.c_str(), "wb");
-                    if (f_wav) {
-                        fwrite("RIFF", 1, 4, f_wav);
-                        fwrite(&riff_size, 4, 1, f_wav);
-                        fwrite("WAVE", 1, 4, f_wav);
-                        fwrite("fmt ", 1, 4, f_wav);
-                        uint32_t fmt_size = 16;
-                        uint16_t audio_format = 1;
-                        fwrite(&fmt_size, 4, 1, f_wav);
-                        fwrite(&audio_format, 2, 1, f_wav);
-                        fwrite(&num_channels, 2, 1, f_wav);
-                        fwrite(&sample_rate, 4, 1, f_wav);
-                        fwrite(&byte_rate, 4, 1, f_wav);
-                        fwrite(&block_align, 2, 1, f_wav);
-                        fwrite(&bits_per_sample, 2, 1, f_wav);
-                        fwrite("data", 1, 4, f_wav);
-                        fwrite(&data_bytes, 4, 1, f_wav);
-                        fwrite(pcm.data(), 1, data_bytes, f_wav);
-                        fclose(f_wav);
-                        
-                        float audio_duration = chunk_wav.size() / (float)sample_rate;
-                        float rtf = (float)(t2w_ms / 1000.0) / audio_duration;
-                        
-                        auto wav_complete_time = std::chrono::high_resolution_clock::now();
-                        auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                            wav_complete_time - ctx_omni->stream_decode_start_time).count();
-                        
-                        if (wav_idx == 0) {
-                            print_with_timestamp("🎉 首响时间 (First Audio Response): %lldms\n", (long long)elapsed_ms);
-                        }
-                        print_with_timestamp("T2W线程: wav_%d.wav | %.2fs audio | %.1fms inference | RTF=%.2f | t=%lldms\n",
-                                            ctx_omni->wav_turn_base + wav_idx, audio_duration, t2w_ms, rtf, (long long)elapsed_ms);
-                        wav_idx++;
+                    if (wav_idx == 0) {
+                        print_with_timestamp("🎉 首响时间 (First Audio Response): %lldms\n", (long long)elapsed_ms);
                     }
+                    
+                    int current_wav_idx = ctx_omni->wav_turn_base + wav_idx;
+                    
+                    if (ctx_omni->wav_callback) {
+                        // 🔧 [pybind11 直连路径] 通过回调直接传递 PCM 数据，零文件 I/O
+                        ctx_omni->wav_callback(pcm.data(), pcm.size(), current_wav_idx);
+                        print_with_timestamp("T2W线程: wav_%d (callback) | %.2fs audio | %.1fms inference | RTF=%.2f | t=%lldms\n",
+                                            current_wav_idx, audio_duration, t2w_ms, rtf, (long long)elapsed_ms);
+                    } else {
+                        // 原有路径：写 WAV 文件（server.cpp HTTP 模式使用）
+                        std::string wav_path = tts_wav_output_dir + "/wav_" + std::to_string(current_wav_idx) + ".wav";
+                        
+                        const int16_t num_channels = 1;
+                        const int16_t bits_per_sample = 16;
+                        const int16_t block_align = num_channels * (bits_per_sample / 8);
+                        const int32_t byte_rate = sample_rate * block_align;
+                        uint32_t data_bytes = (uint32_t)(pcm.size() * sizeof(int16_t));
+                        uint32_t riff_size = 36u + data_bytes;
+                        
+                        FILE* f_wav = fopen(wav_path.c_str(), "wb");
+                        if (f_wav) {
+                            fwrite("RIFF", 1, 4, f_wav);
+                            fwrite(&riff_size, 4, 1, f_wav);
+                            fwrite("WAVE", 1, 4, f_wav);
+                            fwrite("fmt ", 1, 4, f_wav);
+                            uint32_t fmt_size = 16;
+                            uint16_t audio_format = 1;
+                            fwrite(&fmt_size, 4, 1, f_wav);
+                            fwrite(&audio_format, 2, 1, f_wav);
+                            fwrite(&num_channels, 2, 1, f_wav);
+                            fwrite(&sample_rate, 4, 1, f_wav);
+                            fwrite(&byte_rate, 4, 1, f_wav);
+                            fwrite(&block_align, 2, 1, f_wav);
+                            fwrite(&bits_per_sample, 2, 1, f_wav);
+                            fwrite("data", 1, 4, f_wav);
+                            fwrite(&data_bytes, 4, 1, f_wav);
+                            fwrite(pcm.data(), 1, data_bytes, f_wav);
+                            fclose(f_wav);
+                            
+                            print_with_timestamp("T2W线程: wav_%d.wav | %.2fs audio | %.1fms inference | RTF=%.2f | t=%lldms\n",
+                                                current_wav_idx, audio_duration, t2w_ms, rtf, (long long)elapsed_ms);
+                        }
+                    }
+                    wav_idx++;
                 }
             } else {
                 LOG_ERR("T2W线程: feed_window 失败\n");
@@ -8666,6 +8723,7 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
     else {
         if (!ctx_omni->async) {
             if (img_fname.length() > 0) {
+                print_with_timestamp("[TIMELINE] vision_encode_start index=%d (sync)\n", index);
                 // 🔧 [高清模式] 使用 V2.6 slice schema
                 // 如果指定了 max_slice_nums，临时设置（用于高清+高刷组合模式）
                 if (max_slice_nums >= 1 && ctx_omni->ctx_vision) {
@@ -8678,11 +8736,13 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
                     LOG_ERR("%s: failed to create vision embeddings for %s\n", __func__, img_fname.c_str());
                     return false;
                 }
+                print_with_timestamp("[TIMELINE] vision_encode_done index=%d chunks=%d (sync)\n", index, (int)vision_chunks.size());
                 
                 int n_chunks = (int)vision_chunks.size();
                 int tokens_per_chunk = (int)vision_chunks[0].size() / hidden_size;
                 bool has_slices = (n_chunks > 1);
                 
+                print_with_timestamp("[TIMELINE] vision_prefill_start index=%d n_chunks=%d (sync)\n", index, n_chunks);
                 std::string prefix = "<unit>";
                 eval_string(ctx_omni, ctx_omni->params, prefix.c_str(), ctx_omni->params->n_batch, &ctx_omni->n_past, false);
                 
@@ -8700,14 +8760,17 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
                     }
                     eval_string(ctx_omni, ctx_omni->params, "\n", ctx_omni->params->n_batch, &ctx_omni->n_past, false);
                 }
+                print_with_timestamp("[TIMELINE] vision_prefill_done index=%d (sync)\n", index);
                 LOG_INF("%s: prefilled %d vision chunks (%d tokens each)\n", __func__, n_chunks, tokens_per_chunk);
             }
             if (aud_fname.length() > 0) {
+                print_with_timestamp("[TIMELINE] audio_encode_start index=%d (sync)\n", index);
                 print_with_timestamp("stream_prefill(index=%d): processing user audio: %s\n", index, aud_fname.c_str());
                 auto * embeds = omni_audio_embed_make_with_filename(ctx_omni->ctx_audio, ctx_omni->params->cpuparams.n_threads, aud_fname);
                 // 🔧 [修复] 音频太短时会在 audition_audio_preprocess 中自动 pad 静音到 100ms
                 // 这里做安全检查，如果仍然失败则跳过该帧音频
                 if (embeds != nullptr && embeds->n_pos > 0) {
+                    print_with_timestamp("[TIMELINE] audio_encode_done index=%d n_pos=%d (sync)\n", index, embeds->n_pos);
                     print_with_timestamp("stream_prefill(index=%d): user audio embedding: n_pos=%d\n", index, embeds->n_pos);
                     // 🔧 添加音频标记，与 index=0 保持一致
                     eval_string(ctx_omni, ctx_omni->params, "<|audio_start|>", ctx_omni->params->n_batch, &ctx_omni->n_past, false);
@@ -8715,6 +8778,7 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
                     eval_string(ctx_omni, ctx_omni->params, "<|audio_end|>", ctx_omni->params->n_batch, &ctx_omni->n_past, false);
                     omni_embed_free(embeds);
                 } else {
+                    print_with_timestamp("[TIMELINE] audio_encode_failed index=%d (sync)\n", index);
                     LOG_WRN("%s: audio encoding failed, skipping audio for this frame\n", __func__);
                 }
             }
@@ -8726,6 +8790,7 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
             omni_embeds * omni_embeds = new struct omni_embeds();
             //video
             if (img_fname.length() > 0) {
+                print_with_timestamp("[TIMELINE] vision_encode_start index=%d\n", index);
                 LOG_INF("%s: img_fname:%s\n", __func__, img_fname.c_str());
                 // 🔧 [高清模式] 如果指定了 max_slice_nums，临时设置（用于高清+高刷组合模式）
                 if (max_slice_nums >= 1 && ctx_omni->ctx_vision) {
@@ -8739,22 +8804,26 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
                     delete omni_embeds;
                     return false;
                 }
+                print_with_timestamp("[TIMELINE] vision_encode_done index=%d chunks=%d\n", index, (int)omni_embeds->vision_embed.size());
                 LOG_INF("%s: vision_embed has %d chunks\n", __func__, (int)omni_embeds->vision_embed.size());
             }
             //audio
             // 只有在音频路径非空时才处理音频
             if (aud_fname.length() > 0) {
+                print_with_timestamp("[TIMELINE] audio_encode_start index=%d\n", index);
                 LOG_INF("%s: aud_fname:%s\n", __func__, aud_fname.c_str());
                 auto * audio_embeds = omni_audio_embed_make_with_filename(ctx_omni->ctx_audio, ctx_omni->params->cpuparams.n_threads, aud_fname);
                 // 🔧 [修复] 音频太短时会在 audition_audio_preprocess 中自动 pad 静音到 100ms
                 // 这里做安全检查，如果仍然失败则跳过该帧音频（保持 audio_embed 为空）
                 if (audio_embeds != nullptr && audio_embeds->n_pos > 0) {
+                    print_with_timestamp("[TIMELINE] audio_encode_done index=%d n_pos=%d\n", index, audio_embeds->n_pos);
                     //save to buffer
                     LOG_INF("%s: audio_embeds->n_pos: %d ,hidden_size: %d\n", __func__, audio_embeds->n_pos, hidden_size);
                     omni_embeds->audio_embed.resize(audio_embeds->n_pos * hidden_size);
                     std::memcpy(omni_embeds->audio_embed.data(), audio_embeds->embed, omni_embeds->audio_embed.size() * sizeof(float));
                     omni_embed_free(audio_embeds);
                 } else {
+                    print_with_timestamp("[TIMELINE] audio_encode_failed index=%d\n", index);
                     LOG_WRN("%s: audio encoding failed, skipping audio for this frame: %s\n", __func__, aud_fname.c_str());
                 }
             }
@@ -8762,6 +8831,7 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
             // 🔧 [整合] <|im_start|>user\n 已在 sys prompt 末尾添加，后续轮次在 stream_decode 结束时添加
             // 不再需要在这里设置 is_round_start 标记
             
+            print_with_timestamp("[TIMELINE] llm_queue_push index=%d\n", index);
             std::unique_lock<std::mutex> lock(ctx_omni->llm_thread_info->mtx);
             ctx_omni->llm_thread_info->cv.wait(lock, [&] { return ctx_omni->llm_thread_info->queue.size() < ctx_omni->llm_thread_info->MAX_QUEUE_SIZE; });
             ctx_omni->llm_thread_info->queue.push(omni_embeds);
@@ -8774,6 +8844,90 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
     // 🔧 [诊断] 打印 stream_prefill 结束时的状态
     print_with_timestamp("\n\nc++ finish stream_prefill(index=%d). n_past=%d, n_keep=%d, n_ctx=%d\n\n",
                          index, ctx_omni->n_past, ctx_omni->n_keep, ctx_omni->params->n_ctx);
+    return true;
+}
+
+// 🔧 [pybind11 内存路径] 从内存 buffer 直接 prefill，零文件 I/O
+//
+// 仅处理 index >= 1 的 async 路径（双工模式用户输入）。
+// index == 0（系统 prompt 初始化）仍使用 stream_prefill + 文件路径。
+//
+// 内存安全保证:
+//   - audio_wav_bytes/image_bytes: 函数内拷贝一次到 audition_audio_u8/vision_image_u8
+//     函数返回后调用方可安全释放
+//   - omni_embeds*: 由 LLM 线程 queue 持有，处理后 delete
+//   - 中间 embedding 缓冲区: 在函数内分配和释放
+bool stream_prefill_from_memory(
+    struct omni_context * ctx_omni,
+    const unsigned char * audio_wav_bytes, size_t audio_wav_bytes_len,
+    const unsigned char * image_bytes, size_t image_bytes_len,
+    int index, int max_slice_nums)
+{
+    if (index < 1) {
+        LOG_ERR("%s: index must be >= 1 for memory path (index=0 uses file path for system prompt init)\n", __func__);
+        return false;
+    }
+    if (!ctx_omni->async) {
+        LOG_ERR("%s: memory path only supports async mode\n", __func__);
+        return false;
+    }
+
+    const int hidden_size = llama_n_embd(llama_get_model(ctx_omni->ctx_llama));
+
+    omni_embeds * embeds = new struct omni_embeds();
+
+    // Vision encode（从内存）
+    if (image_bytes && image_bytes_len > 0) {
+        print_with_timestamp("[TIMELINE] vision_encode_start index=%d (memory)\n", index);
+        if (max_slice_nums >= 1 && ctx_omni->ctx_vision) {
+            vision_set_max_slice_nums(ctx_omni->ctx_vision, max_slice_nums);
+        }
+        if (!omni_image_embed_make_chunks_from_bytes(
+                ctx_omni->ctx_vision, ctx_omni->params->cpuparams.n_threads,
+                image_bytes, (int)image_bytes_len, embeds->vision_embed)) {
+            LOG_ERR("%s: failed to create vision embeddings from memory (%zu bytes)\n",
+                    __func__, image_bytes_len);
+            delete embeds;
+            return false;
+        }
+        print_with_timestamp("[TIMELINE] vision_encode_done index=%d chunks=%d (memory)\n",
+                            index, (int)embeds->vision_embed.size());
+    }
+
+    // Audio encode（从内存）
+    if (audio_wav_bytes && audio_wav_bytes_len > 0) {
+        print_with_timestamp("[TIMELINE] audio_encode_start index=%d (memory)\n", index);
+        auto * audio_embeds = omni_audio_embed_from_wav_bytes(
+            ctx_omni->ctx_audio, ctx_omni->params->cpuparams.n_threads,
+            audio_wav_bytes, audio_wav_bytes_len);
+        if (audio_embeds != nullptr && audio_embeds->n_pos > 0) {
+            print_with_timestamp("[TIMELINE] audio_encode_done index=%d n_pos=%d (memory)\n",
+                                index, audio_embeds->n_pos);
+            embeds->audio_embed.resize(audio_embeds->n_pos * hidden_size);
+            std::memcpy(embeds->audio_embed.data(), audio_embeds->embed,
+                       embeds->audio_embed.size() * sizeof(float));
+            omni_embed_free(audio_embeds);
+        } else {
+            print_with_timestamp("[TIMELINE] audio_encode_failed index=%d (memory)\n", index);
+            LOG_WRN("%s: audio encoding failed from memory buffer (%zu bytes)\n",
+                    __func__, audio_wav_bytes_len);
+        }
+    }
+
+    embeds->index = index;
+
+    // 推入 LLM 线程队列（与 stream_prefill 的 async 路径相同）
+    print_with_timestamp("[TIMELINE] llm_queue_push index=%d (memory)\n", index);
+    std::unique_lock<std::mutex> lock(ctx_omni->llm_thread_info->mtx);
+    ctx_omni->llm_thread_info->cv.wait(lock, [&] {
+        return ctx_omni->llm_thread_info->queue.size() < (size_t)ctx_omni->llm_thread_info->MAX_QUEUE_SIZE;
+    });
+    ctx_omni->llm_thread_info->queue.push(embeds);
+    lock.unlock();
+    ctx_omni->llm_thread_info->cv.notify_all();
+
+    print_with_timestamp("stream_prefill_from_memory(index=%d) done. audio=%zu bytes, image=%zu bytes\n",
+                         index, audio_wav_bytes_len, image_bytes_len);
     return true;
 }
 
@@ -8886,6 +9040,14 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
         g_decode_cv.wait(lock, []{ return prefill_done; });
         prefill_done = false;
     }
+    
+    // 🔧 [并行优化] 标记 decode 开始活跃
+    // 从此刻到 decode loop 结束，LLM thread 暂停 prefill_with_emb（防止并发 llama_decode）
+    if (ctx_omni->async) {
+        std::lock_guard<std::mutex> da_lock(ctx_omni->decode_active_mtx);
+        ctx_omni->decode_active.store(true);
+    }
+    
     // 只有启用 TTS 时才设置 speek_done 为 false
     if (ctx_omni->use_tts) {
         ctx_omni->speek_done = false;
@@ -9123,8 +9285,11 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
                         
                         // 推送一个特殊的 JSON 标记到 text_queue，SSE 会转发给客户端
                         if (ctx_omni->async) {
+                            // 🔧 [pybind11] 回调优先，text_queue 始终推送（向后兼容）
+                            if (ctx_omni->text_callback) {
+                                ctx_omni->text_callback("__IS_LISTEN__");
+                            }
                             std::lock_guard<std::mutex> tl(ctx_omni->text_mtx);
-                            // 使用特殊前缀标记这是状态消息而非文本
                             ctx_omni->text_queue.push_back("__IS_LISTEN__");
                             ctx_omni->text_cv.notify_all();
                         }
@@ -9219,6 +9384,10 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
             // push text fragment for server stream
             if (!response.empty()) {
                 fflush(stdout);
+                // 🔧 [pybind11] 回调优先
+                if (ctx_omni->text_callback) {
+                    ctx_omni->text_callback(response);
+                }
                 std::lock_guard<std::mutex> tl(ctx_omni->text_mtx);
                 ctx_omni->text_queue.push_back(response);
                 ctx_omni->text_cv.notify_all();
@@ -9298,12 +9467,26 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
         fflush(stdout);
     }
     fflush(stdout);
+    
+    // 🔧 [并行优化] decode loop 结束，清除 decode_active，唤醒等待中的 LLM thread
+    if (ctx_omni->async) {
+        {
+            std::lock_guard<std::mutex> da_lock(ctx_omni->decode_active_mtx);
+            ctx_omni->decode_active.store(false);
+        }
+        ctx_omni->decode_active_cv.notify_all();
+    }
+    
     // 🔧 [P1-SSE响应] 推送轮次结束标记
     // mark text done
     {
         std::lock_guard<std::mutex> tl(ctx_omni->text_mtx);
         // 推送 end_of_turn 标记，让客户端知道当前轮次结束
         if (!ctx_omni->duplex_mode || !ctx_omni->ended_with_listen) {
+            // 🔧 [pybind11] 回调优先
+            if (ctx_omni->text_callback) {
+                ctx_omni->text_callback("__END_OF_TURN__");
+            }
             ctx_omni->text_queue.push_back("__END_OF_TURN__");
         }
 

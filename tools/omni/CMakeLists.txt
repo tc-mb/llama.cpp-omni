@@ -91,3 +91,36 @@ target_compile_features(${TARGET} PRIVATE cxx_std_17)
 # target_link_libraries(token2wav-example PRIVATE common omni Threads::Threads)
 # target_compile_features(token2wav-example PRIVATE cxx_std_17)
 
+# ==================== pybind11 Python binding ====================
+# 构建 omni_engine.cpython-*.so，供 Python 直接 import
+# 用法: cmake .. -DBUILD_PYBIND=ON -DPython3_EXECUTABLE=/path/to/python
+option(BUILD_PYBIND "Build pybind11 Python module (omni_engine)" OFF)
+if(BUILD_PYBIND)
+    find_package(Python3 REQUIRED COMPONENTS Interpreter Development)
+    # 使用 pip 安装的 pybind11 的 CMake 配置
+    execute_process(
+        COMMAND ${Python3_EXECUTABLE} -m pybind11 --cmakedir
+        OUTPUT_VARIABLE pybind11_DIR
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+    )
+    find_package(pybind11 REQUIRED HINTS ${pybind11_DIR})
+
+    pybind11_add_module(omni_engine py_omni.cpp)
+    target_link_libraries(omni_engine PRIVATE omni common ggml llama Threads::Threads)
+    target_include_directories(omni_engine PRIVATE . ../.. ../../vendor)
+    target_compile_features(omni_engine PRIVATE cxx_std_17)
+
+    # CoreML frameworks (macOS)
+    if(ENABLE_COREML)
+        target_link_libraries(omni_engine PRIVATE
+            "-framework Foundation"
+            "-framework CoreML"
+            "-framework Accelerate"
+        )
+    endif()
+
+    message(STATUS "pybind11: omni_engine module will be built")
+    message(STATUS "  Python: ${Python3_EXECUTABLE}")
+    message(STATUS "  pybind11: ${pybind11_DIR}")
+endif()
+

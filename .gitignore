@@ -23,6 +23,7 @@
 
 # IDE / OS
 
+.cursor/
 .cache/
 .ccls-cache/
 .direnv/
@@ -201,3 +202,16 @@ poetry.toml
 # Output directories
 tools/omni/output/
 tools/omni/output_*/
+
+# ==================== MiniCPM-o macOS 项目 ====================
+
+# 模型权重（GGUF / CoreML / token2wav 等，体积大，不入库）
+tools/omni/models/
+
+# App 运行时临时文件
+tools/omni/app/temp_streaming_prefill*/
+
+# 临时脚本和资源（R11.3）
+tmp/
+*/resources/*
+**/results/*

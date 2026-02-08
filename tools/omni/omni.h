@@ -209,6 +209,14 @@ struct omni_context {
     //              打断后可继续调用 prefill/decode
     std::atomic<bool> break_event{false};
     
+    // 🔧 [并行优化] decode loop 活跃标志
+    // 当 stream_decode 的 decode loop 正在运行 llama_decode 时为 true
+    // LLM thread 在 decode_active 期间暂停 prefill_with_emb（ctx_llama 不支持并发 llama_decode）
+    // stream_prefill 的 vision/audio encode 使用独立的 ctx_vision/ctx_audio，可与 decode 并行
+    std::atomic<bool> decode_active{false};
+    std::mutex decode_active_mtx;
+    std::condition_variable decode_active_cv;
+    
     // session_stop_event: 终止整个会话（预留，目前未使用）
     //                     用于彻底关闭当前会话，需要重新 omni_init
     std::atomic<bool> session_stop_event{false};
@@ -277,6 +285,17 @@ struct omni_context {
     std::deque<std::string> text_queue;
     bool text_streaming = false;
     bool text_done_flag = false;
+
+    // ==================== pybind11 直连回调 ====================
+    // 设置后，text/audio 数据通过回调直接传递给 Python，绕过 text_queue 轮询和文件 I/O
+    // 未设置时保持原有行为（text_queue + WAV 文件写入）
+    //
+    // text_callback: stream_decode 产出文本/控制消息时调用
+    //   参数: (message: string) — 普通文本、"__IS_LISTEN__"、"__END_OF_TURN__"
+    // wav_callback: T2W 线程产出 PCM 音频时调用，替代写 WAV 文件
+    //   参数: (pcm_data: int16_t*, num_samples: size_t, wav_index: int)
+    std::function<void(const std::string&)> text_callback;
+    std::function<void(const int16_t*, size_t, int)> wav_callback;
 
     // llama inference mutex - 保护 ctx_llama 的推理操作
     std::mutex llama_mtx;
@@ -396,6 +415,33 @@ struct omni_embed * omni_image_embed_make_with_bytes(struct vision_ctx * ctx_vis
 struct omni_embed * omni_image_embed_make_with_filename(struct vision_ctx * ctx_vision, int n_threads, std::string image_path);
 struct omni_embed * omni_audio_embed_make_with_bytes(struct audition_ctx * ctx_audition, int n_threads, audition_audio_f32 * audio);
 struct omni_embed * omni_audio_embed_make_with_filename(struct audition_ctx * ctx_audition, int n_threads, std::string audio_path);
+
+// ==================== 内存路径接口（pybind11 用，零文件 I/O）====================
+
+// 从原始 WAV 字节创建音频 embedding（跳过文件读取）
+// audio_wav_bytes: 完整的 WAV 文件内容（包含 RIFF header）
+// 内部分配的 embed 由调用方通过 omni_embed_free 释放
+struct omni_embed * omni_audio_embed_from_wav_bytes(
+    struct audition_ctx * ctx_audition, int n_threads,
+    const unsigned char * audio_wav_bytes, size_t audio_wav_bytes_len);
+
+// 从原始图像字节创建 vision chunks embedding（跳过文件读取）
+// image_bytes: PNG/JPEG 编码的图像数据
+// vision_chunks: 输出参数，[0]=overview, [1..n]=slices
+bool omni_image_embed_make_chunks_from_bytes(
+    struct vision_ctx * ctx_vision, int n_threads,
+    const unsigned char * image_bytes, int image_bytes_length,
+    std::vector<std::vector<float>> & vision_chunks);
+
+// 从内存 buffer 直接 prefill（替代 stream_prefill 的文件路径版本）
+// audio_wav_bytes: WAV 文件字节（可为 nullptr）
+// image_bytes: PNG/JPEG 编码字节（可为 nullptr）
+// 内存由调用方管理，函数内不持有引用（函数返回后 buffer 可安全释放）
+bool stream_prefill_from_memory(
+    struct omni_context * ctx_omni,
+    const unsigned char * audio_wav_bytes, size_t audio_wav_bytes_len,
+    const unsigned char * image_bytes, size_t image_bytes_len,
+    int index, int max_slice_nums = -1);
 
 //
 // omni main
