@@ -49,7 +49,13 @@
   <div class="btn-wrap">
     <button id="btnRecord">🎙️ 录音</button>
     <button id="btnStop" disabled>⏹️ 发送</button>
+    <button id="btnAbort" disabled style="background:var(--accent);border-color:var(--accent);">✋ 打断</button>
     <button id="btnReset">🔄 新对话</button>
+  </div>
+  <div style="display:flex;align-items:center;justify-content:center;gap:0.6rem;margin-bottom:1rem;font-size:0.85rem;color:var(--muted);">
+    <label for="lpSlider">length_penalty:</label>
+    <input id="lpSlider" type="range" min="0.8" max="2.0" step="0.05" value="1.1" style="width:120px;">
+    <span id="lpValue">1.1</span>
   </div>
 
   <div class="chat" id="chat"></div>
@@ -73,9 +79,14 @@ const $chat   = $('chat');
 const $btnRec = $('btnRecord');
 const $btnStp = $('btnStop');
 const $btnRst = $('btnReset');
+const $btnAbort = $('btnAbort');
 const $ttfa   = $('statTTFA');
 const $audio  = $('statAudio');
 const $rtf    = $('statRTF');
+
+const $lpSlider = $('lpSlider');
+const $lpValue  = $('lpValue');
+$lpSlider.addEventListener('input', () => { $lpValue.textContent = $lpSlider.value; });
 
 let mediaStream = null;
 let audioCtx = null;
@@ -84,6 +95,7 @@ let recorder = null;
 let recordedChunks = [];
 let isRecording = false;
 let isGenerating = false;
+let abortController = null;
 
 // ==================== 初始化引擎 ====================
 async function initEngine() {
@@ -92,7 +104,7 @@ async function initEngine() {
     const resp = await fetch(`${API}/omni/init_sys_prompt`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ media_type: 1, duplex_mode: false, language: 'zh' }),
+      body: JSON.stringify({ media_type: 1, duplex_mode: false, language: 'zh', length_penalty: parseFloat($lpSlider.value) }),
     });
     const data = await resp.json();
     if (data.success) {
@@ -234,8 +246,10 @@ function arrayBufferToBase64(buffer) {
 async function sendAndGenerate(wavB64) {
   const t0 = performance.now();
   isGenerating = true;
+  abortController = new AbortController();
   $btnRec.disabled = true;
   $btnRst.disabled = true;
+  $btnAbort.disabled = false;
 
   appendChat('user', '🎙️ [语音输入]');
 
@@ -258,7 +272,12 @@ async function sendAndGenerate(wavB64) {
 
     // 2. Generate (SSE)
     $status.textContent = '生成中...';
-    const genResp = await fetch(`${API}/omni/streaming_generate`, { method: 'POST' });
+    const genResp = await fetch(`${API}/omni/streaming_generate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ length_penalty: parseFloat($lpSlider.value) }),
+      signal: abortController.signal,
+    });
     const reader = genResp.body.getReader();
     const decoder = new TextDecoder();
 
@@ -361,12 +380,19 @@ async function sendAndGenerate(wavB64) {
     $status.textContent = `完成 | 生成 ${wallTime.toFixed(1)}s | 音频 ${totalAudioDur.toFixed(1)}s`;
 
   } catch (e) {
-    $status.textContent = `错误: ${e.message}`;
+    if (e.name === 'AbortError') {
+      $status.textContent = '已打断';
+      appendChat('system', '[用户打断]');
+    } else {
+      $status.textContent = `错误: ${e.message}`;
+    }
   }
 
+  abortController = null;
   isGenerating = false;
   $btnRec.disabled = false;
   $btnRst.disabled = false;
+  $btnAbort.disabled = true;
 }
 
 // ==================== Chat UI ====================
@@ -379,9 +405,24 @@ function appendChat(role, text) {
   return el;
 }
 
+// ==================== 打断 ====================
+async function abortGeneration() {
+  if (!isGenerating) return;
+  // 1. 通知 C++ 停止推理
+  try { await fetch(`${API}/omni/stop`, { method: 'POST' }); } catch (_) {}
+  // 2. 中断 SSE 流
+  if (abortController) abortController.abort();
+  // 3. 停止音频播放
+  if (playbackCtx && playbackCtx.state !== 'closed') {
+    try { await playbackCtx.close(); } catch (_) {}
+    playbackCtx = null;
+  }
+}
+
 // ==================== Events ====================
 $btnRec.addEventListener('click', startRecording);
 $btnStp.addEventListener('click', stopRecording);
+$btnAbort.addEventListener('click', abortGeneration);
 $btnRst.addEventListener('click', resetConversation);
 
 // 页面加载时检查

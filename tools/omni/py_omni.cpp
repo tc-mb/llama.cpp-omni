@@ -58,6 +58,7 @@ public:
      *   output_dir: 输出目录路径
      *   voice_audio: 参考音频路径（用于音色克隆），空字符串表示不使用
      *   language: 语言设置 "zh" 或 "en"
+     *   length_penalty: EOS length penalty (>1.0 生成更长回复，README 推荐 1.1)
      *
      * Raises:
      *   RuntimeError: 模型加载失败
@@ -75,7 +76,8 @@ public:
         const std::string & coreml_path,
         const std::string & output_dir,
         const std::string & voice_audio,
-        const std::string & language
+        const std::string & language,
+        float length_penalty
     ) {
         if (ctx_ != nullptr) {
             throw std::runtime_error("OmniEngine already initialized, call free() first");
@@ -129,6 +131,7 @@ public:
         ctx_->async = true;
         ctx_->duplex_mode = duplex_mode;
         ctx_->language = language;
+        ctx_->length_penalty = length_penalty;
 
         // CoreML warmup
         if (!coreml_path.empty()) {
@@ -313,6 +316,22 @@ public:
     }
 
     /**
+     * 设置 TTS EOS length_penalty（运行时可调，无需重载模型）
+     */
+    void set_length_penalty(float lp) {
+        if (ctx_ != nullptr) {
+            ctx_->length_penalty = lp;
+        }
+    }
+
+    /**
+     * 获取当前 length_penalty
+     */
+    float get_length_penalty() const {
+        return ctx_ ? ctx_->length_penalty : 1.1f;
+    }
+
+    /**
      * 中断当前生成（双工模式下用户打断）
      */
     void stop() {
@@ -419,7 +438,9 @@ PYBIND11_MODULE(omni_engine, m) {
             py::arg("output_dir") = "./tools/omni/output",
             py::arg("voice_audio") = "",
             py::arg("language") = "zh",
-            "初始化推理引擎（加载模型）")
+            py::arg("length_penalty") = 1.1f,
+            "初始化推理引擎（加载模型）\n\n"
+            "length_penalty: EOS length penalty, >1.0 生成更长回复 (README 推荐 1.1)")
         .def("prefill", &OmniEngine::prefill,
             py::arg("audio_path"),
             py::arg("image_path") = "",
@@ -456,6 +477,11 @@ PYBIND11_MODULE(omni_engine, m) {
             "清除 text/wav 回调（SSE generator 结束后调用）")
         .def("free", &OmniEngine::free,
             "释放所有资源")
+        .def("set_length_penalty", &OmniEngine::set_length_penalty,
+            "设置 TTS EOS length_penalty（运行时可调，无需重载模型）",
+            py::arg("length_penalty"))
+        .def_property_readonly("length_penalty", &OmniEngine::get_length_penalty,
+            "当前 TTS EOS length_penalty")
         .def_property_readonly("n_past", &OmniEngine::get_n_past,
             "当前 KV cache 使用量")
         .def_property_readonly("n_keep", &OmniEngine::get_n_keep,

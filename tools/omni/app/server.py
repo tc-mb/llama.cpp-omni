@@ -151,6 +151,8 @@ class ServerState:
         self.prefill_counter: int = 0
         self.temp_dir: str = ""
         self.lock: threading.Lock = threading.Lock()
+        # decode 线程跟踪（确保打断后等旧 decode 完成再启动新的）
+        self.decode_thread: Optional[threading.Thread] = None
         # 配置（由 main 填充）
         self.llm_model: str = ""
         self.model_dir: str = ""
@@ -260,19 +262,23 @@ async def init_sys_prompt(request: Request):
 
     duplex_mode: bool = body.get("duplex_mode", STATE.duplex_mode)
     language: str = body.get("language", STATE.language)
+    length_penalty: float = float(body.get("length_penalty", 1.1))
 
-    logger.info(f"init_sys_prompt: media_type={media_type}, duplex={duplex_mode}, lang={language}")
+    logger.info(f"init_sys_prompt: media_type={media_type}, duplex={duplex_mode}, lang={language}, length_penalty={length_penalty}")
 
     try:
         # 如果已初始化且参数相同，跳过完整重新加载
         # 避免 Metal GPU 资源释放不及时导致的 OOM crash
         if STATE.initialized and STATE.engine is not None:
-            logger.info("已初始化，跳过重新加载（避免 Metal OOM）")
+            # 运行时可调参数直接更新，无需重载模型
+            STATE.engine.set_length_penalty(length_penalty)
+            logger.info(f"已初始化，更新 length_penalty={length_penalty}，跳过重新加载（避免 Metal OOM）")
             return JSONResponse({
                 "success": True,
                 "media_type": media_type,
                 "duplex_mode": duplex_mode,
                 "language": language,
+                "length_penalty": length_penalty,
                 "backend": "pybind11_direct",
                 "note": "already_initialized",
             })
@@ -309,6 +315,7 @@ async def init_sys_prompt(request: Request):
             output_dir=STATE.output_dir,
             voice_audio=STATE.ref_audio,
             language=language,
+            length_penalty=length_penalty,
         ))
 
         STATE.engine = engine
@@ -322,6 +329,7 @@ async def init_sys_prompt(request: Request):
             "media_type": media_type,
             "duplex_mode": duplex_mode,
             "language": language,
+            "length_penalty": length_penalty,
             "backend": "pybind11_direct",
         })
     except Exception as e:
@@ -400,6 +408,27 @@ async def streaming_generate(request: Request):
     if not STATE.initialized or STATE.engine is None:
         return JSONResponse({"error": "engine not initialized"}, status_code=400)
 
+    # 每轮生成可调 length_penalty（可选，不传则保持当前值）
+    body = {}
+    if request.headers.get("content-type", "").startswith("application/json"):
+        try:
+            body = await request.json()
+        except Exception:
+            pass
+    if "length_penalty" in body:
+        lp: float = float(body["length_penalty"])
+        STATE.engine.set_length_penalty(lp)
+        logger.info(f"streaming_generate: length_penalty={lp}")
+
+    # 等待上一轮 decode 线程完成（打断后可能还在 cleanup）
+    if STATE.decode_thread is not None and STATE.decode_thread.is_alive():
+        logger.info("streaming_generate: 等待上一轮 decode 完成...")
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, STATE.decode_thread.join, 10.0)  # 最多等 10s
+        if STATE.decode_thread.is_alive():
+            logger.warning("streaming_generate: 上一轮 decode 超时未完成")
+        STATE.decode_thread = None
+
     # 创建 asyncio queue 用于桥接 C++ 回调 → SSE 流
     queue: asyncio.Queue = asyncio.Queue()
     loop = asyncio.get_event_loop()
@@ -438,6 +467,7 @@ async def streaming_generate(request: Request):
 
     decode_thread = threading.Thread(target=run_decode, name="decode_worker", daemon=True)
     decode_thread.start()
+    STATE.decode_thread = decode_thread
 
     async def event_generator():
         """SSE 事件生成器
@@ -556,9 +586,10 @@ async def streaming_generate(request: Request):
 
 @app.post("/omni/stop")
 async def stop_generation():
-    """停止当前生成"""
+    """停止当前生成（break_event + 清 TTS 队列）"""
     if STATE.engine is not None:
-        STATE.engine.break_generation()
+        STATE.engine.break_generation()  # 设 break_event=true
+        STATE.engine.stop()              # 清 TTS 队列，加速退出
     return JSONResponse({"success": True})
 
 
@@ -567,6 +598,7 @@ async def break_generation():
     """打断当前生成（等同于 /omni/stop）"""
     if STATE.engine is not None:
         STATE.engine.break_generation()
+        STATE.engine.stop()
     return JSONResponse({"success": True})
 
 

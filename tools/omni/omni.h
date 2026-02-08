@@ -133,10 +133,11 @@ struct omni_context {
     // false: 外部传入的已有模型（模型复用），omni_free 时不释放
     bool owns_model = true;
 
-    // 🔧 [Length Penalty] 用于调整 EOS token 的采样概率
-    // length_penalty > 1.0 会降低 EOS 概率，让模型生成更长的输出
+    // 🔧 [Length Penalty] 用于调整 LLM EOS token (<|tts_eos|>) 的采样概率
+    // length_penalty > 1.0 会降低 EOS 概率，让模型生成更长的回复内容
     // length_penalty < 1.0 会增加 EOS 概率，让模型更早结束
-    float length_penalty = 1.0f;
+    // HuggingFace README 推荐值: 1.1
+    float length_penalty = 1.1f;
 
     struct llama_context * ctx_tts_llama = NULL;
     struct llama_model * model_tts = NULL;
@@ -408,6 +409,7 @@ struct omni_context {
     llama_token tts_bos_token_id = -1;           // <|tts_bos|>: TTS 开始（用于双工强制继续说话）
     llama_token special_token_unit_end = -1;     // </unit>: unit 结束标记（双工 chunk 边界）
     llama_token special_token_tts_pad = -1;      // <|tts_pad|>: TTS 填充（双工模式下禁止采样）
+    llama_token special_token_interrupt = -1;    // <|interrupt|>: 用户打断标记（ID 151707）
 };
 
 //

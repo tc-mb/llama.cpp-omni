@@ -3939,6 +3939,10 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
         // 🔧 [双工模式] 初始化 <|tts_pad|> token（双工模式下禁止采样此 token）
         // Python: self.forbidden_token_ids = [self.tts_pad_id] + list(bad_token_ids)
         ctx_omni->special_token_tts_pad = find_token("<|tts_pad|>");
+        
+        // 🔧 [打断机制] 初始化 <|interrupt|> token（用户打断时注入 KV cache）
+        ctx_omni->special_token_interrupt = find_token("<|interrupt|>");
+        print_with_timestamp("special_token_interrupt = %d\n", ctx_omni->special_token_interrupt);
     }
         
     // ANE/CoreML warmup: pre-load models into NPU to avoid first-inference latency
@@ -8989,11 +8993,11 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
     if (!ctx_omni->duplex_mode) ctx_omni->llm_generation_done.store(false);
     ctx_omni->ended_with_listen = false;
     
-    // 🔧 [关键修复] 在 decode 开始时重置 break_event
+    // 🔧 [关键修复] 在 decode 开始时重置 break_event（双工 + 单工通用）
     // 问题：break_event 只在 T2W 线程中被重置，但 T2W 可能还在等待数据
     //       导致新的 decode 检测到 break_event=true 后立即退出，不生成任何 token
     // 解决：在 decode 开始时立即重置 break_event，确保新一轮生成可以正常进行
-    if (ctx_omni->duplex_mode && ctx_omni->break_event.load()) {
+    if (ctx_omni->break_event.load()) {
         ctx_omni->break_event.store(false);
         print_with_timestamp("📍 stream_decode: reset break_event from true to false\n");
     }
@@ -9547,9 +9551,16 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
         print_with_timestamp("📍 轮次 %zu 结束，记录边界于 n_past=%d\n",
                              ctx_omni->round_start_positions.size(), ctx_omni->n_past);
         
-        // 🔧 [整合] 为下一轮准备 <|im_end|>\n<|im_start|>user\n
-        // 第一轮的 <|im_start|>user\n 在 sys prompt 末尾
-        // 后续轮次需要在 decode 结束时添加，结束当前 assistant 回复并开始新一轮 user 输入
+        // 🔧 [整合] 为下一轮准备 turn 收尾 token
+        // 正常结束: <|im_end|>\n<|im_start|>user\n
+        // 被打断:   <|interrupt|><|im_end|>\n<|im_start|>user\n
+        //   <|interrupt|> 标记当前 assistant turn 被用户打断，模型在训练时可能见过此模式
+        if (ctx_omni->break_event.load() && ctx_omni->special_token_interrupt >= 0) {
+            // 用户打断：先注入 <|interrupt|>，再关闭 turn
+            std::vector<llama_token> interrupt_tokens = {ctx_omni->special_token_interrupt};
+            eval_tokens(ctx_omni, ctx_omni->params, interrupt_tokens, 1, &ctx_omni->n_past);
+            print_with_timestamp("📍 用户打断: eval <|interrupt|>, n_past=%d\n", ctx_omni->n_past);
+        }
         eval_string(ctx_omni, ctx_omni->params, "<|im_end|>\n<|im_start|>user\n", ctx_omni->params->n_batch, &ctx_omni->n_past, false);
         print_with_timestamp("📍 为下一轮准备: eval <|im_end|>\\n<|im_start|>user\\n, n_past=%d\n", ctx_omni->n_past);
     }
