@@ -5786,6 +5786,18 @@ int main(int argc, char ** argv) {
         params.tts_model = model_dir_normalized + "tts/MiniCPM-o-4_5-tts-F16.gguf";
         // LLM 模型路径由 llama-server 启动时的 --model 参数指定，这里不需要设置
         // params.model.path 已经由 ctx_server.model 提供
+        
+        // 视觉编码器后端: "metal"(默认GPU) 或 "coreml"(ANE加速)
+        std::string vision_backend = json_value(data, "vision_backend", std::string("metal"));
+        if (vision_backend == "coreml") {
+            // CoreML 模式：自动从 model_dir/vision/ 下查找 .mlmodelc
+            std::string vision_coreml = json_value(data, "vision_coreml_model_path",
+                std::string(model_dir_normalized + "vision/coreml_minicpmo45_vit_all_f16.mlmodelc"));
+            params.vision_coreml_model_path = vision_coreml;
+        } else {
+            // Metal (GPU) 模式：不设置 CoreML 路径
+            params.vision_coreml_model_path = "";
+        }
 
         {
             std::lock_guard<std::mutex> lock(ctx_server.octx_mutex);
