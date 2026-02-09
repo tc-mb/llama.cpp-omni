@@ -103,12 +103,13 @@ static void sigint_handler(int signo) {
 // └── vision/
 //     └── MiniCPM-o-4_5-vision-F16.gguf
 struct OmniModelPaths {
-    std::string llm;         // LLM 模型路径
-    std::string vision;      // 视觉模型路径
-    std::string audio;       // 音频模型路径
-    std::string tts;         // TTS 模型路径
-    std::string projector;   // Projector 模型路径
-    std::string base_dir;    // 模型根目录
+    std::string llm;           // LLM 模型路径
+    std::string vision;        // 视觉模型路径
+    std::string audio;         // 音频模型路径
+    std::string tts;           // TTS 模型路径
+    std::string projector;     // Projector 模型路径
+    std::string vision_coreml; // CoreML 视觉模型路径 (.mlmodelc)
+    std::string base_dir;      // 模型根目录
 };
 
 static std::string get_parent_dir(const std::string & path) {
@@ -138,6 +139,7 @@ static OmniModelPaths resolve_model_paths(const std::string & llm_path) {
     paths.audio = paths.base_dir + "/audio/MiniCPM-o-4_5-audio-F16.gguf";
     paths.tts = paths.base_dir + "/tts/MiniCPM-o-4_5-tts-F16.gguf";
     paths.projector = paths.base_dir + "/tts/MiniCPM-o-4_5-projector-F16.gguf";
+    paths.vision_coreml = paths.base_dir + "/vision/coreml_minicpmo45_vit_all_f16.mlmodelc";
     
     return paths;
 }
@@ -315,8 +317,7 @@ int main(int argc, char ** argv) {
     // 只有显式选择 coreml 后端时才设置 CoreML 模型路径
     if (vision_backend == "coreml") {
         if (vision_coreml_model_path.empty()) {
-            fprintf(stderr, "Error: --vision-backend coreml requires --vision-coreml <path>\n");
-            return 1;
+            vision_coreml_model_path = paths.vision_coreml;
         }
         params.vision_coreml_model_path = vision_coreml_model_path;
     }
