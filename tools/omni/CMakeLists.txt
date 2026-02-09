@@ -2,6 +2,9 @@
 
 find_package(Threads REQUIRED)
 
+# CoreML / ANE support option
+option(ENABLE_COREML "Enable CoreML/ANE support for vision encoder" OFF)
+
 add_library(omni
             omni.cpp
             omni.h
@@ -16,12 +19,38 @@ add_library(omni
             token2wav/token2wav.h
             )
 
+# Add CoreML related files when enabled
+if(ENABLE_COREML)
+    target_sources(omni PRIVATE
+        coreml/omni_coreml.h
+        coreml/omni_coreml.mm
+        coreml/coreml_minicpmo45_vit_all_f16.h
+        coreml/coreml_minicpmo45_vit_all_f16.m
+    )
+    # Define compile-time macro for code guards
+    target_compile_definitions(omni PRIVATE ENABLE_COREML)
+
+    # Enable ARC for Objective-C files
+    set_source_files_properties(coreml/omni_coreml.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+    set_source_files_properties(coreml/coreml_minicpmo45_vit_all_f16.m PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+endif()
+
 target_link_libraries     (omni PUBLIC ggml llama common)
 target_link_libraries     (omni PRIVATE Threads::Threads)
 target_include_directories(omni PUBLIC  .)
 target_include_directories(omni PRIVATE ../..)
 target_include_directories(omni PRIVATE ../../vendor)
 target_compile_features   (omni PRIVATE cxx_std_17)
+
+# Link CoreML and Accelerate frameworks when CoreML is enabled
+if(ENABLE_COREML)
+    target_link_libraries(omni PRIVATE
+        "-framework Foundation"
+        "-framework CoreML"
+        "-framework Accelerate"
+        "-ObjC"
+    )
+endif()
 
 if (BUILD_SHARED_LIBS)
     set_target_properties     (omni PROPERTIES POSITION_INDEPENDENT_CODE ON)

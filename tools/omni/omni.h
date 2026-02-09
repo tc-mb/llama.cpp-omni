@@ -408,6 +408,9 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
 
 void omni_free(struct omni_context * ctx_omni);
 
+// ANE/CoreML warmup — call once after omni_init to pre-load models into NPU
+void omni_warmup_ane(struct omni_context * ctx_omni);
+
 // 停止所有线程（在 join 之前调用）
 void omni_stop_threads(struct omni_context * ctx_omni);
 

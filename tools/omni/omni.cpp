@@ -3621,8 +3621,20 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
     if (media_type == 2) {
         LOG_INF("init vision....");
         const char * vision_path = ctx_omni->params->vpm_model.c_str();
-        auto * ctx_vision = vision_init(vision_path, vision_context_params{true, GGML_LOG_LEVEL_INFO});
+        auto * ctx_vision = vision_init(vision_path, vision_context_params{true, GGML_LOG_LEVEL_INFO, nullptr});
         ctx_omni->ctx_vision = ctx_vision;
+
+        // Set CoreML model path if available (for vision ANE acceleration)
+        if (ctx_vision && !ctx_omni->params->vision_coreml_model_path.empty()) {
+            std::ifstream coreml_file(ctx_omni->params->vision_coreml_model_path);
+            if (coreml_file.good()) {
+                coreml_file.close();
+                vision_set_coreml_model_path(ctx_vision, ctx_omni->params->vision_coreml_model_path.c_str());
+                LOG_INF("Vision CoreML model path set to: %s\n", ctx_omni->params->vision_coreml_model_path.c_str());
+            } else {
+                LOG_WRN("Vision CoreML model file does not exist: %s, skipping ANE\n", ctx_omni->params->vision_coreml_model_path.c_str());
+            }
+        }
     }
     
     ctx_omni->llm_thread_info = new LLMThreadInfo(1000);
@@ -3897,8 +3909,39 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
         ctx_omni->special_token_tts_pad = find_token("<|tts_pad|>");
     }
         
+    // ANE/CoreML warmup: pre-load models into NPU to avoid first-inference latency
+    omni_warmup_ane(ctx_omni);
+
     print_with_timestamp("=== omni_init success: ctx_llama = %p\n", (void*)ctx_omni->ctx_llama);
     return ctx_omni;
+}
+
+//
+// ANE/CoreML warmup — pre-load models into NPU to avoid first-inference latency
+//
+void omni_warmup_ane(struct omni_context * ctx_omni) {
+#if defined(__APPLE__)
+    if (!ctx_omni) return;
+
+    LOG_INF("%s: starting ANE/CoreML warmup...\n", __func__);
+
+    // 1. Vision ANE warmup
+    if (ctx_omni->ctx_vision) {
+        vision_coreml_warmup(ctx_omni->ctx_vision);
+    }
+
+    // 2. Future: audio ANE warmup
+    // if (ctx_omni->ctx_audio) {
+    //     audition_coreml_warmup(ctx_omni->ctx_audio);
+    // }
+
+    // 3. Future: other module ANE warmup
+    // ...
+
+    LOG_INF("%s: ANE/CoreML warmup finished\n", __func__);
+#else
+    (void)ctx_omni;
+#endif
 }
 
 // 停止所有线程（发送信号，不等待）

@@ -74,6 +74,7 @@ struct vision_image_f32_batch {
 struct vision_context_params {
     bool use_gpu;
     enum ggml_log_level verbosity;
+    const char * coreml_model_path; // path to CoreML model (.mlmodelc) for ANE acceleration
 };
 
 
@@ -102,3 +103,8 @@ bool vision_image_preprocess(struct vision_ctx * ctx, const struct vision_image_
 // vision forward
 bool vision_image_encode      (struct vision_ctx * ctx, int n_threads, struct vision_image_f32 * img, float * vec);
 bool vision_image_batch_encode(struct vision_ctx * ctx, int n_threads, const struct vision_image_f32_batch * imgs, float * vec);
+
+// CoreML / ANE support
+void vision_set_coreml_model_path(struct vision_ctx * ctx, const char * coreml_model_path);
+bool vision_coreml_warmup(struct vision_ctx * ctx);
+bool vision_image_batch_encode_coreml(struct vision_ctx * ctx, const struct vision_image_f32_batch * imgs, float * vec);
