@@ -12,6 +12,11 @@
 #include <functional>
 #include <atomic>
 
+// Windows compatibility: pid_t is not defined on MSVC
+#ifdef _WIN32
+    typedef int pid_t;
+#endif
+
 struct vision_ctx;
 struct audition_ctx;
 struct audition_audio_f32;

@@ -52,10 +52,18 @@ if(ENABLE_COREML)
     )
 endif()
 
+# Windows-specific definitions
+if (WIN32)
+    target_compile_definitions(omni PRIVATE NOMINMAX _USE_MATH_DEFINES _CRT_SECURE_NO_WARNINGS)
+endif()
+
 if (BUILD_SHARED_LIBS)
     set_target_properties     (omni PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_compile_definitions(omni PRIVATE LLAMA_BUILD)
     target_compile_definitions(omni PUBLIC  LLAMA_SHARED)
+    if (WIN32)
+        set_target_properties(omni PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
+    endif()
 endif()
 
 set(OMNI_PUBLIC_HEADERS

@@ -35,19 +35,93 @@
 #include <condition_variable>
 #include <atomic>
 #include <fstream>
-#include <sys/time.h>
 #include <iomanip>
 #include <chrono>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <unistd.h>
-#include <dirent.h>
 #include <cmath>
 #include <sstream>
 #include <random>
 #include <cstdarg>
 #include <signal.h>
+
+#ifdef _WIN32
+    #include <windows.h>
+    #include <direct.h>
+    #include <io.h>
+    #include <process.h>
+    #include <sys/stat.h>
+    #include <sys/types.h>
+    // Windows compatibility macros
+    #define popen  _popen
+    #define pclose _pclose
+    #define unlink _unlink
+    #define stat   _stat
+    #define S_IFDIR _S_IFDIR
+#else
+    #include <sys/time.h>
+    #include <sys/stat.h>
+    #include <sys/types.h>
+    #include <sys/wait.h>
+    #include <unistd.h>
+    #include <dirent.h>
+#endif
+
+// ============================================================
+// Cross-platform helper: recursive directory creation
+// Replaces "mkdir -p" shell command for Windows compatibility
+// ============================================================
+static bool cross_platform_mkdir_p(const std::string& path) {
+    if (path.empty()) return false;
+    
+    std::string normalized = path;
+#ifdef _WIN32
+    for (char& c : normalized) {
+        if (c == '/') c = '\\';
+    }
+    size_t pos = 0;
+    if (normalized.size() >= 2 && normalized[1] == ':') {
+        pos = 2;
+        if (normalized.size() > 2 && normalized[2] == '\\') pos = 3;
+    }
+    while (pos < normalized.size() && normalized[pos] == '\\') pos++;
+    
+    while (pos < normalized.size()) {
+        pos = normalized.find('\\', pos);
+        if (pos == std::string::npos) pos = normalized.size();
+        std::string sub = normalized.substr(0, pos);
+        if (!sub.empty()) {
+            struct _stat info;
+            if (_stat(sub.c_str(), &info) != 0) {
+                if (_mkdir(sub.c_str()) != 0 && errno != EEXIST) {
+                    return false;
+                }
+            }
+        }
+        if (pos < normalized.size()) pos++;
+    }
+    return true;
+#else
+    for (char& c : normalized) {
+        if (c == '\\') c = '/';
+    }
+    size_t pos = 0;
+    if (!normalized.empty() && normalized[0] == '/') pos = 1;
+    while (pos < normalized.size()) {
+        pos = normalized.find('/', pos);
+        if (pos == std::string::npos) pos = normalized.size();
+        std::string sub = normalized.substr(0, pos);
+        if (!sub.empty()) {
+            struct stat info;
+            if (::stat(sub.c_str(), &info) != 0) {
+                if (mkdir(sub.c_str(), 0755) != 0 && errno != EEXIST) {
+                    return false;
+                }
+            }
+        }
+        if (pos < normalized.size()) pos++;
+    }
+    return true;
+#endif
+}
 
 // 前向声明：Python Token2Wav 服务函数（定义在文件后面）
 static bool start_python_t2w_service(struct omni_context * ctx_omni);
@@ -5084,26 +5158,19 @@ static bool generate_audio_tokens_local(
 
 // Helper function to play WAV file
 static void play_wav_file(const std::string& wav_file_path) {
+#ifndef _WIN32
     // Play audio asynchronously using fork() to avoid blocking TTS thread
-    // This is important because audio playback can take time and shouldn't delay
-    // the next TTS request
-    
     pid_t pid = fork();
     if (pid == 0) {
-        // Child process: execute playback command
         #ifdef __APPLE__
             execl("/usr/bin/afplay", "afplay", wav_file_path.c_str(), (char*)NULL);
         #else
             execl("/usr/bin/aplay", "aplay", wav_file_path.c_str(), (char*)NULL);
         #endif
-        // If execl fails, exit child process
         _exit(1);
     } else if (pid > 0) {
         // Parent process: continue without waiting
-        // Detach child process to avoid zombie processes
-        // Note: We don't wait for the child, allowing it to run independently
     } else {
-        // Fork failed, fallback to system() with & (less ideal but better than blocking)
         std::string play_cmd;
         #ifdef __APPLE__
             play_cmd = "afplay \"" + wav_file_path + "\" &";
@@ -5113,6 +5180,8 @@ static void play_wav_file(const std::string& wav_file_path) {
         LOG_WRN("TTS: fork() failed, using system() fallback for audio playback\n");
         system(play_cmd.c_str());
     }
+#endif
+    // Windows: no-op (audio playback handled by frontend)
 }
 
 
@@ -5142,14 +5211,11 @@ static void move_old_output_to_archive() {
         struct stat info;
         if (stat(dir_path.c_str(), &info) != 0) {
             // Directory doesn't exist, try to create it
-            std::string cmd = "mkdir -p " + dir_path;
-            int ret = system(cmd.c_str());
-            if (ret != 0) {
+            if (!cross_platform_mkdir_p(dir_path)) {
                 LOG_ERR("Failed to create output directory: %s\n", dir_path.c_str());
                 return false;
-            } else {
-                return true;
             }
+            return true;
         } else if (!(info.st_mode & S_IFDIR)) {
             LOG_ERR("Output path exists but is not a directory: %s\n", dir_path.c_str());
             return false;
@@ -5160,8 +5226,7 @@ static void move_old_output_to_archive() {
     // Helper function to find next available ID in old_output directory
     auto get_next_output_id = [](const std::string& old_output_base) -> int {
         // Ensure old_output base directory exists
-        std::string mkdir_cmd = "mkdir -p " + old_output_base;
-        system(mkdir_cmd.c_str());
+        cross_platform_mkdir_p(old_output_base);
         
         // Find maximum ID in old_output directory
         int max_id = -1;
@@ -5325,17 +5390,8 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
     
     // Helper function to create directory
     auto create_dir = [](const std::string& dir_path) {
-        struct stat info;
-        if (stat(dir_path.c_str(), &info) != 0) {
-            std::string cmd = "mkdir -p " + dir_path;
-            int ret = system(cmd.c_str());
-            if (ret != 0) {
-                LOG_ERR("Failed to create output directory: %s\n", dir_path.c_str());
-                return false;
-            }
-            return true;
-        } else if (!(info.st_mode & S_IFDIR)) {
-            LOG_ERR("Output path exists but is not a directory: %s\n", dir_path.c_str());
+        if (!cross_platform_mkdir_p(dir_path)) {
+            LOG_ERR("Failed to create output directory: %s\n", dir_path.c_str());
             return false;
         }
         return true;
@@ -5933,14 +5989,11 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
         struct stat info;
         if (stat(dir_path.c_str(), &info) != 0) {
             // Directory doesn't exist, try to create it
-            std::string cmd = "mkdir -p " + dir_path;
-            int ret = system(cmd.c_str());
-            if (ret != 0) {
+            if (!cross_platform_mkdir_p(dir_path)) {
                 LOG_ERR("Failed to create output directory: %s\n", dir_path.c_str());
                 return false;
-            } else {
-                return true;
             }
+            return true;
         } else if (!(info.st_mode & S_IFDIR)) {
             LOG_ERR("Output path exists but is not a directory: %s\n", dir_path.c_str());
             return false;
@@ -7803,9 +7856,7 @@ void t2w_thread_func_python(struct omni_context * ctx_omni, common_params *param
     
     // 确保输出目录存在
     {
-        char mkdir_cmd[512];
-        snprintf(mkdir_cmd, sizeof(mkdir_cmd), "mkdir -p %s", tts_wav_output_dir.c_str());
-        system(mkdir_cmd);
+        cross_platform_mkdir_p(tts_wav_output_dir);
     }
     
     while (t2w_thread_running) {
@@ -7828,9 +7879,7 @@ void t2w_thread_func_python(struct omni_context * ctx_omni, common_params *param
             if (!ctx_omni->duplex_mode && ctx_omni->simplex_round_idx != last_round_idx) {
                 last_round_idx = ctx_omni->simplex_round_idx;
                 tts_wav_output_dir = get_wav_output_dir();
-                char mkdir_cmd[512];
-                snprintf(mkdir_cmd, sizeof(mkdir_cmd), "mkdir -p %s", tts_wav_output_dir.c_str());
-                system(mkdir_cmd);
+                cross_platform_mkdir_p(tts_wav_output_dir);
             }
             
             // 重置 Python 缓存
@@ -7882,9 +7931,7 @@ void t2w_thread_func_python(struct omni_context * ctx_omni, common_params *param
                                 last_round_idx, received_round_idx);
             last_round_idx = received_round_idx;
             tts_wav_output_dir = get_wav_output_dir();
-            char mkdir_cmd[512];
-            snprintf(mkdir_cmd, sizeof(mkdir_cmd), "mkdir -p %s", tts_wav_output_dir.c_str());
-            system(mkdir_cmd);
+            cross_platform_mkdir_p(tts_wav_output_dir);
             // 重置 wav 索引，因为是新的轮次
             wav_idx = 0;
         }
@@ -8002,9 +8049,7 @@ void t2w_thread_func_python(struct omni_context * ctx_omni, common_params *param
                     if (!ctx_omni->duplex_mode && ctx_omni->simplex_round_idx != last_round_idx) {
                         last_round_idx = ctx_omni->simplex_round_idx;
                         tts_wav_output_dir = get_wav_output_dir();
-                        char mkdir_cmd[512];
-                        snprintf(mkdir_cmd, sizeof(mkdir_cmd), "mkdir -p %s", tts_wav_output_dir.c_str());
-                        system(mkdir_cmd);
+                        cross_platform_mkdir_p(tts_wav_output_dir);
                     }
                 }
                 break;
@@ -8184,9 +8229,7 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
             print_with_timestamp("T2W线程(C++): 新输出目录 %s\n", tts_wav_output_dir.c_str());
             
             // 确保目录存在
-            char mkdir_cmd[512];
-            snprintf(mkdir_cmd, sizeof(mkdir_cmd), "mkdir -p %s", tts_wav_output_dir.c_str());
-            system(mkdir_cmd);
+            cross_platform_mkdir_p(tts_wav_output_dir);
         }
         
         // Add new tokens to buffer
@@ -8377,9 +8420,7 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
                         tts_wav_output_dir = get_wav_output_dir();
                         print_with_timestamp("T2W线程: 轮次结束后更新输出目录为 %s\n", tts_wav_output_dir.c_str());
                         // 确保目录存在
-                        char mkdir_cmd[512];
-                        snprintf(mkdir_cmd, sizeof(mkdir_cmd), "mkdir -p %s", tts_wav_output_dir.c_str());
-                        system(mkdir_cmd);
+                        cross_platform_mkdir_p(tts_wav_output_dir);
                     }
                 }
                 // 注意：is_chunk_end 时不重置 buffer，剩余 tokens 保留给下一个 chunk
