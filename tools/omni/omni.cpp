@@ -5392,6 +5392,13 @@ static void move_old_output_to_archive() {
         } else {
             // Move entire output directory contents to old_output/<id>/
             // Use find + xargs for more reliable moving
+#ifdef _WIN32
+            std::string move_cmd = "robocopy \"" + base_output_dir + "\" \"" + old_output_dir + "\" /E /MOVE >NUL 2>&1";
+            system(move_cmd.c_str());
+            // robocopy returns non-zero on success (exit codes < 8 are success)
+            // Re-create the base output dir since robocopy /MOVE removes it
+            cross_platform_mkdir_p(base_output_dir);
+#else
             std::string move_cmd = "find " + base_output_dir + " -mindepth 1 -maxdepth 1 -exec mv {} " + old_output_dir + "/ \\; 2>/dev/null";
             int ret = system(move_cmd.c_str());
             if (ret == 0) {
@@ -5404,6 +5411,7 @@ static void move_old_output_to_archive() {
                     LOG_WRN("Failed to move old output directory (may be empty or already moved)\n");
                 }
             }
+#endif
         }
     } else {
     }
@@ -7673,6 +7681,81 @@ static bool start_python_t2w_service(struct omni_context * ctx_omni) {
     print_with_timestamp("Python T2W: 启动服务进程 %s\n", script_path.c_str());
     
     // 创建管道
+#ifdef _WIN32
+    // Windows: use CreateProcess with pipes for bidirectional communication
+    SECURITY_ATTRIBUTES sa;
+    sa.nLength = sizeof(SECURITY_ATTRIBUTES);
+    sa.bInheritHandle = TRUE;
+    sa.lpSecurityDescriptor = NULL;
+    
+    HANDLE hStdinRead, hStdinWrite, hStdoutRead, hStdoutWrite;
+    
+    if (!CreatePipe(&hStdinRead, &hStdinWrite, &sa, 0)) {
+        LOG_ERR("Python T2W: CreatePipe (stdin) 失败\n");
+        return false;
+    }
+    SetHandleInformation(hStdinWrite, HANDLE_FLAG_INHERIT, 0);
+    
+    if (!CreatePipe(&hStdoutRead, &hStdoutWrite, &sa, 0)) {
+        LOG_ERR("Python T2W: CreatePipe (stdout) 失败\n");
+        CloseHandle(hStdinRead);
+        CloseHandle(hStdinWrite);
+        return false;
+    }
+    SetHandleInformation(hStdoutRead, HANDLE_FLAG_INHERIT, 0);
+    
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    si.hStdInput = hStdinRead;
+    si.hStdOutput = hStdoutWrite;
+    si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+    si.dwFlags |= STARTF_USESTDHANDLES;
+    
+    ZeroMemory(&pi, sizeof(pi));
+    
+    // Set environment if needed
+    if (!ctx_omni->python_t2w_gpu_id.empty()) {
+        _putenv_s("CUDA_VISIBLE_DEVICES", ctx_omni->python_t2w_gpu_id.c_str());
+    }
+    
+    std::string win_cmd = "python \"" + script_path + "\"";
+    char cmd_buf[2048];
+    strncpy(cmd_buf, win_cmd.c_str(), sizeof(cmd_buf) - 1);
+    cmd_buf[sizeof(cmd_buf) - 1] = '\0';
+    
+    if (!CreateProcessA(NULL, cmd_buf, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {
+        LOG_ERR("Python T2W: CreateProcess 失败, error=%lu\n", GetLastError());
+        CloseHandle(hStdinRead);
+        CloseHandle(hStdinWrite);
+        CloseHandle(hStdoutRead);
+        CloseHandle(hStdoutWrite);
+        return false;
+    }
+    
+    CloseHandle(hStdinRead);
+    CloseHandle(hStdoutWrite);
+    CloseHandle(pi.hThread);
+    
+    ctx_omni->python_t2w_pid = (int)(intptr_t)pi.hProcess;
+    
+    // Convert HANDLEs to FILE*
+    int stdin_fd = _open_osfhandle((intptr_t)hStdinWrite, 0);
+    int stdout_fd = _open_osfhandle((intptr_t)hStdoutRead, 0);
+    
+    if (stdin_fd < 0 || stdout_fd < 0) {
+        LOG_ERR("Python T2W: _open_osfhandle 失败\n");
+        TerminateProcess(pi.hProcess, 1);
+        CloseHandle(pi.hProcess);
+        return false;
+    }
+    
+    ctx_omni->python_t2w_stdin = _fdopen(stdin_fd, "w");
+    ctx_omni->python_t2w_stdout = _fdopen(stdout_fd, "r");
+    
+#else
+    // POSIX implementation using fork/pipe
     int stdin_pipe[2];
     int stdout_pipe[2];
     
@@ -7718,6 +7801,7 @@ static bool start_python_t2w_service(struct omni_context * ctx_omni) {
     ctx_omni->python_t2w_pid = pid;
     ctx_omni->python_t2w_stdin = fdopen(stdin_pipe[1], "w");
     ctx_omni->python_t2w_stdout = fdopen(stdout_pipe[0], "r");
+#endif
     
     if (!ctx_omni->python_t2w_stdin || !ctx_omni->python_t2w_stdout) {
         LOG_ERR("Python T2W: fdopen 失败\n");
@@ -7763,6 +7847,16 @@ static void stop_python_t2w_service(struct omni_context * ctx_omni) {
     
     if (ctx_omni->python_t2w_pid > 0) {
         // 等待子进程退出
+#ifdef _WIN32
+        HANDLE hProcess = (HANDLE)(intptr_t)ctx_omni->python_t2w_pid;
+        // Wait briefly for process to exit gracefully
+        if (WaitForSingleObject(hProcess, 500) == WAIT_TIMEOUT) {
+            // Force terminate if still running
+            TerminateProcess(hProcess, 1);
+            WaitForSingleObject(hProcess, 1000);
+        }
+        CloseHandle(hProcess);
+#else
         int status;
         waitpid(ctx_omni->python_t2w_pid, &status, WNOHANG);
         
@@ -7778,6 +7872,7 @@ static void stop_python_t2w_service(struct omni_context * ctx_omni) {
         }
         
         waitpid(ctx_omni->python_t2w_pid, &status, 0);
+#endif
         ctx_omni->python_t2w_pid = -1;
     }
     
@@ -8262,8 +8357,7 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
         std::unique_lock<std::mutex> lock(mtx);
         
         // Wait for queue to have data or thread to stop
-        // cv.wait(lock, [&] { return !queue.empty() || !t2w_thread_running || ctx_omni->break_event.load(); });
-        cv.wait(lock, [&] { return !queue.empty() || !t2w_thread_running; });
+        cv.wait(lock, [&] { return !queue.empty() || !t2w_thread_running || ctx_omni->break_event.load(); });
         
         if (!t2w_thread_running && queue.empty()) {
             break;
