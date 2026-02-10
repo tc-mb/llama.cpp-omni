@@ -3421,7 +3421,11 @@ void print_with_timestamp(const char* format, ...)
     
     // 格式化时间戳
     std::tm buf;
+#ifdef _WIN32
+    localtime_s(&buf, &in_time_t);
+#else
     localtime_r(&in_time_t, &buf);
+#endif
     std::cout << std::put_time(&buf, "%H:%M:%S") << '.' << std::setfill('0') << std::setw(3) << ms.count() << " ";
     
     // 打印格式化字符串
@@ -3694,14 +3698,14 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
         ctx_omni->ctx_vision = ctx_vision;
 
         // Set CoreML model path if available (for vision ANE acceleration)
+        // Note: .mlmodelc is a directory, not a file, so use stat instead of ifstream
         if (ctx_vision && !ctx_omni->params->vision_coreml_model_path.empty()) {
-            std::ifstream coreml_file(ctx_omni->params->vision_coreml_model_path);
-            if (coreml_file.good()) {
-                coreml_file.close();
+            struct stat coreml_stat;
+            if (stat(ctx_omni->params->vision_coreml_model_path.c_str(), &coreml_stat) == 0) {
                 vision_set_coreml_model_path(ctx_vision, ctx_omni->params->vision_coreml_model_path.c_str());
                 LOG_INF("Vision CoreML model path set to: %s\n", ctx_omni->params->vision_coreml_model_path.c_str());
             } else {
-                LOG_WRN("Vision CoreML model file does not exist: %s, skipping ANE\n", ctx_omni->params->vision_coreml_model_path.c_str());
+                LOG_WRN("Vision CoreML model path does not exist: %s, skipping ANE\n", ctx_omni->params->vision_coreml_model_path.c_str());
             }
         }
     }
@@ -5286,7 +5290,11 @@ static void move_old_output_to_archive() {
         }
         
         // Check if directory has any files/subdirectories
+#ifdef _WIN32
+        std::string cmd = "dir /b \"" + dir_path + "\" 2>NUL | findstr /r \".\" >NUL 2>&1";
+#else
         std::string cmd = "test -n \"$(ls -A " + dir_path + " 2>/dev/null)\"";
+#endif
         int ret = system(cmd.c_str());
         return (ret == 0);  // Returns 0 if directory has content
     };
@@ -5315,10 +5323,29 @@ static void move_old_output_to_archive() {
         
         // Find maximum ID in old_output directory
         int max_id = -1;
+#ifdef _WIN32
+        std::string find_cmd = "dir /b \"" + old_output_base + "\" 2>NUL";
+#else
         std::string find_cmd = "ls -1 " + old_output_base + " 2>/dev/null | grep -E '^[0-9]+$' | sort -n | tail -1";
+#endif
         FILE* pipe = popen(find_cmd.c_str(), "r");
         if (pipe) {
             char buffer[128];
+#ifdef _WIN32
+            // On Windows, read all entries and find the max numeric ID
+            while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+                std::string result(buffer);
+                while (!result.empty() && (result.back() == '\n' || result.back() == '\r')) {
+                    result.pop_back();
+                }
+                if (!result.empty()) {
+                    try {
+                        int id = std::stoi(result);
+                        if (id > max_id) max_id = id;
+                    } catch (...) {}
+                }
+            }
+#else
             if (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
                 std::string result(buffer);
                 // Remove trailing newline
@@ -5333,6 +5360,7 @@ static void move_old_output_to_archive() {
                     }
                 }
             }
+#endif
             pclose(pipe);
         }
         
@@ -8517,10 +8545,17 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
     // 只有在新一轮开始时 (index == 0) 才需要等待上一轮 TTS 完成
     // 同一轮内的后续 prefill (index >= 1) 不需要等待
     if (ctx_omni->use_tts && index == 0 && ctx_omni->warmup_done.load() && !ctx_omni->duplex_mode) {
+        // 🔧 如果 break_event 已触发，跳过等待（上一轮已被打断）
+        if (ctx_omni->break_event.load()) {
+            print_with_timestamp("TTS: break_event active, skipping wait for previous round\n");
+            ctx_omni->speek_done = true;
+            ctx_omni->break_event.store(false);
+            speek_cv.notify_all();
+        }
         print_with_timestamp("TTS: 等待上一轮语音生成完成\n");
         std::unique_lock<std::mutex> lock(speek_mtx);
         // 添加超时等待，避免永久卡住
-        auto wait_result = speek_cv.wait_for(lock, std::chrono::seconds(30), [&]{return ctx_omni->speek_done; });
+        auto wait_result = speek_cv.wait_for(lock, std::chrono::seconds(5), [&]{return ctx_omni->speek_done || ctx_omni->break_event.load(); });
         if (!wait_result) {
             // 强制设置为 true 以继续
             ctx_omni->speek_done = true;
