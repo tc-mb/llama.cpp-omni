@@ -194,89 +194,50 @@ tools/omni/output/
 
 ---
 
-<details>
-<summary><h2>🐳 WebRTC Demo (macOS Docker Deployment)</h2></summary>
+## 🌐 WebRTC Demo — Real-Time Video Interaction
 
-Full-duplex real-time video interaction demo based on WebRTC. One-click deployment with pre-built Docker images.
+Full-duplex real-time video interaction demo based on WebRTC. Supports **macOS (Metal)**, **Linux (CUDA)**, and **Windows (CUDA)**.
 
-### Requirements
-
-- **Hardware**: Apple Silicon Mac (M1/M2/M3/M4), **M4 recommended** for optimal performance
-- **Software**: Docker Desktop, Python 3.10+
-- **Models**: MiniCPM-o 4.5 GGUF models (see directory structure above)
-
-### Quick Start
-
-**1. Download Docker Package**
-
-📦 [Download Docker Image (macOS)](https://drive.google.com/file/d/1vOi2T_l-MED7-q7fW-G1GHiHoDDcObxJ/view?usp=sharing)
-
-**2. Build llama-server**
+### Fastest Way: oneclick.sh (No Docker Needed)
 
 ```bash
-cd /path/to/llama.cpp-omni
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build --target llama-server -j
+# One command — auto-downloads everything, compiles, and starts all services
+PYTHON_CMD=/path/to/python bash oneclick.sh start
 ```
 
-**3. Deploy**
+Open **https://localhost:8088** after startup.
+
+### Alternative: Docker Deployment
 
 ```bash
-# Extract and enter directory
-unzip omni_docker.zip && cd omni_docker
+# Build llama-server
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target llama-server -j
 
-# Load Docker images
-docker load -i o45-frontend.tar
-docker load -i omini_backend_code/omni_backend.tar
+# Download and load Docker images
+# 📦 Download: https://drive.google.com/file/d/191h2OJYir9aAL4KIE-mFF_XJ1jT6gnxj/view?usp=sharing
 
-# One-click deployment
+# One-click deployment (simplex)
 ./deploy_all.sh \
     --cpp-dir /path/to/llama.cpp-omni \
     --model-dir /path/to/MiniCPM-o-4_5-gguf
 
-# For duplex mode
+# Duplex mode
 ./deploy_all.sh \
     --cpp-dir /path/to/llama.cpp-omni \
     --model-dir /path/to/MiniCPM-o-4_5-gguf \
     --duplex
 ```
 
-**4. Access Web Interface**
-
-```bash
-open http://localhost:3000
-```
+Open **http://localhost:3000** after startup.
 
 ### Service Ports
 
 | Service | Port | Description |
 |---------|------|-------------|
-| Frontend | 3000 | Web UI |
-| Backend | 8021 | Backend API |
+| Frontend | 3000 (Docker) / 8088 (oneclick) | Web UI |
+| Backend | 8025 (Docker) / 8021 (oneclick) | Backend API |
 | LiveKit | 7880 | Real-time communication |
-| Inference | 9060 | Python HTTP API |
+| Inference | 9060 | C++ HTTP API |
 
-### Troubleshooting
-
-| Issue | Solution |
-|-------|----------|
-| Port conflict | Use `--port 9060` (recommended, avoids Cursor IDE conflicts) |
-| "Experience quota full" | Check `model_type` and `session_type` in registration |
-| Model loading timeout | Wait 2-3 minutes for large models |
-| LiveKit connection failed | Update `node_ip` in `livekit.yaml` |
-
-📖 **Full Documentation**: [tools/omni/release_cpp/README.md](./tools/omni/release_cpp/README.md)
-
-</details>
-
----
-
-## Coming Soon
-
-Deployment and usage documentation is still being prepared, including:
-
-- **Voice Cloning**: Custom voice synthesis with reference audio
-- **NPU Adaptation**: Support for various NPU hardware platforms
-- **More features**...
-
-Stay tuned for updates in the coming days.
+📖 **Full Documentation**: [MiniCPM-o-cookbook WebRTC Demo](https://github.com/OpenBMB/MiniCPM-o-cookbook/tree/main/demo/web_demo/WebRTC_Demo)
