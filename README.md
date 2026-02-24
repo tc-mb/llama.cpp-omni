@@ -240,4 +240,4 @@ Open **http://localhost:3000** after startup.
 | LiveKit | 7880 | Real-time communication |
 | Inference | 9060 | C++ HTTP API |
 
-📖 **Full Documentation**: [MiniCPM-o-cookbook WebRTC Demo](https://github.com/OpenBMB/MiniCPM-o-cookbook/tree/main/demo/web_demo/WebRTC_Demo)
+📖 **Full Documentation**: [MiniCPM-o-cookbook WebRTC Demo](https://github.com/OpenSQZ/MiniCPM-V-CookBook/blob/main/demo/web_demo/WebRTC_Demo/README.md)
