@@ -3774,9 +3774,14 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
             
             // Device configuration - 使用 omni_init 传入的 token2wav_device 参数
             // 格式: "gpu", "gpu:0", "gpu:1", "cpu"
-            // 🔧 Token2Mel 用 GPU (Metal) 加速，Vocoder 用 CPU（因为 reshape/permute 开销太大）
             std::string device_token2mel = token2wav_device;
-            std::string device_vocoder = "cpu";  // Vocoder 强制用 CPU，避免 Metal 中大量小操作的开销
+            // Vocoder 默认跟随 token2wav_device；可通过 OMNI_VOC_DEVICE 覆盖
+            // 例如 Metal 下如果 GPU vocoder 有问题，可以 export OMNI_VOC_DEVICE=cpu
+            const char * voc_dev_env = getenv("OMNI_VOC_DEVICE");
+            std::string device_vocoder = voc_dev_env ? voc_dev_env : token2wav_device;
+            if (voc_dev_env) {
+                print_with_timestamp("Token2Wav: vocoder device overridden by OMNI_VOC_DEVICE=%s\n", voc_dev_env);
+            }
             
             // 🔧 优先使用 prompt_bundle (setup_cache 路径)，否则 fallback 到 prompt_cache.gguf
             std::string prompt_bundle_dir = "tools/omni/assets/default_ref_audio";
