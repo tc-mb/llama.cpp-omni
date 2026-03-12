@@ -1,4 +1,5 @@
 #include "conv-transpose-1d.cuh"
+#include "conv-transpose-1d-gemm.cuh"
 
 static  __global__ void conv_transpose_1d_kernel(
         const int s0, const int p0, const int d0, const int output_size,
@@ -55,6 +56,12 @@ static void conv_transpose_1d_f32_f32_cuda(
 }
 
 void ggml_cuda_op_conv_transpose_1d(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    // Try cuBLAS GEMM + col2im path for large channel dimensions
+    if (ggml_cuda_conv_transpose_1d_gemm(ctx, dst)) {
+        return;
+    }
+
+    // Fallback: original direct kernel
     const ggml_tensor * src0 = dst->src[0];
     const float * src0_d = (const float *)src0->data;
 
