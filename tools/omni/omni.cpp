@@ -3775,12 +3775,25 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
             // Device configuration - 使用 omni_init 传入的 token2wav_device 参数
             // 格式: "gpu", "gpu:0", "gpu:1", "cpu"
             std::string device_token2mel = token2wav_device;
-            // Vocoder 默认跟随 token2wav_device；可通过 OMNI_VOC_DEVICE 覆盖
-            // 例如 Metal 下如果 GPU vocoder 有问题，可以 export OMNI_VOC_DEVICE=cpu
+
+            // Vocoder 设备策略：
+            //   CUDA: vocoder 跟随 token2wav_device（GPU），因为 CUDA kernel launch 开销低
+            //   Metal (macOS): vocoder 强制用 CPU，因为 vocoder 有大量小操作，
+            //     Metal kernel dispatch 开销累积后远慢于 CPU 直接计算
+            //   可通过 OMNI_VOC_DEVICE 环境变量覆盖
             const char * voc_dev_env = getenv("OMNI_VOC_DEVICE");
-            std::string device_vocoder = voc_dev_env ? voc_dev_env : token2wav_device;
+            std::string device_vocoder;
             if (voc_dev_env) {
+                device_vocoder = voc_dev_env;
                 print_with_timestamp("Token2Wav: vocoder device overridden by OMNI_VOC_DEVICE=%s\n", voc_dev_env);
+            } else {
+#ifdef GGML_USE_CUDA
+                device_vocoder = token2wav_device;
+                print_with_timestamp("Token2Wav: CUDA detected, vocoder using GPU (%s)\n", device_vocoder.c_str());
+#else
+                device_vocoder = "cpu";
+                print_with_timestamp("Token2Wav: non-CUDA backend, vocoder using CPU for better performance\n");
+#endif
             }
             
             // 🔧 优先使用 prompt_bundle (setup_cache 路径)，否则 fallback 到 prompt_cache.gguf
