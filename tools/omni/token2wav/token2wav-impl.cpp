@@ -6318,6 +6318,11 @@ bool voc_hg2_model::voc_hg2_model_init_from_gguf(const std::string & gguf_path_i
         return false;
     }
 
+    if (!hg_backend_is_device(backend) && num_threads > 1) {
+        ggml_backend_cpu_set_n_threads(backend, num_threads);
+        std::fprintf(stderr, "voc_hg2_model: CPU backend using %d threads\n", num_threads);
+    }
+
     auto loader = std::make_shared<hifigan2::hg2_gguf_model_loader>();
     if (!loader->hg_gguf_model_loader_load_from_file(gguf_path, backend)) {
         LOG_ERROR( "voc_hg2_model_init_from_gguf: failed to load gguf: %s\n", gguf_path.c_str());
