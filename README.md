@@ -241,3 +241,169 @@ Open **http://localhost:3000** after startup.
 | Inference | 9060 | C++ HTTP API |
 
 📖 **Full Documentation**: [MiniCPM-o-cookbook WebRTC Demo](https://github.com/OpenSQZ/MiniCPM-V-CookBook/blob/main/demo/web_demo/WebRTC_Demo/README.md)
+
+
+
+
+
+## HTTP API & Integration Guide
+> 📝 This section is based on community integration experience.
+
+This section documents the HTTP API call sequence for integrating llama-server into your own application (e.g. a Tauri/Electron desktop app). The official CLI is a black box — if you want programmatic control, you need to call these endpoints directly.
+
+> This guide is based on real-world integration experience. Several critical details are **not documented elsewhere**.
+
+---
+
+### 1. Start llama-server
+
+```bash
+./llama-server \
+  --host 0.0.0.0 \
+  --port 9060 \
+  --model /path/to/MiniCPM-o-4_5-Q4_K_M.gguf \
+  -ngl 99 \
+  --ctx-size 8192 \
+  --repeat-penalty 1.05 \
+  --temp 0.7
+```
+
+Poll `GET /health` until it returns 200 before proceeding. It typically takes 10–60 seconds.
+
+```bash
+# Wait for ready
+curl http://localhost:9060/health
+```
+
+---
+
+### 2. Initialize — `POST /v1/stream/omni_init`
+
+Call this **once per application lifecycle**. It loads all model modules, sets up voice cloning, and internally executes the `index=0` prefill (system prompt initialization).
+
+```json
+POST /v1/stream/omni_init
+
+{
+  "media_type": 2,
+  "use_tts": true,
+  "duplex_mode": true,
+  "model_dir": "/path/to/MiniCPM-o-4_5-gguf",
+  "tts_bin_dir": "/path/to/MiniCPM-o-4_5-gguf/tts",
+  "tts_gpu_layers": 100,
+  "token2wav_device": "gpu:0",
+  "output_dir": "/path/to/output",
+  "voice_audio": "/path/to/reference_voice.wav"
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `media_type` | `2` = vision + audio (full omni) |
+| `duplex_mode` | `true` enables full-duplex streaming |
+| `voice_audio` | Reference WAV for voice cloning. Omit to use default voice |
+| `output_dir` | Directory where TTS WAV files will be written |
+
+**Expected response:**
+```json
+{ "success": true, ... }
+```
+
+> ⚠️ `omni_init` internally completes `index=0` prefill. **Do not** send a separate `cnt=0` prefill after this call. Start your prefill counter at `1`.
+
+---
+
+### 3. Prefill Loop — `POST /v1/stream/prefill`
+
+After `omni_init`, enter a continuous loop. Each iteration sends 1 second of audio + 1 screenshot frame. The counter `cnt` increments by 1 each call and **never resets** within a session.
+
+```json
+POST /v1/stream/prefill
+
+{
+  "audio_path_prefix": "/path/to/audio_chunk.wav",
+  "img_path_prefix": "/path/to/screenshot.png",
+  "cnt": 1
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `cnt` | Starts at `1`, increments every call. `0` is reserved for `omni_init` |
+| `audio_path_prefix` | 1-second audio chunk (16kHz WAV). Send a silence chunk if mic is muted |
+| `img_path_prefix` | Current screen frame. Can reuse last frame if no update |
+
+> ⚠️ **Always send an audio chunk**, even when muted. Submitting a silence segment keeps the duplex loop rhythm intact. Skipping will cause timing drift.
+
+**Recommended loop cadence:** 1000ms per iteration.
+
+---
+
+### 4. Decode — `POST /v1/stream/decode`
+
+Call decode **after each prefill**. It triggers the LLM to generate a response and returns an SSE stream.
+
+```json
+POST /v1/stream/decode
+
+{
+  "debug_dir": "/path/to/output",
+  "stream": true
+}
+```
+
+**SSE stream response format:**
+
+```
+data: {"content": "Hello", "is_listen": false, "stop": false}
+data: {"content": "!", "is_listen": false, "stop": false}
+data: {"is_listen": true, "stop": false}
+data: [DONE]
+```
+
+| Field | Description |
+|-------|-------------|
+| `content` | Text token chunk. Empty string is possible, filter before display |
+| `is_listen` | `true` = model has switched to listening state (stop playing audio) |
+| `stop` | `true` = generation fully complete |
+
+> ⚠️ The text field is **`content`**, not `text`. This is inconsistent with standard OpenAI-compatible SSE format.
+
+---
+
+### 5. Audio Output
+
+TTS WAV files are written incrementally to `output_dir/round_XXX/tts_wav/`. Watch this directory for new files and play them in order.
+
+Use a filesystem watcher (e.g. `notify` in Rust) to detect new WAV files as they appear during decode.
+
+```
+output_dir/
+├── round_000/
+│   └── tts_wav/
+│       ├── wav_0.wav
+│       ├── wav_1.wav
+│       └── ...
+└── round_001/
+    └── tts_wav/
+        └── wav_1000.wav
+```
+
+> ⚠️ Mute your microphone input while playing back TTS audio to prevent echo feedback into the prefill loop.
+
+---
+
+### Full Call Sequence Summary
+
+```
+start llama-server
+    ↓
+GET /health  (poll until 200)
+    ↓
+POST /v1/stream/omni_init  (cnt=0 handled internally, start your counter at 1)
+    ↓
+loop every ~1000ms:
+    POST /v1/stream/prefill  { cnt: N, audio, image }
+    POST /v1/stream/decode   → consume SSE → play WAV files from output_dir
+    N++
+```
