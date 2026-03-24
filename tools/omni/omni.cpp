@@ -685,46 +685,131 @@ struct omni_embed * omni_audio_embed_make_with_filename(struct audition_ctx * ct
 //
 static void kv_cache_slide_window(struct omni_context* ctx_omni, common_params* params, int chunk_size) {
     const int n_ctx = params->n_ctx;
-    
-    // 检查是否需要滑动窗口
+
+    // ==================== 双工模式：按轮次边界智能清理 ====================
+    if (ctx_omni->duplex_mode) {
+        const int duplex_trigger = std::max(ctx_omni->n_keep, n_ctx - 2048);
+
+        if (ctx_omni->n_past + chunk_size < duplex_trigger) {
+            return;
+        }
+
+        // defer：生成中 / TTS 忙 / 正在 SPEAK 时不滑窗，除非快要撞上 n_ctx 硬限制
+        bool generating    = ctx_omni->text_streaming;
+        bool tts_busy      = !ctx_omni->speek_done;
+        bool mid_speak     = !ctx_omni->slide_last_was_listen.load();
+        bool force_slide   = (ctx_omni->n_past + chunk_size >= n_ctx - 512);
+
+        if (!force_slide && (generating || tts_busy || mid_speak)) {
+            return;
+        }
+        if (force_slide) {
+            print_with_timestamp("⚠️ slide FORCE: n_past=%d approaching n_ctx=%d\n",
+                                 ctx_omni->n_past, n_ctx);
+        }
+
+        int old_n_past = ctx_omni->n_past;
+        const auto& rounds = ctx_omni->round_start_positions;
+        const int total_rounds = (int)rounds.size();
+
+        print_with_timestamp("⚠️ slide TRIGGERED: n_past=%d, chunk=%d, trigger=%d, n_ctx=%d, n_keep=%d, rounds=%d\n",
+                             ctx_omni->n_past, chunk_size, duplex_trigger, n_ctx,
+                             ctx_omni->n_keep, total_rounds);
+
+        if (total_rounds < 2) {
+            // 轮次不足，退化为全量清空
+            int n_discard_full = ctx_omni->n_past - ctx_omni->n_keep;
+            if (n_discard_full > 0) {
+                llama_memory_t mem = llama_get_memory(ctx_omni->ctx_llama);
+                if (mem) {
+                    llama_memory_seq_rm(mem, 0, ctx_omni->n_keep, ctx_omni->n_past);
+                }
+                ctx_omni->n_past = ctx_omni->n_keep;
+                ctx_omni->round_start_positions.clear();
+                if (ctx_omni->ctx_tts_llama) {
+                    llama_memory_t tts_mem = llama_get_memory(ctx_omni->ctx_tts_llama);
+                    if (tts_mem) llama_memory_seq_rm(tts_mem, 0, 0, -1);
+                    ctx_omni->tts_n_past_accumulated = 0;
+                    ctx_omni->tts_all_generated_tokens.clear();
+                    ctx_omni->tts_condition_saved = false;
+                }
+                print_with_timestamp("⚠️ slide DONE: full reset (rounds=%d<2): n_past %d→%d, freed %d, TTS KV cleared\n",
+                                     total_rounds, old_n_past, ctx_omni->n_past, n_discard_full);
+            }
+        } else {
+            // 保留约 n_ctx/4 的上下文，按 round boundary 对齐截断
+            const int target_keep_tokens = std::max(n_ctx / 4, 2048);
+            const int min_keep_from_pos  = ctx_omni->n_past - target_keep_tokens;
+
+            int keep_from = rounds[total_rounds - 2];
+            for (int i = 0; i <= total_rounds - 2; i++) {
+                if (rounds[i] >= min_keep_from_pos) {
+                    keep_from = rounds[i];
+                    break;
+                }
+            }
+            keep_from = std::max(keep_from, ctx_omni->n_keep);
+
+            int n_discard = keep_from - ctx_omni->n_keep;
+
+            if (n_discard <= 0) {
+                print_with_timestamp("⚠️ slide: nothing to discard (keep_from=%d <= n_keep=%d)\n",
+                                     keep_from, ctx_omni->n_keep);
+            } else {
+                llama_memory_t mem = llama_get_memory(ctx_omni->ctx_llama);
+                if (mem) {
+                    llama_memory_seq_rm(mem, 0, ctx_omni->n_keep, keep_from);
+                    llama_memory_seq_add(mem, 0, keep_from, ctx_omni->n_past, -n_discard);
+                }
+                ctx_omni->n_past -= n_discard;
+
+                std::vector<int> new_rounds;
+                for (int i = 0; i < total_rounds; i++) {
+                    if (rounds[i] > keep_from) {
+                        new_rounds.push_back(rounds[i] - n_discard);
+                    }
+                }
+                ctx_omni->round_start_positions = new_rounds;
+
+                if (ctx_omni->ctx_tts_llama) {
+                    llama_memory_t tts_mem = llama_get_memory(ctx_omni->ctx_tts_llama);
+                    if (tts_mem) llama_memory_seq_rm(tts_mem, 0, 0, -1);
+                    ctx_omni->tts_n_past_accumulated = 0;
+                    ctx_omni->tts_all_generated_tokens.clear();
+                    ctx_omni->tts_condition_saved = false;
+                }
+
+                print_with_timestamp("⚠️ slide DONE: n_past %d→%d, freed %d, boundaries_kept=%d, TTS KV cleared\n",
+                                     old_n_past, ctx_omni->n_past, n_discard, (int)new_rounds.size());
+            }
+        }
+        return;
+    }
+
+    // ==================== 非双工模式：原有滑窗逻辑 ====================
     if (ctx_omni->n_past + chunk_size < n_ctx) {
-        return; // 还有足够空间，无需滑动
+        return;
     }
     
-    // 🔧 [诊断] 打印滑动窗口触发信息
     print_with_timestamp("⚠️ KV Cache 滑动窗口触发: n_past=%d, chunk_size=%d, n_ctx=%d, n_keep=%d, 轮次数=%zu\n",
                          ctx_omni->n_past, chunk_size, n_ctx, ctx_omni->n_keep, 
                          ctx_omni->round_start_positions.size());
     
     int n_discard = 0;
-    int delete_end_pos = ctx_omni->n_keep;  // 删除范围的结束位置
+    int delete_end_pos = ctx_omni->n_keep;
     
-    // ==================== 按轮次边界删除（优先使用） ====================
-    // 🔧 [重要] round_start_positions 记录的是轮次**结束**位置（也是下一轮开始位置）
-    // 轮次布局：
-    //   轮次 0: [n_keep, round_start_positions[0])
-    //   轮次 1: [round_start_positions[0], round_start_positions[1])
-    //   轮次 i: [round_start_positions[i-1], round_start_positions[i])
-    //   当前轮（未结束）: [round_start_positions[size-1], n_past)
     if (ctx_omni->max_preserved_context > 0 && ctx_omni->round_start_positions.size() >= 1) {
-        // 策略：保留尽可能多的最近轮次，但总长度不超过 max_preserved_context
-        // 从最新轮次往前数，累计长度直到超过 max_preserved_context
-        
         const auto& rounds = ctx_omni->round_start_positions;
         int cumulative_length = 0;
-        int keep_from_round = rounds.size();  // 从哪个轮次开始保留（0-indexed）
-        int total_rounds = rounds.size();  // 总轮次数（已完成的轮次）
+        int keep_from_round = rounds.size();
+        int total_rounds = rounds.size();
         
-        // 从最后一个已完成轮次往前遍历
         for (int i = total_rounds - 1; i >= 0; --i) {
-            // 计算第 i 轮的长度
-            // 轮次 i 的范围是 [round_start(i), round_end(i))
             int round_start = (i == 0) ? ctx_omni->n_keep : rounds[i - 1];
             int round_end = rounds[i];
             int round_length = round_end - round_start;
             
             if (cumulative_length + round_length > ctx_omni->max_preserved_context) {
-                // 加上这一轮会超过限制，停止
                 break;
             }
             
@@ -732,90 +817,54 @@ static void kv_cache_slide_window(struct omni_context* ctx_omni, common_params* 
             keep_from_round = i;
         }
         
-        // 至少保留最近一轮
         if (keep_from_round >= total_rounds) {
             keep_from_round = total_rounds - 1;
         }
         
-        // 计算要删除的范围
-        // 保留轮次 [keep_from_round, total_rounds)
-        // 删除轮次 [0, keep_from_round)
-        // 删除范围：[n_keep, 轮次 keep_from_round 的开始位置)
         int delete_start = ctx_omni->n_keep;
         delete_end_pos = (keep_from_round == 0) ? ctx_omni->n_keep : rounds[keep_from_round - 1];
         
         if (delete_end_pos > delete_start) {
             n_discard = delete_end_pos - delete_start;
             
-            print_with_timestamp("⚠️ 按轮次删除: 删除轮次 0-%d，保留轮次 %d-%d，保留长度=%d\n",
-                                 keep_from_round - 1, keep_from_round, total_rounds - 1, cumulative_length);
-            
-            // 更新 round_start_positions：删除早期轮次，调整剩余轮次的位置
             std::vector<int> new_rounds;
             for (int i = keep_from_round; i < total_rounds; ++i) {
                 new_rounds.push_back(rounds[i] - n_discard);
             }
             ctx_omni->round_start_positions = new_rounds;
-            
-            print_with_timestamp("⚠️ 更新轮次边界: 新边界数=%zu，首轮结束位置=%d\n",
-                                 new_rounds.size(), new_rounds.empty() ? -1 : new_rounds[0]);
         } else {
-            // 没有可删除的完整轮次，回退到按比例删除
-            print_with_timestamp("⚠️ 没有可删除的完整轮次（keep_from_round=%d），回退到按比例删除\n", keep_from_round);
             n_discard = 0;
         }
     }
     
-    // ==================== 回退策略：按比例删除（旧逻辑） ====================
     if (n_discard == 0) {
         const int n_left = ctx_omni->n_past - ctx_omni->n_keep;
         n_discard = n_left / 2;
         delete_end_pos = ctx_omni->n_keep + n_discard;
         
-        // 边界检查
         if (n_left <= 0 || n_discard <= 0) {
-            print_with_timestamp("⚠️ KV Cache 滑动窗口: 边界检查失败 n_left=%d, n_discard=%d，跳过滑动\n",
-                                 n_left, n_discard);
             return;
         }
         
-        // 按比例删除时，更新 round_start_positions
-        // round_start_positions[i] 表示第 i 轮的结束位置
-        // 删除范围 [n_keep, delete_end_pos) 会影响轮次边界
         std::vector<int> new_rounds;
         for (int pos : ctx_omni->round_start_positions) {
             if (pos > delete_end_pos) {
-                // 这个轮次结束位置在删除范围之后，需要前移
                 new_rounds.push_back(pos - n_discard);
             }
-            // 如果 pos <= delete_end_pos，说明这个轮次被删除或部分删除，丢弃
         }
         ctx_omni->round_start_positions = new_rounds;
-        
-        print_with_timestamp("⚠️ 按比例删除后轮次边界: 剩余 %zu 个轮次\n", new_rounds.size());
-        
-        print_with_timestamp("⚠️ 按比例删除: n_left=%d, n_discard=%d, 删除范围=[%d, %d)\n",
-                             n_left, n_discard, ctx_omni->n_keep, delete_end_pos);
     }
-    
-    // ==================== 执行 KV Cache 操作 ====================
-    print_with_timestamp("⚠️ KV Cache 滑动窗口执行: 删除范围=[%d, %d), n_discard=%d\n",
-                         ctx_omni->n_keep, delete_end_pos, n_discard);
     
     llama_memory_t mem = llama_get_memory(ctx_omni->ctx_llama);
     if (mem) {
-        // 1. 删除 [n_keep, delete_end_pos) 范围的 token
         bool rm_ok = llama_memory_seq_rm(mem, 0, ctx_omni->n_keep, delete_end_pos);
         (void)rm_ok;
-        
-        // 2. 将 [delete_end_pos, n_past) 范围的 token 位置前移 n_discard
         llama_memory_seq_add(mem, 0, delete_end_pos, ctx_omni->n_past, -n_discard);
     }
     
-    // 3. 更新 n_past
     int old_n_past = ctx_omni->n_past;
     ctx_omni->n_past -= n_discard;
-    print_with_timestamp("⚠️ KV Cache 滑动窗口完成: n_past 从 %d 减少到 %d\n", old_n_past, ctx_omni->n_past);
+    print_with_timestamp("⚠️ KV Cache 滑动窗口完成: n_past %d→%d\n", old_n_past, ctx_omni->n_past);
 }
 
 static bool eval_tokens(struct omni_context* ctx_omni, common_params* params, std::vector<llama_token> tokens, int n_batch, int * n_past, bool get_emb = false) {
@@ -9305,17 +9354,16 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
                     // - 需要通过 text_queue 通知 SSE 客户端
                     // - 设置 ended_with_listen 标志，让 stream_decode 末尾不清理 KV cache
                     if (token_type == OmniTokenType::LISTEN && ctx_omni->duplex_mode) {
-                        
-                        // 🔧 [关键] 标记以 listen 结束，不清理 KV cache
                         ctx_omni->ended_with_listen = true;
+                        ctx_omni->slide_last_was_listen = true;
                         
-                        // 推送一个特殊的 JSON 标记到 text_queue，SSE 会转发给客户端
                         if (ctx_omni->async) {
                             std::lock_guard<std::mutex> tl(ctx_omni->text_mtx);
-                            // 使用特殊前缀标记这是状态消息而非文本
                             ctx_omni->text_queue.push_back("__IS_LISTEN__");
                             ctx_omni->text_cv.notify_all();
                         }
+                    } else if (ctx_omni->duplex_mode) {
+                        ctx_omni->slide_last_was_listen = false;
                     }
                     
                     // Don't add end tokens to response
@@ -9548,14 +9596,16 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
         print_with_timestamp("📍 为下一轮准备: eval <|im_end|>\\n<|im_start|>user\\n, n_past=%d\n", ctx_omni->n_past);
     }
     
-    // 🔧 [双工模式] 在双工模式下永远不清理 KV cache
-    // Python 双工模型的 llm_past_key_values 一直累积，只在 reset_session() 时清空
-    // C++ 已有滑动窗口机制 (kv_cache_slide_window)，会在上下文满时自动滑动
+    // 双工模式：只在 LISTEN 结束时记录 round 边界（一个完整的"说+听"轮次结束）
+    // 这样 round 覆盖完整的 [unit+SPEAK...unit+LISTEN] 序列，
+    // 滑窗按 round 截断时不会把连续 SPEAK 或 unit 从中间切开
     if (ctx_omni->duplex_mode) {
-        // 不调用 clean_kvcache 和 eval_prefix，保留当前上下文
-        // 滑动窗口机制会在 prefill_with_emb/eval_tokens 时自动触发
+        if (ctx_omni->ended_with_listen) {
+            ctx_omni->round_start_positions.push_back(ctx_omni->n_past);
+            print_with_timestamp("📍 round boundary at n_past=%d, total rounds=%zu\n",
+                                 ctx_omni->n_past, ctx_omni->round_start_positions.size());
+        }
     } else {
-        // 非双工模式（单工），每轮对话后清理 KV cache
         // clean_kvcache(ctx_omni);
         // eval_prefix(ctx_omni, ctx_omni->params);
     }

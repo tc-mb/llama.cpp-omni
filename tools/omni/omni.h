@@ -222,6 +222,11 @@ struct omni_context {
     // 如果是，则不清理 KV cache，让下一个音频片段可以累积上下文
     std::atomic<bool> ended_with_listen{false};
     
+    // [滑窗专用] 记录最近一次 decode 结果是 LISTEN 还是 SPEAK
+    // 与 ended_with_listen 不同：不在 stream_decode 开头重置，
+    // 只由 decode 的实际输出驱动（LISTEN→true, SPEAK→false）
+    std::atomic<bool> slide_last_was_listen{true};
+    
     // 🔧 [与 Python 对齐] LLM 生成结束标志
     // 当 LLM 检测到 end token 时设置为 true
     // TTS 线程检查此标志来决定是否添加 text_eos_embed
