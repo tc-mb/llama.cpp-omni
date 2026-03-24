@@ -5677,7 +5677,8 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
             while (!queue.empty()) {
                 LLMOut *llm_out = queue.front();
                 llm_finish |= llm_out->llm_finish;
-                accumulated_is_end_of_turn |= llm_out->is_end_of_turn;
+                bool item_is_eot = llm_out->is_end_of_turn;
+                accumulated_is_end_of_turn |= item_is_eot;
                 
                 if (!ctx_omni->speek_done || ctx_omni->duplex_mode) {
                     llm_text += llm_out->text;
@@ -5696,6 +5697,11 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
                 }
                 delete llm_out;
                 queue.pop();
+                
+                // 遇到 EOT 边界立即停止，下一轮的 item 留给下次迭代处理
+                if (item_is_eot) {
+                    break;
+                }
             }
             lock.unlock();
             ctx_omni->tts_thread_info->cv.notify_all();
@@ -5712,6 +5718,19 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
             
             if (ctx_omni->speek_done && llm_finish) {
                 if (ctx_omni->duplex_mode && !current_chunk_token_ids.empty()) {
+                    // 新一轮 SPEAK：重置 TTS 状态，防止上轮残留污染
+                    if (chunk_idx > 0) {
+                        chunk_idx = 0;
+                        tts_n_past = 0;
+                        audio_tokens.clear();
+                        llama_memory_t mem = llama_get_memory(ctx_omni->ctx_tts_llama);
+                        if (mem) {
+                            llama_memory_seq_rm(mem, 0, 0, -1);
+                        }
+                        ctx_omni->tts_n_past_accumulated = 0;
+                        ctx_omni->tts_all_generated_tokens.clear();
+                        ctx_omni->tts_condition_saved = false;
+                    }
                     ctx_omni->speek_done = false;
                 } else if (ctx_omni->duplex_mode && accumulated_is_end_of_turn) {
                     ctx_omni->speek_done = false;
