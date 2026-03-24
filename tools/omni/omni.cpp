@@ -8845,10 +8845,12 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
             // Python: sys_msgs = {"role": "system", "content": [vc_prompt_prefix, ref_audio, vc_prompt_suffix]}
             // 格式: <|im_start|>system\n{vc_prompt_prefix}\n<|audio_start|>[ref_audio_embed]<|audio_end|>{vc_prompt_suffix}<|im_end|>\n
             
-            // 确定 ref_audio 路径：优先使用配置的路径，否则使用默认路径
-            std::string system_ref_audio = ctx_omni->ref_audio_path.empty() 
-                ? "tools/omni/assets/default_ref_audio/default_ref_audio.wav" 
-                : ctx_omni->ref_audio_path;
+            // 确定 ref_audio 路径：优先使用调用方传入的 aud_fname，其次配置路径，最后默认路径
+            std::string system_ref_audio = !aud_fname.empty()
+                ? aud_fname
+                : (!ctx_omni->ref_audio_path.empty()
+                    ? ctx_omni->ref_audio_path
+                    : "tools/omni/assets/default_ref_audio/default_ref_audio.wav");
             print_with_timestamp("system prompt ref_audio: %s\n", system_ref_audio.c_str());
             
             // Step 1: 评估 prefix (voice_clone_prompt，包含 <|audio_start|>)
@@ -8875,7 +8877,11 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
         //把这步完成再开llm线程以防冲突
         ctx_omni->n_keep = ctx_omni->n_past;
         print_with_timestamp("🔒 n_keep 设置为 %d (system prompt tokens)，这部分永远不会被滑动窗口删除\n", ctx_omni->n_keep);
-        eval_prefix(ctx_omni, ctx_omni->params);
+        // 双工模式：assistant_prompt 不含 <|im_start|>user\n，需要 eval_prefix 补充
+        // 非双工模式：assistant_prompt 末尾已含 <|im_start|>user\n，无需重复添加
+        if (ctx_omni->duplex_mode) {
+            eval_prefix(ctx_omni, ctx_omni->params);
+        }
         
         // 🔧 [说明] index=0 时，aud_fname 通常是 ref_audio（用于 voice cloning）
         // ref_audio 已经在上面的 system prompt 初始化中被正确 prefill 了
