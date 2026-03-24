@@ -7874,7 +7874,7 @@ static bool start_python_t2w_service(struct omni_context * ctx_omni) {
         }
         
         // 执行 Python 脚本 (使用 conda Python)
-        execlp("/Users/tianchi/software/miniconda3/bin/python", "python", script_path.c_str(), (char*)NULL);
+        execlp("python3", "python3", script_path.c_str(), (char*)NULL);
         
         // 如果 execlp 失败
         _exit(1);
