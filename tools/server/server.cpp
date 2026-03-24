@@ -5817,6 +5817,20 @@ int main(int argc, char ** argv) {
             ctx_server.octx->async = true;
             ctx_server.octx->duplex_mode = duplex_mode;  // 确保设置
 
+            // 外部传入 system prompt（优先于 C++ 内置默认值）
+            if (data.contains("voice_clone_prompt") && data.at("voice_clone_prompt").is_string()) {
+                const std::string vcp = data.at("voice_clone_prompt").get<std::string>();
+                ctx_server.octx->audio_voice_clone_prompt = vcp;
+                ctx_server.octx->omni_voice_clone_prompt = vcp;
+                SRV_INF("%s: voice_clone_prompt overridden from request\n", __func__);
+            }
+            if (data.contains("assistant_prompt") && data.at("assistant_prompt").is_string()) {
+                const std::string ap = data.at("assistant_prompt").get<std::string>();
+                ctx_server.octx->audio_assistant_prompt = ap;
+                ctx_server.octx->omni_assistant_prompt = ap;
+                SRV_INF("%s: assistant_prompt overridden from request\n", __func__);
+            }
+
             // optional: voice cloning audio during init, index=0
             if (data.contains("voice_audio") && data.at("voice_audio").is_string()) {
                 const std::string voice_audio = data.at("voice_audio");
@@ -6123,7 +6137,21 @@ int main(int argc, char ** argv) {
             ctx_server.octx->speek_done = true;
             SRV_INF("%s: speek_done set to true for session config update\n", __func__);
             
-            // 🔧 [关键] 重置 system_prompt_initialized，让 stream_prefill 重新评估 system prompt
+            // 外部传入 system prompt（优先于 C++ 内置默认值）
+            if (data.contains("voice_clone_prompt") && data.at("voice_clone_prompt").is_string()) {
+                const std::string vcp = data.at("voice_clone_prompt").get<std::string>();
+                ctx_server.octx->audio_voice_clone_prompt = vcp;
+                ctx_server.octx->omni_voice_clone_prompt = vcp;
+                SRV_INF("%s: voice_clone_prompt overridden from request\n", __func__);
+            }
+            if (data.contains("assistant_prompt") && data.at("assistant_prompt").is_string()) {
+                const std::string ap = data.at("assistant_prompt").get<std::string>();
+                ctx_server.octx->audio_assistant_prompt = ap;
+                ctx_server.octx->omni_assistant_prompt = ap;
+                SRV_INF("%s: assistant_prompt overridden from request\n", __func__);
+            }
+
+            // 重置 system_prompt_initialized，让 stream_prefill 重新评估 system prompt
             ctx_server.octx->system_prompt_initialized = false;
             
             // 5. 重新 prefill system prompt（如果提供 voice_audio）
