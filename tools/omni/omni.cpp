@@ -8927,10 +8927,12 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
     }
     else {
         if (!ctx_omni->async) {
-            if (img_fname.length() > 0) {
-                // 🔧 [高清模式] 使用 V2.6 slice schema
-                // 如果指定了 max_slice_nums，临时设置（用于高清+高刷组合模式）
-                if (max_slice_nums >= 1 && ctx_omni->ctx_vision) {
+            if (img_fname.length() > 0 && ctx_omni->ctx_vision == nullptr) {
+                LOG_WRN("%s: image provided but ctx_vision is NULL (media_type=%d), skipping: %s\n",
+                        __func__, ctx_omni->media_type, img_fname.c_str());
+            }
+            if (img_fname.length() > 0 && ctx_omni->ctx_vision != nullptr) {
+                if (max_slice_nums >= 1) {
                     vision_set_max_slice_nums(ctx_omni->ctx_vision, max_slice_nums);
                     LOG_INF("%s: [临时] max_slice_nums=%d for this prefill\n", __func__, max_slice_nums);
                 }
@@ -8988,20 +8990,23 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
             omni_embeds * omni_embeds = new struct omni_embeds();
             //video
             if (img_fname.length() > 0) {
-                LOG_INF("%s: img_fname:%s\n", __func__, img_fname.c_str());
-                // 🔧 [高清模式] 如果指定了 max_slice_nums，临时设置（用于高清+高刷组合模式）
-                if (max_slice_nums >= 1 && ctx_omni->ctx_vision) {
-                    vision_set_max_slice_nums(ctx_omni->ctx_vision, max_slice_nums);
-                    LOG_INF("%s: [临时] max_slice_nums=%d for this prefill\n", __func__, max_slice_nums);
+                if (ctx_omni->ctx_vision == nullptr) {
+                    LOG_WRN("%s: image provided but ctx_vision is NULL (media_type=%d), skipping: %s\n",
+                            __func__, ctx_omni->media_type, img_fname.c_str());
+                } else {
+                    LOG_INF("%s: img_fname:%s\n", __func__, img_fname.c_str());
+                    if (max_slice_nums >= 1) {
+                        vision_set_max_slice_nums(ctx_omni->ctx_vision, max_slice_nums);
+                        LOG_INF("%s: [临时] max_slice_nums=%d for this prefill\n", __func__, max_slice_nums);
+                    }
+                    if (!omni_image_embed_make_chunks_with_filename(ctx_omni->ctx_vision, 
+                            ctx_omni->params->cpuparams.n_threads, img_fname, omni_embeds->vision_embed)) {
+                        LOG_ERR("%s: failed to create vision embeddings for %s\n", __func__, img_fname.c_str());
+                        delete omni_embeds;
+                        return false;
+                    }
+                    LOG_INF("%s: vision_embed has %d chunks\n", __func__, (int)omni_embeds->vision_embed.size());
                 }
-                // 🔧 [高清模式] 使用新的 chunks 接口，支持 V2.6 slice schema
-                if (!omni_image_embed_make_chunks_with_filename(ctx_omni->ctx_vision, 
-                        ctx_omni->params->cpuparams.n_threads, img_fname, omni_embeds->vision_embed)) {
-                    LOG_ERR("%s: failed to create vision embeddings for %s\n", __func__, img_fname.c_str());
-                    delete omni_embeds;
-                    return false;
-                }
-                LOG_INF("%s: vision_embed has %d chunks\n", __func__, (int)omni_embeds->vision_embed.size());
             }
             //audio
             // 只有在音频路径非空时才处理音频
