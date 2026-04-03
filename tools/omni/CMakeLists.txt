@@ -94,6 +94,13 @@ endif()
 target_link_libraries  (${TARGET} PRIVATE common omni Threads::Threads)
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
 
+# 双工模式测试
+set(TARGET_DUPLEX_TEST llama-omni-test-duplex)
+add_executable         (${TARGET_DUPLEX_TEST} test/test-duplex.cpp)
+set_target_properties  (${TARGET_DUPLEX_TEST} PROPERTIES OUTPUT_NAME llama-omni-test-duplex)
+target_link_libraries  (${TARGET_DUPLEX_TEST} PRIVATE common omni Threads::Threads)
+target_compile_features(${TARGET_DUPLEX_TEST} PRIVATE cxx_std_17)
+
 # # Token2Wav 测试程序 - 完整 C++ 语音合成
 # add_executable(token2wav-example token2wav/token2wav-example.cpp)
 # target_link_libraries(token2wav-example PRIVATE common omni Threads::Threads)

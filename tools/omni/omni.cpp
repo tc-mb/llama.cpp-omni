@@ -4035,6 +4035,19 @@ void omni_warmup_ane(struct omni_context * ctx_omni) {
 #endif
 }
 
+bool omni_tts_queues_empty(struct omni_context * ctx_omni) {
+    bool tts_empty = true, t2w_empty = true;
+    if (ctx_omni->tts_thread_info) {
+        std::lock_guard<std::mutex> lock(ctx_omni->tts_thread_info->mtx);
+        tts_empty = ctx_omni->tts_thread_info->queue.empty();
+    }
+    if (ctx_omni->t2w_thread_info) {
+        std::lock_guard<std::mutex> lock(ctx_omni->t2w_thread_info->mtx);
+        t2w_empty = ctx_omni->t2w_thread_info->queue.empty();
+    }
+    return tts_empty && t2w_empty;
+}
+
 // 停止所有线程（发送信号，不等待）
 void omni_stop_threads(struct omni_context * ctx_omni) {
     // 发送停止信号
@@ -9021,25 +9034,6 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
         print_with_timestamp("📍 stream_decode: reset break_event from true to false\n");
     }
     
-    //eval_string(ctx_omni->ctx_llama, std::string("hello").c_str(), params->n_batch, &ctx_omni->n_past, false);
-    
-    // 🔧 [修复多轮对话] 清空上一轮的文本队列，重置状态标志
-    if (ctx_omni->duplex_mode) {
-        std::lock_guard<std::mutex> lock(ctx_omni->text_mtx);
-        ctx_omni->text_queue.clear();
-        ctx_omni->text_done_flag = false;
-        ctx_omni->text_streaming = true;
-    }
-    
-    if (ctx_omni->async && ctx_omni->duplex_mode){
-        ctx_omni->need_speek = true;
-        //ctx_omni->llm_thread.join();
-        ctx_omni->llm_thread_info->cv.notify_all();
-        print_with_timestamp("wait prefill done\n");
-    }
-    
-    //eval_string(ctx_omni->ctx_llama, std::string("hello").c_str(), params->n_batch, &ctx_omni->n_past, false);
-    
     // 🔧 [修复多轮对话] 清空上一轮的文本队列，重置状态标志
     {
         std::lock_guard<std::mutex> lock(ctx_omni->text_mtx);
@@ -9401,17 +9395,13 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
             }
         }
         fflush(stdout);
+        // push text fragment to text_queue (both sync and async modes)
+        if (!response.empty()) {
+            std::lock_guard<std::mutex> tl(ctx_omni->text_mtx);
+            ctx_omni->text_queue.push_back(response);
+            ctx_omni->text_cv.notify_all();
+        }
         if (ctx_omni->async){
-            fflush(stdout);
-            
-            // push text fragment for server stream
-            if (!response.empty()) {
-                fflush(stdout);
-                std::lock_guard<std::mutex> tl(ctx_omni->text_mtx);
-                ctx_omni->text_queue.push_back(response);
-                ctx_omni->text_cv.notify_all();
-                fflush(stdout);
-            }
             fflush(stdout);
             
             if (ctx_omni->use_tts && ctx_omni->tts_thread_info && (!response.empty() || llm_finish)) {
@@ -9478,12 +9468,11 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
                 fflush(stdout);
             }
             fflush(stdout);
-            if (llm_finish) break;
-            fflush(stdout);
         }else{
             fflush(stdout);
         }
         fflush(stdout);
+        if (llm_finish) break;
     }
     fflush(stdout);
     // 🔧 [P1-SSE响应] 推送轮次结束标记

@@ -416,6 +416,9 @@ void omni_free(struct omni_context * ctx_omni);
 // ANE/CoreML warmup — call once after omni_init to pre-load models into NPU
 void omni_warmup_ane(struct omni_context * ctx_omni);
 
+// 检查 TTS 和 T2W 队列是否都为空
+bool omni_tts_queues_empty(struct omni_context * ctx_omni);
+
 // 停止所有线程（在 join 之前调用）
 void omni_stop_threads(struct omni_context * ctx_omni);
 
