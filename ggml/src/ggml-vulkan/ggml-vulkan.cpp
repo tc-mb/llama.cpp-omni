@@ -519,10 +519,12 @@ struct vk_device_struct {
     vk_pipeline pipeline_concat_f32, pipeline_concat_f16, pipeline_concat_i32;
     vk_pipeline pipeline_upscale_nearest_f32, pipeline_upscale_bilinear_f32, pipeline_upscale_bilinear_ac_f32;
     vk_pipeline pipeline_scale_f32;
+    vk_pipeline pipeline_arange_f32;
     vk_pipeline pipeline_sqr_f32;
     vk_pipeline pipeline_sqrt_f32;
     vk_pipeline pipeline_sin_f32;
     vk_pipeline pipeline_cos_f32;
+    vk_pipeline pipeline_log[2];  // [0] = f32, [1] = f16
     vk_pipeline pipeline_clamp_f32;
     vk_pipeline pipeline_pad_f32;
     vk_pipeline pipeline_roll_f32;
@@ -3467,10 +3469,15 @@ static void ggml_vk_load_shaders(vk_device& device) {
 
     ggml_vk_create_pipeline(device, device->pipeline_scale_f32, "scale_f32", scale_f32_len, scale_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
 
+    ggml_vk_create_pipeline(device, device->pipeline_arange_f32, "arange_f32", arange_f32_len, arange_f32_data, "main", 1, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
+
     ggml_vk_create_pipeline(device, device->pipeline_sqr_f32, "sqr_f32", sqr_f32_len, sqr_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_sqrt_f32, "sqrt_f32", sqrt_f32_len, sqrt_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_sin_f32, "sin_f32", sin_f32_len, sin_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_cos_f32, "cos_f32", cos_f32_len, cos_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
+
+    ggml_vk_create_pipeline(device, device->pipeline_log[0], "log_f32", log_f32_len, log_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_log[1], "log_f16", log_f16_len, log_f16_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_clamp_f32, "clamp_f32", clamp_f32_len, clamp_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
 
@@ -7818,6 +7825,11 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             return ctx->device->pipeline_scale_f32;
         }
         return nullptr;
+    case GGML_OP_ARANGE:
+        if (dst->type == GGML_TYPE_F32) {
+            return ctx->device->pipeline_arange_f32;
+        }
+        return nullptr;
     case GGML_OP_SQR:
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             return ctx->device->pipeline_sqr_f32;
@@ -7836,6 +7848,12 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
     case GGML_OP_COS:
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             return ctx->device->pipeline_cos_f32;
+        }
+        return nullptr;
+    case GGML_OP_LOG:
+        if (src0->type == dst->type &&
+            (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16)) {
+            return ctx->device->pipeline_log[dst->type == GGML_TYPE_F16];
         }
         return nullptr;
     case GGML_OP_CLAMP:
@@ -8180,6 +8198,7 @@ static bool ggml_vk_op_supports_incontiguous(ggml_op op) {
     case GGML_OP_SQRT:
     case GGML_OP_SIN:
     case GGML_OP_COS:
+    case GGML_OP_LOG:
     case GGML_OP_CLAMP:
     case GGML_OP_PAD:
     case GGML_OP_REPEAT:
@@ -8518,10 +8537,12 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
     case GGML_OP_DIV:
     case GGML_OP_MUL:
     case GGML_OP_SCALE:
+    case GGML_OP_ARANGE:
     case GGML_OP_SQR:
     case GGML_OP_SQRT:
     case GGML_OP_SIN:
     case GGML_OP_COS:
+    case GGML_OP_LOG:
     case GGML_OP_CLAMP:
     case GGML_OP_PAD:
     case GGML_OP_ROLL:
@@ -9184,6 +9205,35 @@ static void ggml_vk_scale(ggml_backend_vk_context * ctx, vk_context& subctx, con
     ggml_vk_op_f32(ctx, subctx, src0, nullptr, nullptr, dst, GGML_OP_SCALE, std::move(p), dryrun);
 }
 
+static void ggml_vk_arange(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst, bool dryrun = false) {
+    vk_op_push_constants pc = {
+        (uint32_t)ggml_nelements(dst),
+        1,
+        ggml_get_op_params_f32(dst, 0),
+        ggml_get_op_params_f32(dst, 2),
+    };
+
+    vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, nullptr, nullptr, nullptr, dst, GGML_OP_ARANGE);
+    GGML_ASSERT(pipeline != nullptr);
+
+    if (dryrun) {
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+        return;
+    }
+
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    ggml_backend_vk_buffer_context * dst_buf_ctx = (ggml_backend_vk_buffer_context *)dst->buffer->context;
+    vk_buffer d_D = dst_buf_ctx->dev_buffer;
+    size_t dst_offset = vk_tensor_offset(dst) + dst->view_offs;
+
+    vk_subbuffer dst_buf = ggml_vk_subbuffer(ctx, d_D, dst_offset);
+
+    std::array<uint32_t, 3> elements = { (uint32_t)ggml_nelements(dst), 1, 1 };
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { dst_buf }, pc, elements);
+}
+
 static void ggml_vk_sqr(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst, bool dryrun = false) {
     ggml_vk_op_f32(ctx, subctx, src0, nullptr, nullptr, dst, GGML_OP_SQR, vk_op_unary_push_constants_init(src0, dst), dryrun);
 }
@@ -9198,6 +9248,10 @@ static void ggml_vk_sin(ggml_backend_vk_context * ctx, vk_context& subctx, const
 
 static void ggml_vk_cos(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst, bool dryrun = false) {
     ggml_vk_op_f32(ctx, subctx, src0, nullptr, nullptr, dst, GGML_OP_COS, vk_op_unary_push_constants_init(src0, dst), dryrun);
+}
+
+static void ggml_vk_log(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst, bool dryrun = false) {
+    ggml_vk_op_f32(ctx, subctx, src0, nullptr, nullptr, dst, GGML_OP_LOG, vk_op_unary_push_constants_init(src0, dst), dryrun);
 }
 
 static void ggml_vk_clamp(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst, bool dryrun = false) {
@@ -10819,10 +10873,12 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
     case GGML_OP_CONCAT:
     case GGML_OP_UPSCALE:
     case GGML_OP_SCALE:
+    case GGML_OP_ARANGE:
     case GGML_OP_SQR:
     case GGML_OP_SQRT:
     case GGML_OP_SIN:
     case GGML_OP_COS:
+    case GGML_OP_LOG:
     case GGML_OP_CLAMP:
     case GGML_OP_PAD:
     case GGML_OP_ROLL:
@@ -11072,6 +11128,10 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         ggml_vk_scale(ctx, compute_ctx, src0, node, dryrun);
 
         break;
+    case GGML_OP_ARANGE:
+        ggml_vk_arange(ctx, compute_ctx, node, dryrun);
+
+        break;
     case GGML_OP_SQR:
         ggml_vk_sqr(ctx, compute_ctx, src0, node, dryrun);
 
@@ -11086,6 +11146,10 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         break;
     case GGML_OP_COS:
         ggml_vk_cos(ctx, compute_ctx, src0, node, dryrun);
+
+        break;
+    case GGML_OP_LOG:
+        ggml_vk_log(ctx, compute_ctx, src0, node, dryrun);
 
         break;
     case GGML_OP_CLAMP:
@@ -11344,10 +11408,12 @@ static bool ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph *
     case GGML_OP_CONCAT:
     case GGML_OP_UPSCALE:
     case GGML_OP_SCALE:
+    case GGML_OP_ARANGE:
     case GGML_OP_SQR:
     case GGML_OP_SQRT:
     case GGML_OP_SIN:
     case GGML_OP_COS:
+    case GGML_OP_LOG:
     case GGML_OP_CLAMP:
     case GGML_OP_PAD:
     case GGML_OP_ROLL:
@@ -12841,12 +12907,16 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
         case GGML_OP_OPT_STEP_ADAMW:
         case GGML_OP_OPT_STEP_SGD:
             return op->src[0]->type == GGML_TYPE_F32;
+        case GGML_OP_LOG:
+            return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
+                   op->type == op->src[0]->type;
         case GGML_OP_ARGSORT:
             return op->ne[0] <= max_argsort_cols;
         case GGML_OP_UPSCALE:
         case GGML_OP_ACC:
         case GGML_OP_CONCAT:
         case GGML_OP_SCALE:
+        case GGML_OP_ARANGE:
         case GGML_OP_PAD:
         case GGML_OP_ROLL:
         case GGML_OP_DIAG_MASK_INF:
