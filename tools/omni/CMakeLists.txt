@@ -8,6 +8,16 @@ option(ENABLE_COREML "Enable CoreML/ANE support for vision encoder" OFF)
 add_library(omni
             omni.cpp
             omni.h
+            omni-runtime-messages.h
+            omni-worker-state.h
+            omni-token-protocol.cpp
+            omni-token-protocol.h
+            omni-output.cpp
+            omni-output.h
+            omni-python-t2w.cpp
+            omni-python-t2w.h
+            omni-worker-coordinator.cpp
+            omni-worker-coordinator.h
             audition.cpp
             audition.h
             vision.cpp
@@ -105,4 +115,3 @@ target_compile_features(${TARGET_DUPLEX_TEST} PRIVATE cxx_std_17)
 # add_executable(token2wav-example token2wav/token2wav-example.cpp)
 # target_link_libraries(token2wav-example PRIVATE common omni Threads::Threads)
 # target_compile_features(token2wav-example PRIVATE cxx_std_17)
-

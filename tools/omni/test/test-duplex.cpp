@@ -99,12 +99,125 @@ static TestModelPaths resolve_model_paths(const std::string & llm_path) {
     return paths;
 }
 
+struct ChunkTimingReport {
+    int chunk_idx = -1;
+    bool has_image = false;
+    bool ended_with_listen = false;
+    std::string generated_text;
+    double vit_embedding_ms = -1.0;
+    double audio_embedding_ms = -1.0;
+    double stream_prefill_ms = -1.0;
+    double stream_decode_ms = -1.0;
+    double tts_audio_token_ms = -1.0;
+    double token2wav_ms = -1.0;
+    bool tts_done = false;
+    bool token2wav_done = false;
+};
+
+static std::string format_stage_ms(double value_ms, bool ready = true, bool allow_pending = false) {
+    if (value_ms >= 0.0) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%.1f ms", value_ms);
+        return buf;
+    }
+    if (allow_pending && !ready) {
+        return "pending";
+    }
+    return "n/a";
+}
+
+static std::string sanitize_summary_text(const std::string & text) {
+    std::string out;
+    out.reserve(text.size());
+    for (char ch : text) {
+        if (ch == '\n') {
+            out += "\\n";
+        } else if (ch == '\r') {
+            continue;
+        } else if (ch == '\t') {
+            out += ' ';
+        } else {
+            out += ch;
+        }
+    }
+    return out;
+}
+
+static void refresh_chunk_timing_report(struct omni_context * ctx_omni, ChunkTimingReport & report) {
+    omni_duplex_chunk_timing timing;
+    if (!omni_get_duplex_chunk_timing(ctx_omni, report.chunk_idx, &timing)) {
+        return;
+    }
+    report.vit_embedding_ms = timing.vit_embedding_ms;
+    report.audio_embedding_ms = timing.audio_embedding_ms;
+    report.tts_audio_token_ms = timing.tts_audio_token_ms;
+    report.token2wav_ms = timing.token2wav_ms;
+    report.tts_done = timing.tts_done;
+    report.token2wav_done = timing.token2wav_done;
+}
+
+static double average_stage_ms(const std::vector<ChunkTimingReport> & reports,
+                               const std::function<double(const ChunkTimingReport &)> & picker) {
+    double total = 0.0;
+    int count = 0;
+    for (const auto & report : reports) {
+        double value = picker(report);
+        if (value >= 0.0) {
+            total += value;
+            count++;
+        }
+    }
+    return count > 0 ? total / count : -1.0;
+}
+
+static void print_chunk_timing_summary(const std::vector<ChunkTimingReport> & reports, bool use_tts) {
+    if (reports.empty()) {
+        return;
+    }
+
+    printf("\n========================================\n");
+    printf("  Chunk Stage Timing Summary\n");
+    printf("========================================\n");
+    for (const auto & report : reports) {
+        printf("  chunk %04d | vit: %s | audio: %s | prefill: %s | decode: %s",
+               report.chunk_idx,
+               format_stage_ms(report.vit_embedding_ms).c_str(),
+               format_stage_ms(report.audio_embedding_ms).c_str(),
+               format_stage_ms(report.stream_prefill_ms).c_str(),
+               format_stage_ms(report.stream_decode_ms).c_str());
+        if (use_tts) {
+            printf(" | tts(audio token): %s | token2wav: %s",
+                   format_stage_ms(report.tts_audio_token_ms, report.tts_done).c_str(),
+                   format_stage_ms(report.token2wav_ms, report.token2wav_done).c_str());
+        }
+        printf(" | decision: %s\n", report.ended_with_listen ? "<|listen|>" : "<|speak|>");
+        if (!report.ended_with_listen) {
+            const std::string text = sanitize_summary_text(report.generated_text);
+            printf("    text: \"%s\"\n", text.empty() ? "" : text.c_str());
+        }
+    }
+
+    printf("----------------------------------------\n");
+    printf("  avg vit: %s | avg audio: %s | avg prefill: %s | avg decode: %s",
+           format_stage_ms(average_stage_ms(reports, [](const ChunkTimingReport & r) { return r.vit_embedding_ms; })).c_str(),
+           format_stage_ms(average_stage_ms(reports, [](const ChunkTimingReport & r) { return r.audio_embedding_ms; })).c_str(),
+           format_stage_ms(average_stage_ms(reports, [](const ChunkTimingReport & r) { return r.stream_prefill_ms; })).c_str(),
+           format_stage_ms(average_stage_ms(reports, [](const ChunkTimingReport & r) { return r.stream_decode_ms; })).c_str());
+    if (use_tts) {
+        printf(" | avg tts(audio token): %s | avg token2wav: %s",
+               format_stage_ms(average_stage_ms(reports, [](const ChunkTimingReport & r) { return r.tts_audio_token_ms; })).c_str(),
+               format_stage_ms(average_stage_ms(reports, [](const ChunkTimingReport & r) { return r.token2wav_ms; })).c_str());
+    }
+    printf("\n========================================\n");
+}
+
 // ==================== 双工测试核心 ====================
 
 static void duplex_test_case(struct omni_context * ctx_omni,
                              common_params & /*params*/,
                              const std::string & data_path_prefix,
-                             int cnt) {
+                             int cnt,
+                             std::vector<ChunkTimingReport> & chunk_reports) {
     printf("\n========================================\n");
     printf("  双工模式测试: %d chunks\n", cnt);
     printf("  数据前缀: %s\n", data_path_prefix.c_str());
@@ -192,6 +305,16 @@ static void duplex_test_case(struct omni_context * ctx_omni,
             speak_count++;
         }
 
+        ChunkTimingReport report;
+        report.chunk_idx = il;
+        report.has_image = !img_fname.empty();
+        report.ended_with_listen = ended_listen;
+        report.generated_text = generated_text;
+        report.stream_prefill_ms = prefill_dt * 1000.0;
+        report.stream_decode_ms = decode_dt * 1000.0;
+        refresh_chunk_timing_report(ctx_omni, report);
+        chunk_reports.push_back(report);
+
         total_prefill_s += prefill_dt;
         total_decode_s += decode_dt;
         chunks_completed++;
@@ -206,6 +329,17 @@ static void duplex_test_case(struct omni_context * ctx_omni,
                        ? (generated_text.substr(0, 60) + "...").c_str()
                        : generated_text.c_str());
         }
+        printf("  分阶段: vit=%s | audio=%s | prefill=%s | decode=%s",
+               format_stage_ms(report.vit_embedding_ms).c_str(),
+               format_stage_ms(report.audio_embedding_ms).c_str(),
+               format_stage_ms(report.stream_prefill_ms).c_str(),
+               format_stage_ms(report.stream_decode_ms).c_str());
+        if (ctx_omni->use_tts) {
+            printf(" | tts(audio token)=%s | token2wav=%s",
+                   format_stage_ms(report.tts_audio_token_ms, report.tts_done, true).c_str(),
+                   format_stage_ms(report.token2wav_ms, report.token2wav_done, true).c_str());
+        }
+        printf("\n");
     }
 
     auto total_t1 = std::chrono::high_resolution_clock::now();
@@ -384,42 +518,81 @@ int main(int argc, char ** argv) {
         printf("=== Running duplex test case ===\n");
         printf("  Prefix: %s\n", test_prefix.c_str());
         printf("  Count: %d\n", test_count);
-        duplex_test_case(ctx_omni, params, test_prefix, test_count);
+        std::vector<ChunkTimingReport> chunk_reports;
+        duplex_test_case(ctx_omni, params, test_prefix, test_count, chunk_reports);
+        if (ctx_omni->async && ctx_omni->use_tts) {
+            fprintf(stderr, "Waiting for TTS/T2W processing to complete...\n");
+            int idle_count = 0;
+            for (int i = 0; i < 1200; ++i) {
+                if (omni_tts_queues_empty(ctx_omni)) {
+                    idle_count++;
+                    if (idle_count >= 30) {
+                        fprintf(stderr, "TTS/T2W queues idle for 3s, proceeding.\n");
+                        break;
+                    }
+                } else {
+                    idle_count = 0;
+                }
+                usleep(100000);
+            }
+        }
+
+        if (ctx_omni->async) {
+            omni_stop_threads(ctx_omni);
+            if (ctx_omni->llm_thread.joinable()) { ctx_omni->llm_thread.join(); printf("llm thread end\n"); }
+            if (ctx_omni->use_tts && ctx_omni->tts_thread.joinable()) { ctx_omni->tts_thread.join(); printf("tts thread end\n"); }
+            if (ctx_omni->use_tts && ctx_omni->t2w_thread.joinable()) { ctx_omni->t2w_thread.join(); printf("t2w thread end\n"); }
+        }
+
+        for (auto & report : chunk_reports) {
+            refresh_chunk_timing_report(ctx_omni, report);
+        }
+        print_chunk_timing_summary(chunk_reports, ctx_omni->use_tts);
+
+        llama_perf_context_print(ctx_omni->ctx_llama);
+        omni_free(ctx_omni);
+
+        printf("\n=== Duplex test finished ===\n");
+        return 0;
     } else {
         printf("=== Running default duplex test (audio_test_case, 2 chunks) ===\n");
+        std::vector<ChunkTimingReport> chunk_reports;
         duplex_test_case(ctx_omni, params,
-                         "tools/omni/assets/test_case/audio_test_case/audio_test_case_", 2);
-    }
-
-    // 等待 TTS 和 T2W 队列清空
-    if (ctx_omni->async && ctx_omni->use_tts) {
-        fprintf(stderr, "Waiting for TTS/T2W processing to complete...\n");
-        int idle_count = 0;
-        for (int i = 0; i < 1200; ++i) {
-            if (omni_tts_queues_empty(ctx_omni)) {
-                idle_count++;
-                if (idle_count >= 30) {
-                    fprintf(stderr, "TTS/T2W queues idle for 3s, proceeding.\n");
-                    break;
+                         "tools/omni/assets/test_case/audio_test_case/audio_test_case_", 2,
+                         chunk_reports);
+        if (ctx_omni->async && ctx_omni->use_tts) {
+            fprintf(stderr, "Waiting for TTS/T2W processing to complete...\n");
+            int idle_count = 0;
+            for (int i = 0; i < 1200; ++i) {
+                if (omni_tts_queues_empty(ctx_omni)) {
+                    idle_count++;
+                    if (idle_count >= 30) {
+                        fprintf(stderr, "TTS/T2W queues idle for 3s, proceeding.\n");
+                        break;
+                    }
+                } else {
+                    idle_count = 0;
                 }
-            } else {
-                idle_count = 0;
+                usleep(100000);
             }
-            usleep(100000);
         }
+
+        if (ctx_omni->async) {
+            omni_stop_threads(ctx_omni);
+            if (ctx_omni->llm_thread.joinable()) { ctx_omni->llm_thread.join(); printf("llm thread end\n"); }
+            if (ctx_omni->use_tts && ctx_omni->tts_thread.joinable()) { ctx_omni->tts_thread.join(); printf("tts thread end\n"); }
+            if (ctx_omni->use_tts && ctx_omni->t2w_thread.joinable()) { ctx_omni->t2w_thread.join(); printf("t2w thread end\n"); }
+        }
+
+        for (auto & report : chunk_reports) {
+            refresh_chunk_timing_report(ctx_omni, report);
+        }
+        print_chunk_timing_summary(chunk_reports, ctx_omni->use_tts);
+
+        llama_perf_context_print(ctx_omni->ctx_llama);
+        omni_free(ctx_omni);
+
+        printf("\n=== Duplex test finished ===\n");
+        return 0;
     }
-
-    // 停止线程并等待
-    if (ctx_omni->async) {
-        omni_stop_threads(ctx_omni);
-        if (ctx_omni->llm_thread.joinable()) { ctx_omni->llm_thread.join(); printf("llm thread end\n"); }
-        if (ctx_omni->use_tts && ctx_omni->tts_thread.joinable()) { ctx_omni->tts_thread.join(); printf("tts thread end\n"); }
-        if (ctx_omni->use_tts && ctx_omni->t2w_thread.joinable()) { ctx_omni->t2w_thread.join(); printf("t2w thread end\n"); }
-    }
-
-    llama_perf_context_print(ctx_omni->ctx_llama);
-    omni_free(ctx_omni);
-
-    printf("\n=== Duplex test finished ===\n");
-    return 0;
 }

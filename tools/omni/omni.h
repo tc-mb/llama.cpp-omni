@@ -1,5 +1,7 @@
 #include "ggml.h"
 #include "llama.h"
+#include "omni-runtime-messages.h"
+#include "omni-worker-state.h"
 
 #include <thread>
 #include <memory>
@@ -11,6 +13,7 @@
 #include <chrono>
 #include <functional>
 #include <atomic>
+#include <unordered_map>
 
 // Windows compatibility: pid_t is not defined on MSVC
 #ifdef _WIN32
@@ -61,6 +64,7 @@ struct T2WOut {
     bool is_final = false;  // Whether this is the final chunk (turn end)
     bool is_chunk_end = false;  // Whether this is the end of a TTS chunk (flush buffer, but not final)
     int round_idx = -1;  // 🔧 [修复目录同步] 轮次索引，由 TTS 线程设置，T2W 线程使用此值确定输出目录
+    int duplex_chunk_idx = -1;  // Duplex test chunk index for timing aggregation
 };
 
 struct T2WThreadInfo {
@@ -123,6 +127,17 @@ struct projector_model {
     ggml_backend_t backend = nullptr;
     ggml_backend_buffer_type_t buf_type = nullptr;
     bool initialized = false;
+};
+
+struct omni_duplex_chunk_timing {
+    double vit_embedding_ms = -1.0;
+    double audio_embedding_ms = -1.0;
+    double tts_audio_token_ms = -1.0;
+    double token2wav_ms = -1.0;
+    int tts_audio_token_count = 0;
+    int token2wav_window_count = 0;
+    bool tts_done = false;
+    bool token2wav_done = false;
 };
 
 struct omni_context {
@@ -197,6 +212,7 @@ struct omni_context {
     struct LLMThreadInfo *llm_thread_info = NULL;
     struct TTSThreadInfo *tts_thread_info = NULL;
     struct T2WThreadInfo *t2w_thread_info = NULL;
+    OmniWorkerState workers;
     
     volatile bool need_speek = false;
     volatile bool speek_done = true;
@@ -340,6 +356,11 @@ struct omni_context {
     
     // Timestamp for stream_decode start (used for WAV file naming)
     std::chrono::high_resolution_clock::time_point stream_decode_start_time;
+
+    // Duplex per-chunk timing, used by test-duplex.cpp to print async stage costs.
+    std::mutex duplex_timing_mtx;
+    std::unordered_map<int, omni_duplex_chunk_timing> duplex_chunk_timings;
+    int active_duplex_chunk_idx = -1;
     
     // C++ Token2Wav session for audio synthesis
     std::unique_ptr<omni::flow::Token2WavSession> token2wav_session;
@@ -418,6 +439,7 @@ void omni_warmup_ane(struct omni_context * ctx_omni);
 
 // 检查 TTS 和 T2W 队列是否都为空
 bool omni_tts_queues_empty(struct omni_context * ctx_omni);
+bool omni_get_duplex_chunk_timing(struct omni_context * ctx_omni, int chunk_idx, struct omni_duplex_chunk_timing * out_timing);
 
 // 停止所有线程（在 join 之前调用）
 void omni_stop_threads(struct omni_context * ctx_omni);
