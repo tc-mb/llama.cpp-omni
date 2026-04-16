@@ -5641,6 +5641,19 @@ int main(int argc, char ** argv) {
         bool stream = json_value(data, "stream", true);
         int round_idx = json_value(data, "round_idx", -1);  // 🔧 [轮次同步] 从请求中获取 round_idx
 
+        // 🔧 [Length Penalty] 从请求体读取 length_penalty 覆盖 omni context 中的值
+        // length_penalty > 1.0 降低 EOS 概率（生成更长），< 1.0 提高 EOS 概率（更早结束），= 1.0 禁用
+        if (data.contains("length_penalty") && data.at("length_penalty").is_number()) {
+            float lp = data.at("length_penalty").get<float>();
+            {
+                std::lock_guard<std::mutex> lock(ctx_server.octx_mutex);
+                if (ctx_server.octx != nullptr) {
+                    ctx_server.octx->length_penalty = lp;
+                }
+            }
+            SRV_INF("%s: length_penalty set to %.3f\n", __func__, lp);
+        }
+
         if (!stream) {
             bool ok = false;
             {
