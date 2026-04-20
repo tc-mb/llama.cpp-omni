@@ -367,26 +367,6 @@ struct omni_context {
     bool token2wav_initialized = false;
     std::string token2wav_model_dir;  // Directory containing token2wav GGUF models
     
-    // 🔧 [Python Token2Wav] 使用 Python stepaudio2 库实现的 Token2Wav
-    // 设置为 true 时使用 Python 实现（精度更高），false 时使用 C++ 实现
-    // macOS 上默认使用 C++ 实现（无 CUDA）
-    bool use_python_token2wav = false;
-    std::string python_t2w_script_dir;  // Python Token2Wav 脚本目录
-    std::string python_t2w_model_dir;   // Python Token2Wav 模型目录
-    
-    // Python Token2Wav 服务进程 (通过 popen 启动)
-    FILE* python_t2w_stdin = nullptr;   // 写入命令
-    FILE* python_t2w_stdout = nullptr;  // 读取响应
-    pid_t python_t2w_pid = -1;          // 进程 ID
-    bool python_t2w_initialized = false;
-    std::string python_t2w_gpu_id;      // GPU ID (如 "0", "1")
-    
-    // 🔧 Python T2W 独立 GPU 配置
-    // C++ LLM+TTS 占用约 22GB，Python T2W 占用约 3.3GB
-    // 单卡 24GB 放不下，需要使用独立 GPU
-    // 设置为空字符串表示使用与 C++ 相同的 GPU
-    std::string python_t2w_dedicated_gpu = "";  // 独立 GPU ID，如 "1"
-    
     // Token2Wav sliding window buffer (跨 chunk 保持状态)
     // Python 逻辑: buffer 初始填充 3 个静音 token (4218)
     // 每次取 28 个 tokens (25 main + 3 lookahead)，处理后移动 25 个，保留 3 个重叠

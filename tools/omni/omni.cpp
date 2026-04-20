@@ -1,6 +1,5 @@
 #include "omni-impl.h"
 #include "omni-output.h"
-#include "omni-python-t2w.h"
 #include "omni-token-protocol.h"
 #include "omni-worker-coordinator.h"
 #include "vision.h"
@@ -3596,9 +3595,6 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
         // Fallback to tools/omni/token2wav-gguf if not found
         ctx_omni->token2wav_initialized = false;
         
-        // 🔧 如果使用 Python Token2Wav，跳过 C++ 的初始化以节省显存
-        bool skip_cpp_token2wav = ctx_omni->use_python_token2wav;
-        
         // Check if token2wav model files exist
         // 优先检查 HF 模型目录下的 token2wav-gguf (tts_bin_dir 的父目录)
         // 目录结构: {model_dir}/token2wav-gguf/
@@ -3638,7 +3634,7 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
             }
         }
         
-        if (all_files_exist && !skip_cpp_token2wav) {
+        if (all_files_exist) {
             print_with_timestamp("Token2Wav: all model files found, initializing session...\n");
             ctx_omni->token2wav_session = std::make_unique<omni::flow::Token2WavSession>();
             
@@ -3716,107 +3712,6 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
             print_with_timestamp("Token2Wav: model files not found in %s\n", ctx_omni->token2wav_model_dir.c_str());
         }
         
-        // ==================== 初始化 Python Token2Wav ====================
-        // 🔧 默认使用 Python Token2Wav（精度更高）
-        // 设置 Python T2W 脚本目录和模型目录
-        // Python T2W 脚本目录：tools/omni/pyt2w/
-        // Python T2W 模型目录：dependencies/token2wav/
-        
-        // 计算 Python T2W 脚本目录（相对于 tts_bin_dir）
-        // tts_bin_dir 通常是 /xxx/tools/omni/convert/gguf/token2wav-gguf
-        // 我们需要 /xxx/tools/omni/pyt2w
-        std::string t2w_script_dir = tts_bin_dir;  // /xxx/tools/omni/convert/gguf/token2wav-gguf
-        // 回退到 tools/omni/
-        size_t convert_pos = t2w_script_dir.find("/convert/gguf/tts");
-        if (convert_pos != std::string::npos) {
-            t2w_script_dir = t2w_script_dir.substr(0, convert_pos) + "/pyt2w";
-        } else if ((convert_pos = t2w_script_dir.find("/convert/gguf")) != std::string::npos) {
-            t2w_script_dir = t2w_script_dir.substr(0, convert_pos) + "/pyt2w";
-        } else {
-            // 尝试从当前工作目录构建
-            t2w_script_dir = "./tools/omni/pyt2w";
-        }
-        ctx_omni->python_t2w_script_dir = t2w_script_dir;
-        
-        // Python T2W 模型目录（stepaudio2 模型）
-        // 默认路径：相对于 script_dir 的 token2wav 子目录
-        ctx_omni->python_t2w_model_dir = t2w_script_dir + "/token2wav";
-        
-        // 参考音频路径
-        std::string ref_audio_path = "tools/omni/assets/default_ref_audio/default_ref_audio.wav";
-        
-        print_with_timestamp("Python T2W: script_dir=%s, model_dir=%s\n", 
-                             ctx_omni->python_t2w_script_dir.c_str(),
-                             ctx_omni->python_t2w_model_dir.c_str());
-        
-        if (ctx_omni->use_python_token2wav) {
-            print_with_timestamp("Python T2W: 使用 Python Token2Wav 实现\n");
-            
-            // 🔧 Python T2W GPU 配置
-            // C++ LLM+TTS 占用约 22GB，Python T2W 占用约 3.3GB
-            // 单卡 24GB 放不下，需要配置独立 GPU
-            // 
-            // 通过环境变量 PYTHON_T2W_GPU 配置独立 GPU
-            // 例如: export PYTHON_T2W_GPU=1  # Python T2W 使用 GPU 1
-            // 
-            // 优先级：PYTHON_T2W_GPU 环境变量 > 外部 CUDA_VISIBLE_DEVICES > token2wav_device
-            const char* env_python_t2w_gpu = getenv("PYTHON_T2W_GPU");
-            if (env_python_t2w_gpu && strlen(env_python_t2w_gpu) > 0) {
-                ctx_omni->python_t2w_dedicated_gpu = env_python_t2w_gpu;
-            }
-            
-            ctx_omni->python_t2w_gpu_id = "";
-            
-            if (!ctx_omni->python_t2w_dedicated_gpu.empty()) {
-                // 使用配置的独立 GPU
-                ctx_omni->python_t2w_gpu_id = ctx_omni->python_t2w_dedicated_gpu;
-                print_with_timestamp("Python T2W: 使用独立 GPU %s (C++ 和 Python 分开)\n", ctx_omni->python_t2w_gpu_id.c_str());
-            } else {
-                const char* env_cuda_visible = getenv("CUDA_VISIBLE_DEVICES");
-                if (env_cuda_visible && strlen(env_cuda_visible) > 0) {
-                    // 外部已设置，Python 子进程会继承，不需要额外设置
-                    print_with_timestamp("Python T2W: 继承外部 CUDA_VISIBLE_DEVICES=%s (与 C++ 共用)\n", env_cuda_visible);
-                } else if (token2wav_device.find("gpu") != std::string::npos) {
-                    // 外部未设置，从 token2wav_device 提取
-                    size_t colon_pos = token2wav_device.find(':');
-                    if (colon_pos != std::string::npos) {
-                        ctx_omni->python_t2w_gpu_id = token2wav_device.substr(colon_pos + 1);
-                    } else {
-                        ctx_omni->python_t2w_gpu_id = "0";
-                    }
-                    print_with_timestamp("Python T2W: 设置 CUDA_VISIBLE_DEVICES=%s (与 C++ 共用)\n", ctx_omni->python_t2w_gpu_id.c_str());
-                } else {
-                    print_with_timestamp("Python T2W: CPU 模式\n");
-                }
-            }
-            
-            // 启动 Python 服务
-            if (omni_start_python_t2w_service(ctx_omni)) {
-                // 初始化模型
-                if (omni_init_python_t2w_model(ctx_omni, token2wav_device)) {
-                    // 设置参考音频
-                    if (omni_set_python_t2w_ref_audio(ctx_omni, ref_audio_path)) {
-                        print_with_timestamp("Python T2W: 初始化成功\n");
-                    } else {
-                        print_with_timestamp("Python T2W: 设置参考音频失败\n");
-                        ctx_omni->use_python_token2wav = false;
-                    }
-                } else {
-                    print_with_timestamp("Python T2W: 初始化模型失败\n");
-                    ctx_omni->use_python_token2wav = false;
-                }
-            } else {
-                print_with_timestamp("Python T2W: 启动服务失败\n");
-                ctx_omni->use_python_token2wav = false;
-            }
-            
-            // 如果 Python 初始化失败，回退到 C++ 实现
-            if (!ctx_omni->use_python_token2wav) {
-                print_with_timestamp("Python T2W: 回退到 C++ 实现\n");
-            }
-        } else {
-            print_with_timestamp("Token2Wav: 使用 C++ 实现\n");
-        }
     }
     ctx_omni->async = true;
     
@@ -3957,11 +3852,6 @@ void omni_free(struct omni_context * ctx_omni) {
             ctx_omni->token2wav_session.reset();
             ctx_omni->token2wav_initialized = false;
             LOG_INF("Token2Wav (C++): session released\n");
-        }
-        
-        // 🔧 停止 Python Token2Wav 服务
-        if (ctx_omni->python_t2w_initialized) {
-            omni_stop_python_t2w_service(ctx_omni);
         }
         
         // Free ggml-based projector model
@@ -7463,251 +7353,7 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
 
 // ======================= Token2Wav 线程函数 =======================
 
-// Python Token2Wav thread function
-void t2w_thread_func_python(struct omni_context * ctx_omni, common_params *params) {
-    print_with_timestamp("T2W thread (Python) started\n");
-    fflush(stdout);
-    
-    auto& queue = ctx_omni->t2w_thread_info->queue;
-    auto& mtx = ctx_omni->t2w_thread_info->mtx;
-    auto& cv = ctx_omni->t2w_thread_info->cv;
-    
-    // Token2Wav sliding window parameters
-    constexpr int32_t CHUNK_SIZE = 25;      // Main chunk size (25 tokens = 1s audio)
-    constexpr int32_t PRE_LOOKAHEAD = 3;    // Lookahead for overlap
-    constexpr int32_t WINDOW_SIZE = CHUNK_SIZE + PRE_LOOKAHEAD;  // 28
-    
-    // Buffer to accumulate tokens (for sliding window)
-    std::vector<int32_t> token_buffer = {4218, 4218, 4218};
-    
-    // 使用可配置的 base_output_dir
-    const std::string& base_output_dir = ctx_omni->base_output_dir;
-    
-    // Helper function to get round-specific output directory
-    auto get_wav_output_dir = [&]() -> std::string {
-        if (!ctx_omni->duplex_mode) {
-            char round_dir[512];
-            snprintf(round_dir, sizeof(round_dir), "%s/round_%03d/tts_wav", 
-                     base_output_dir.c_str(), ctx_omni->simplex_round_idx);
-            return std::string(round_dir);
-        } else {
-            return base_output_dir + "/tts_wav";
-        }
-    };
-    
-    int last_round_idx = ctx_omni->simplex_round_idx;
-    std::string tts_wav_output_dir = get_wav_output_dir();
-    int wav_idx = 0;
-    const int sample_rate = 24000;  // Python Token2Wav 输出采样率
-    
-    // 确保输出目录存在
-    {
-        cross_platform_mkdir_p(tts_wav_output_dir);
-    }
-    
-    while (ctx_omni->workers.t2w_thread_running) {
-        // 检测打断事件
-        if (ctx_omni->break_event.load()) {
-            std::lock_guard<std::mutex> lock(mtx);
-            while (!queue.empty()) {
-                T2WOut *t2w_out = queue.front();
-                queue.pop();
-                delete t2w_out;
-            }
-            ctx_omni->break_event = false;
-            token_buffer = {4218, 4218, 4218};
-            wav_idx = 0;
-            
-            if (!ctx_omni->duplex_mode) {
-                ctx_omni->wav_turn_base += 1000;
-            }
-            
-            if (!ctx_omni->duplex_mode && ctx_omni->simplex_round_idx != last_round_idx) {
-                last_round_idx = ctx_omni->simplex_round_idx;
-                tts_wav_output_dir = get_wav_output_dir();
-                cross_platform_mkdir_p(tts_wav_output_dir);
-            }
-            
-            // 重置 Python 缓存
-            omni_reset_python_t2w_cache(ctx_omni);
-            continue;
-        }
-        
-        std::unique_lock<std::mutex> lock(mtx);
-        cv.wait(lock, [&] { return !queue.empty() || !ctx_omni->workers.t2w_thread_running; });
-        
-        if (!ctx_omni->workers.t2w_thread_running && queue.empty()) {
-            break;
-        }
-        
-        if (ctx_omni->break_event.load()) {
-            lock.unlock();
-            continue;
-        }
-        
-        // Get all available tokens from queue
-        std::vector<llama_token> new_tokens;
-        bool is_final = false;
-        bool is_chunk_end = false;
-        int received_round_idx = -1;  // 🔧 从队列中获取的 round_idx
-        
-        while (!queue.empty()) {
-            T2WOut *t2w_out = queue.front();
-            queue.pop();
-            new_tokens.insert(new_tokens.end(), t2w_out->audio_tokens.begin(), t2w_out->audio_tokens.end());
-            is_final = is_final || t2w_out->is_final;
-            is_chunk_end = is_chunk_end || t2w_out->is_chunk_end;
-            // 🔧 使用最新的 round_idx（最后一个有效的值）
-            if (t2w_out->round_idx >= 0) {
-                received_round_idx = t2w_out->round_idx;
-            }
-            delete t2w_out;
-        }
-        
-        lock.unlock();
-        
-        if (new_tokens.empty() && !is_chunk_end && !is_final) {
-            continue;
-        }
-        
-        // 🔧 [通过 T2WOut 传递 round_idx] 使用传入的 round_idx 确定输出目录
-        // 这比从 ctx_omni->simplex_round_idx 读取更可靠，避免竞态条件
-        if (!ctx_omni->duplex_mode && received_round_idx >= 0 && received_round_idx != last_round_idx) {
-            print_with_timestamp("T2W(Python): round_idx 变化 %d -> %d（来自T2WOut），更新输出目录\n",
-                                last_round_idx, received_round_idx);
-            last_round_idx = received_round_idx;
-            tts_wav_output_dir = get_wav_output_dir();
-            cross_platform_mkdir_p(tts_wav_output_dir);
-            // 重置 wav 索引，因为是新的轮次
-            wav_idx = 0;
-        }
-        
-        // Add new tokens to buffer
-        token_buffer.insert(token_buffer.end(), new_tokens.begin(), new_tokens.end());
-        
-        // 检查 Python 服务是否初始化
-        if (!ctx_omni->python_t2w_initialized) {
-            continue;
-        }
-        
-        bool need_flush = false;
-        size_t min_process_threshold = WINDOW_SIZE;
-        
-        if (!ctx_omni->duplex_mode) {
-            need_flush = is_final || is_chunk_end;
-        } else {
-            need_flush = is_final;
-        }
-
-        // 🔧 [修复双工模式最后一个字没说完] 当 is_final=true 但 token_buffer 为空时
-        // 也需要调用 reset_python_t2w_cache，否则 T2W 的流式缓存不会被重置
-        // 这会导致下一个 turn 的音频和上一个 turn 的尾音混在一起
-        if (is_final && token_buffer.empty()) {
-            print_with_timestamp("T2W(Python): is_final=true but token_buffer empty, calling reset directly\n");
-            omni_reset_python_t2w_cache(ctx_omni);
-            // 不需要处理 token_buffer，直接继续等待下一个消息
-            continue;
-        }
-        
-        // Process windows using sliding window
-        while (token_buffer.size() >= min_process_threshold || (need_flush && !token_buffer.empty())) {
-            size_t process_size = std::min(token_buffer.size(), (size_t)WINDOW_SIZE);
-            bool is_last_window = need_flush && (token_buffer.size() <= WINDOW_SIZE);
-            
-            std::vector<int32_t> window(token_buffer.begin(), token_buffer.begin() + process_size);
-            
-            // 生成 WAV 输出路径
-            std::string wav_path = tts_wav_output_dir + "/wav_" + std::to_string(ctx_omni->wav_turn_base + wav_idx) + ".wav";
-            
-            double inference_time_ms = 0;
-            double audio_duration = 0;
-            
-            if (omni_process_python_t2w_tokens(ctx_omni, window, is_last_window, wav_path, inference_time_ms, audio_duration)) {
-                if (audio_duration > 0) {
-                    auto wav_complete_time = std::chrono::high_resolution_clock::now();
-                    auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        wav_complete_time - ctx_omni->stream_decode_start_time).count();
-                    
-                    if (wav_idx == 0) {
-                        print_with_timestamp("🎉 首响时间 (First Audio Response): %lldms\n", (long long)elapsed_ms);
-                    }
-                    
-                    float rtf = (float)(inference_time_ms / 1000.0) / audio_duration;
-                    print_with_timestamp("T2W(Python): wav_%d.wav | %.2fs audio | %.1fms inference | RTF=%.2f | t=%lldms\n",
-                                        ctx_omni->wav_turn_base + wav_idx, audio_duration, inference_time_ms, rtf, (long long)elapsed_ms);
-                    wav_idx++;
-                    
-                    // 注意：不要在中途重置缓存！Python 原版在整个对话中保持缓存连续
-                    // 只在对话/轮次结束时（is_final=true）才重置缓存
-                    // 使用独立 GPU 后，显存不再是问题
-                }
-            } else {
-                LOG_ERR("T2W(Python): process 失败\n");
-            }
-            
-            // Slide window
-            if (!ctx_omni->duplex_mode) {
-                if (token_buffer.size() > CHUNK_SIZE) {
-                    token_buffer.erase(token_buffer.begin(), token_buffer.begin() + CHUNK_SIZE);
-                } else {
-                    token_buffer.clear();
-                }
-            } else {
-                size_t slide_amount;
-                if (is_last_window) {
-                    slide_amount = token_buffer.size();
-                } else if (token_buffer.size() > CHUNK_SIZE) {
-                    slide_amount = CHUNK_SIZE;
-                } else if (token_buffer.size() > PRE_LOOKAHEAD) {
-                    slide_amount = token_buffer.size() - PRE_LOOKAHEAD;
-                } else {
-                    slide_amount = 0;
-                }
-                
-                if (slide_amount > 0 && slide_amount <= token_buffer.size()) {
-                    token_buffer.erase(token_buffer.begin(), token_buffer.begin() + slide_amount);
-                } else if (slide_amount > token_buffer.size()) {
-                    token_buffer.clear();
-                }
-            }
-            
-            if (is_last_window) {
-                if (is_final) {
-                    // 写入结束标记
-                    std::string done_flag_path = tts_wav_output_dir + "/generation_done.flag";
-                    FILE* flag_file = fopen(done_flag_path.c_str(), "w");
-                    if (flag_file) {
-                        int last_wav_idx = (wav_idx > 0) ? (ctx_omni->wav_turn_base + wav_idx - 1) : 0;
-                        fprintf(flag_file, "%d\n", last_wav_idx);
-                        fclose(flag_file);
-                    }
-                    
-                    token_buffer = {4218, 4218, 4218};
-                    
-                    // 重置 Python 缓存
-                    omni_reset_python_t2w_cache(ctx_omni);
-                    
-                    if (!ctx_omni->duplex_mode) {
-                        wav_idx = 0;
-                        ctx_omni->wav_turn_base += 1000;
-                    }
-                    
-                    if (!ctx_omni->duplex_mode && ctx_omni->simplex_round_idx != last_round_idx) {
-                        last_round_idx = ctx_omni->simplex_round_idx;
-                        tts_wav_output_dir = get_wav_output_dir();
-                        cross_platform_mkdir_p(tts_wav_output_dir);
-                    }
-                }
-                break;
-            }
-        }
-    }
-    
-    print_with_timestamp("T2W(Python) 线程: 停止\n");
-    fflush(stdout);
-}
-
-// C++ Token2Wav thread function (原实现，保留作为备选)
+// C++ Token2Wav thread function
 // ==============================================================================
 // T2W Thread Function (C++ Token2Wav)
 // ==============================================================================
@@ -8095,13 +7741,9 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
     fflush(stdout);
 }
 
-// Token2Wav 线程入口函数（根据配置选择 Python 或 C++ 实现）
+// Token2Wav 线程入口函数
 void t2w_thread_func(struct omni_context * ctx_omni, common_params *params) {
-    if (ctx_omni->use_python_token2wav) {
-        t2w_thread_func_python(ctx_omni, params);
-    } else {
-        t2w_thread_func_cpp(ctx_omni, params);
-    }
+    t2w_thread_func_cpp(ctx_omni, params);
 }
 
 bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::string img_fname, int index, int max_slice_nums) {

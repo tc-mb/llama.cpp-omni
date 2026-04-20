@@ -14,8 +14,7 @@ add_library(omni
             omni-token-protocol.h
             omni-output.cpp
             omni-output.h
-            omni-python-t2w.cpp
-            omni-python-t2w.h
+
             omni-worker-coordinator.cpp
             omni-worker-coordinator.h
             audition.cpp
