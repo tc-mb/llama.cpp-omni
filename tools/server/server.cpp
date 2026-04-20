@@ -6142,7 +6142,9 @@ int main(int argc, char ** argv) {
             ctx_server.octx->simplex_round_idx = 0;
             ctx_server.octx->wav_turn_base = 0;
             ctx_server.octx->round_start_positions.clear();
-            SRV_INF("%s: simplex_round_idx and wav_turn_base reset to 0\n", __func__);
+            // [Case 2 抢答] 新 session 时重置 force_listen 计数器，重新进入开局强制 LISTEN 期
+            ctx_server.octx->force_listen_used = 0;
+            SRV_INF("%s: simplex_round_idx, wav_turn_base, force_listen_used reset to 0\n", __func__);
             
             // 🔧 [修复卡住问题] 重置 speek_done 为 true
             // 原因：stream_prefill(index=0) 在 warmup_done=true 时会等待 speek_done=true

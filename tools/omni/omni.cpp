@@ -717,14 +717,26 @@ static void kv_cache_slide_window(struct omni_context* ctx_omni, common_params* 
                              ctx_omni->n_keep, total_rounds);
 
         if (total_rounds < 2) {
-            // 轮次不足，退化为全量清空
-            int n_discard_full = ctx_omni->n_past - ctx_omni->n_keep;
-            if (n_discard_full > 0) {
+            // 轮次边界不足（一轮超长对话）：不做全量清空，尽量保留最近一段 KV。
+            // 原行为是丢掉 [n_keep, n_past)，模型立刻失忆 → 连续长对话下触发后模型会
+            // 陷入长时间 LISTEN / 彻底失控（case 3、case 4）。
+            // 改为按 tail window 保留最近 target_keep_tokens，通过左移 KV 对齐位置。
+            const int target_keep_tokens = std::max(n_ctx / 4, 2048);
+            int keep_from = ctx_omni->n_past - target_keep_tokens;
+            keep_from = std::max(keep_from, ctx_omni->n_keep);
+            int n_discard = keep_from - ctx_omni->n_keep;
+
+            if (n_discard <= 0) {
+                print_with_timestamp("⚠️ slide skipped (rounds<2): nothing to discard (n_past=%d, target_keep=%d)\n",
+                                     ctx_omni->n_past, target_keep_tokens);
+            } else {
                 llama_memory_t mem = llama_get_memory(ctx_omni->ctx_llama);
                 if (mem) {
-                    llama_memory_seq_rm(mem, 0, ctx_omni->n_keep, ctx_omni->n_past);
+                    llama_memory_seq_rm(mem, 0, ctx_omni->n_keep, keep_from);
+                    llama_memory_seq_add(mem, 0, keep_from, ctx_omni->n_past, -n_discard);
                 }
-                ctx_omni->n_past = ctx_omni->n_keep;
+                ctx_omni->n_past -= n_discard;
+                // 没有可信的 round boundary 了，清空以避免后续按错位的 boundary 切割
                 ctx_omni->round_start_positions.clear();
                 if (ctx_omni->ctx_tts_llama) {
                     llama_memory_t tts_mem = llama_get_memory(ctx_omni->ctx_tts_llama);
@@ -733,8 +745,8 @@ static void kv_cache_slide_window(struct omni_context* ctx_omni, common_params* 
                     ctx_omni->tts_all_generated_tokens.clear();
                     ctx_omni->tts_condition_saved = false;
                 }
-                print_with_timestamp("⚠️ slide DONE: full reset (rounds=%d<2): n_past %d→%d, freed %d, TTS KV cleared\n",
-                                     total_rounds, old_n_past, ctx_omni->n_past, n_discard_full);
+                print_with_timestamp("⚠️ slide DONE: rounds<2 tail-keep: n_past %d→%d, freed %d (kept last %d), TTS KV cleared\n",
+                                     old_n_past, ctx_omni->n_past, n_discard, target_keep_tokens);
             }
         } else {
             // 保留约 n_ctx/4 的上下文，按 round boundary 对齐截断
@@ -8541,7 +8553,9 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
         if (!ctx_omni->duplex_mode) {
             need_flush = is_final || is_chunk_end;
         } else {
-            need_flush = is_final;  // 完全 flush 只在轮次结束时
+            // 双工：只在 is_final（LISTEN→SPEAK 切换时 LLM 线程设置）时 flush。
+            // chunk_end 保持原语义"累积等下个 chunk"，避免把一轮 turn 切成多段 wav 产生播放 gap。
+            need_flush = is_final;
         }
         
         // Process windows using sliding window
@@ -8549,8 +8563,9 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
         while (token_buffer.size() >= min_process_threshold || (need_flush && !token_buffer.empty())) {
             // Determine how many tokens to process
             size_t process_size = std::min(token_buffer.size(), (size_t)WINDOW_SIZE);
-            // 🔧 is_last_window: 当是 final 或 chunk_end，且 buffer 中的 tokens 不足一个完整 window 时
-            bool is_last_window = need_flush && (token_buffer.size() <= WINDOW_SIZE);
+            // 🔧 is_last_window: 只有 is_final 才算轮次真正的"最后窗口"（触发 token2wav 终结 + buffer 重置）
+            // 双工 chunk_end 不能视为 last_window，否则 token2wav 会被重置、丢失跨 chunk 的状态
+            bool is_last_window = is_final && (token_buffer.size() <= WINDOW_SIZE);
             
             std::vector<int32_t> window(token_buffer.begin(), token_buffer.begin() + process_size);
             
@@ -9185,6 +9200,32 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
         // stream_prefill 已添加 <unit>[audio_embed]
         // 模型会输出 <|speak|>xxx<|chunk_eos|> 或 <|listen|><|chunk_eos|>
         print_with_timestamp("stream_decode: 双工模式，跳过 assistant prompt\n");
+
+        // [Case 2 抢答] 会话开局前 N 次 stream_decode 强制 LISTEN，
+        // 与 Python duplex_config.force_listen_count=3 对齐。
+        // 防止 browser MediaStreamTrack 开启时的瞬态噪声 + 强 system prompt
+        // 组合导致模型第一个 chunk 直接 SPEAK。
+        // 这里直接发 __IS_LISTEN__ 到 text_queue 走 LISTEN 分支，不启动 LLM 采样。
+        // 用户音频的 KV cache 已经在 stream_prefill 阶段写入，所以不会丢失上下文。
+        if (ctx_omni->force_listen_used < ctx_omni->force_listen_count) {
+            ctx_omni->force_listen_used++;
+            ctx_omni->slide_last_was_listen = true;
+            ctx_omni->ended_with_listen = true;
+            ctx_omni->current_turn_ended = false;
+            if (ctx_omni->use_tts) {
+                ctx_omni->speek_done = true;
+            }
+            print_with_timestamp("LLM Duplex: force_listen %d/%d, skip generation and emit __IS_LISTEN__\n",
+                                 ctx_omni->force_listen_used, ctx_omni->force_listen_count);
+            if (ctx_omni->async) {
+                std::lock_guard<std::mutex> tl(ctx_omni->text_mtx);
+                ctx_omni->text_queue.push_back("__IS_LISTEN__");
+                ctx_omni->text_done_flag = true;
+                ctx_omni->text_streaming = false;
+                ctx_omni->text_cv.notify_all();
+            }
+            return true;
+        }
     } else if (ctx_omni->use_tts) {
         // 🔧 [非双工 TTS 模式] 需要包含 <|tts_bos|>，告诉模型开始生成 TTS 文本
         // stream_prefill 已添加 <|audio_start|>[audio]<|audio_end|>，这里关闭用户消息并添加 assistant prompt
@@ -9354,6 +9395,22 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
                                             "set is_end_of_turn=true (not breaking, wait for chunk_eos)\n",
                                             (int)token_type);
                         // 不 break，不设 llm_finish，继续生成直到 chunk_eos/listen
+                    } else if (token_type == OmniTokenType::LISTEN) {
+                        // 🔧 [修复尾音问题] LISTEN 表示切回听状态：
+                        // - 如果之前在 SPEAK（slide_last_was_listen=false），说明本轮发言刚结束，
+                        //   TTS buffer 里可能有不足 chunk_size(25) 的残留 token，必须 flush 出去，
+                        //   否则残留 token 会被带入下一轮，造成尾音串接到下轮开头。
+                        // - 如果之前已经在 listen（slide_last_was_listen=true，比如会话开局
+                        //   用户还没说话、或模型连续生成 listen），则没有 speak 内容要 flush，
+                        //   不应触发 is_end_of_turn（否则 TTS 会错误地添加 text_eos_embed 并生成杂音）。
+                        // 注意：slide_last_was_listen 由 LISTEN 分支末尾更新（见下方 9386 行附近），
+                        // 此处读到的是"上一个 chunk 结束时的状态"，正好用于判断。
+                        if (!ctx_omni->slide_last_was_listen.load()) {
+                            local_is_end_of_turn = true;
+                            print_with_timestamp("LLM Duplex: LISTEN detected after SPEAK, set is_end_of_turn=true to flush TTS buffer\n");
+                        } else {
+                            print_with_timestamp("LLM Duplex: LISTEN during listen state, skip flush\n");
+                        }
                     }
                 }
                 
