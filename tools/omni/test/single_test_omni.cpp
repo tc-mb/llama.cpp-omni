@@ -1,27 +1,20 @@
 /**
- * 单工 (Singleplex) Omni 模式批量测试
+ * 单工 (Singleplex) Omni (audio + vision) 批量测试
  *
- * 单工模式下，所有音频（+可选图片）一次性 prefill 完成，最后统一 decode 一次生成完整回复。
+ * 测试数据格式: <prefix>0000.wav / <prefix>0000.jpg, <prefix>0001.wav / <prefix>0001.jpg, ...
+ * 每个 chunk 的图片 (.jpg) 与音频 (.wav) 同前缀同编号配对；图片缺失的 chunk 会退化为纯音频 prefill。
+ * 典型数据集:
+ *   tools/omni/assets/test_case/omni_test_case/omni_test_case_XXXX.{wav,jpg}
  *
- * 与双工模式的区别：
- *   - 单工：所有 chunk 一次性 prefill，然后统一 decode 一次
- *   - 双工：每个 chunk prefill 后立即 decode，模型实时决策
+ * 流程：所有 (audio[+image]) chunk 同步 prefill 完成后，统一 decode 一次生成完整回复。
  *
  * 用法:
- *   llama-omni-test-singleplex -m <llm_model_path> [options]
- *     --test <prefix> <n>   指定测试数据前缀和 chunk 数量 (必需)
- *     --ref-audio <path>    参考音频路径
- *     --no-tts              禁用 TTS
- *     --omni                启用 omni 模式 (audio+vision)
- *     --vision-backend <mode>  Vision 后端: 'metal'(默认) 或 'coreml'
- *     --vision-coreml <path>   CoreML 模型路径 (backend=coreml 时需要)
- *     -c <n>                上下文大小 (默认 4096)
- *     -ngl <n>              GPU 层数 (默认 99)
+ *   llama-omni-single-test-omni -m <llm_model_path> --test <prefix> <n> [options]
  *
  * 示例:
- *   llama-omni-test-singleplex \
- *       -m ./models/MiniCPM-o-4_5-gguf/MiniCPM-o-4_5-Q4_K_M.gguf \
- *       --omni --test tools/omni/assets/test_case/omni_test_case/omni_test_case_ 9
+ *   llama-omni-single-test-omni \
+ *       -m /path/to/MiniCPM-o-4_5-gguf/MiniCPM-o-4_5-Q4_K_M.gguf \
+ *       --test tools/omni/assets/test_case/omni_test_case/omni_test_case_ 9
  */
 
 #include "omni-impl.h"
@@ -97,37 +90,34 @@ static bool file_exists(const std::string & path) {
 
 static OmniModelPaths resolve_model_paths(const std::string & llm_path) {
     OmniModelPaths paths;
-    paths.llm = llm_path;
+    paths.llm      = llm_path;
     paths.base_dir = get_parent_dir(llm_path);
 
-    paths.vision = paths.base_dir + "/vision/MiniCPM-o-4_5-vision-F16.gguf";
-    paths.audio = paths.base_dir + "/audio/MiniCPM-o-4_5-audio-F16.gguf";
-    paths.tts = paths.base_dir + "/tts/MiniCPM-o-4_5-tts-F16.gguf";
-    paths.projector = paths.base_dir + "/tts/MiniCPM-o-4_5-projector-F16.gguf";
+    paths.vision        = paths.base_dir + "/vision/MiniCPM-o-4_5-vision-F16.gguf";
+    paths.audio         = paths.base_dir + "/audio/MiniCPM-o-4_5-audio-F16.gguf";
+    paths.tts           = paths.base_dir + "/tts/MiniCPM-o-4_5-tts-F16.gguf";
+    paths.projector     = paths.base_dir + "/tts/MiniCPM-o-4_5-projector-F16.gguf";
     paths.vision_coreml = paths.base_dir + "/vision/coreml_minicpmo45_vit_all_f16.mlmodelc";
-
     return paths;
 }
 
 static void print_model_paths(const OmniModelPaths & paths) {
     printf("=== Model Paths ===\n");
     printf("  Base dir:   %s\n", paths.base_dir.c_str());
-    printf("  LLM:        %s %s\n", paths.llm.c_str(), file_exists(paths.llm) ? "[OK]" : "[NOT FOUND]");
-    printf("  Vision:     %s %s\n", paths.vision.c_str(), file_exists(paths.vision) ? "[OK]" : "[NOT FOUND]");
-    printf("  Audio:      %s %s\n", paths.audio.c_str(), file_exists(paths.audio) ? "[OK]" : "[NOT FOUND]");
-    printf("  TTS:        %s %s\n", paths.tts.c_str(), file_exists(paths.tts) ? "[OK]" : "[NOT FOUND]");
+    printf("  LLM:        %s %s\n", paths.llm.c_str(),       file_exists(paths.llm)       ? "[OK]" : "[NOT FOUND]");
+    printf("  Vision:     %s %s\n", paths.vision.c_str(),    file_exists(paths.vision)    ? "[OK]" : "[NOT FOUND]");
+    printf("  Audio:      %s %s\n", paths.audio.c_str(),     file_exists(paths.audio)     ? "[OK]" : "[NOT FOUND]");
+    printf("  TTS:        %s %s\n", paths.tts.c_str(),       file_exists(paths.tts)       ? "[OK]" : "[NOT FOUND]");
     printf("  Projector:  %s %s\n", paths.projector.c_str(), file_exists(paths.projector) ? "[OK]" : "[NOT FOUND]");
     printf("===================\n");
 }
 
 // ==================== 批量测试主流程 ====================
 
-// 单工批量测试：所有 chunk 同步 prefill，最后统一 decode 一次
-static void run_singleplex_test(struct omni_context * ctx_omni,
-                                const std::string & data_path_prefix,
-                                int cnt) {
-    // 单工模式：先 prefill 所有输入，然后 decode 一次生成完整回复
-    // 使用同步模式 prefill，避免 async 模式下的竞态条件
+// Omni 单工批量测试：audio + 同名 .jpg 图片同步 prefill，最后统一 decode 一次
+static void run_omni_test(struct omni_context * ctx_omni,
+                          const std::string & data_path_prefix,
+                          int cnt) {
     ctx_omni->system_prompt_initialized = false;
     bool orig_async = ctx_omni->async;
     ctx_omni->async = false;  // 同步模式 prefill，确保所有数据被处理
@@ -146,56 +136,55 @@ static void run_singleplex_test(struct omni_context * ctx_omni,
         char idx_str[16];
         snprintf(idx_str, sizeof(idx_str), "%04d", il);
         std::string aud_fname = data_path_prefix + idx_str + ".wav";
-
-        // omni 模式：自动检测同名 .jpg 图片
         std::string img_fname;
         std::string img_candidate = data_path_prefix + idx_str + ".jpg";
         if (file_exists(img_candidate)) {
             img_fname = img_candidate;
         }
 
+        if (!file_exists(aud_fname)) {
+            fprintf(stderr, "Warning: audio chunk not found, skip: %s\n", aud_fname.c_str());
+            continue;
+        }
+
         auto t0 = std::chrono::high_resolution_clock::now();
-        // 用户音频 chunk 从 index=1 开始喂入（index=0 保留给 system prompt 初始化）
         stream_prefill(ctx_omni, aud_fname, img_fname, il + 1);
         auto t1 = std::chrono::high_resolution_clock::now();
-        std::chrono::duration<double> elapsed_seconds = t1 - t0;
-        double dt = elapsed_seconds.count();
+        double dt = std::chrono::duration<double>(t1 - t0).count();
         if (img_fname.empty()) {
-            std::cout << "prefill " << il << " (audio) : " << dt << " s" << std::endl;
+            std::cout << "prefill " << il << " (audio only) : " << dt << " s" << std::endl;
         } else {
             std::cout << "prefill " << il << " (audio+vision) : " << dt << " s" << std::endl;
         }
     }
 
-    // 所有数据同步 prefill 完成后恢复 async 模式并调用 decode
-    // stream_decode 内部会根据 async 标志启动 TTS/T2W 线程
     ctx_omni->async = orig_async;
     stream_decode(ctx_omni, "./");
 }
 
 static void show_usage(const char * prog_name) {
     printf(
-        "MiniCPM-o Singleplex Test - Batch prefill + single decode\n\n"
+        "MiniCPM-o Singleplex Omni (audio+vision) Test\n\n"
         "Usage: %s -m <llm_model_path> --test <prefix> <n> [options]\n\n"
         "Required:\n"
         "  -m <path>                LLM GGUF 模型路径\n"
-        "  --test <prefix> <n>      测试数据前缀和 chunk 数量\n\n"
+        "  --test <prefix> <n>      测试数据前缀和 chunk 数量\n"
+        "                           (文件: <prefix>0000.wav/.jpg 等)\n\n"
         "Options:\n"
         "  --vision <path>          覆盖 vision 模型路径\n"
         "  --audio <path>           覆盖 audio 模型路径\n"
         "  --tts <path>             覆盖 TTS 模型路径\n"
         "  --projector <path>       覆盖 projector 模型路径\n"
-        "  --ref-audio <path>       参考音频路径\n"
+        "  --ref-audio <path>       参考音频路径 (voice clone)\n"
         "  -c, --ctx-size <n>       上下文大小 (默认 4096)\n"
         "  -ngl <n>                 GPU 层数 (默认 99)\n"
         "  --no-tts                 禁用 TTS\n"
-        "  --omni                   启用 omni 模式 (audio+vision, media_type=2)\n"
         "  --vision-backend <mode>  Vision 后端: 'metal'(默认) 或 'coreml'\n"
         "  --vision-coreml <path>   CoreML 模型路径 (backend=coreml 时需要)\n"
         "  -h, --help               显示帮助\n\n"
         "Example:\n"
-        "  %s -m ./models/MiniCPM-o-4_5-gguf/MiniCPM-o-4_5-Q4_K_M.gguf \\\n"
-        "     --omni --test tools/omni/assets/test_case/omni_test_case/omni_test_case_ 9\n",
+        "  %s -m /path/to/MiniCPM-o-4_5-gguf/MiniCPM-o-4_5-Q4_K_M.gguf \\\n"
+        "     --test tools/omni/assets/test_case/omni_test_case/omni_test_case_ 9\n",
         prog_name, prog_name
     );
 }
@@ -213,7 +202,6 @@ int main(int argc, char ** argv) {
     std::string ref_audio_path = "tools/omni/assets/default_ref_audio/default_ref_audio.wav";
     int n_ctx = 4096;
     int n_gpu_layers = 99;
-    int media_type = 1;  // 1=audio only, 2=omni(audio+vision)
     bool use_tts = true;
     std::string test_audio_prefix;
     int test_count = 0;
@@ -242,8 +230,6 @@ int main(int argc, char ** argv) {
             n_gpu_layers = std::atoi(argv[++i]);
         } else if (arg == "--no-tts") {
             use_tts = false;
-        } else if (arg == "--omni") {
-            media_type = 2;
         } else if (arg == "--vision-backend" && i + 1 < argc) {
             vision_backend = argv[++i];
             if (vision_backend != "metal" && vision_backend != "coreml") {
@@ -288,6 +274,10 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "Error: Audio model not found: %s\n", paths.audio.c_str());
         return 1;
     }
+    if (!file_exists(paths.vision)) {
+        fprintf(stderr, "Error: Vision model not found: %s\n", paths.vision.c_str());
+        return 1;
+    }
     if (use_tts && !file_exists(paths.tts)) {
         fprintf(stderr, "Warning: TTS model not found: %s, disabling TTS\n", paths.tts.c_str());
         use_tts = false;
@@ -311,20 +301,19 @@ int main(int argc, char ** argv) {
 
     common_init();
 
-    printf("=== Initializing Omni Context ===\n");
-    printf("  Media type: %d (%s)\n", media_type, media_type == 2 ? "omni: audio+vision" : "audio only");
-    printf("  TTS enabled: %s\n", use_tts ? "yes" : "no");
-    printf("  Context size: %d\n", n_ctx);
-    printf("  GPU layers: %d\n", n_gpu_layers);
-    printf("  Vision backend: %s\n", vision_backend.c_str());
+    printf("=== Initializing Omni Context (audio+vision) ===\n");
+    printf("  TTS enabled:   %s\n", use_tts ? "yes" : "no");
+    printf("  Context size:  %d\n", n_ctx);
+    printf("  GPU layers:    %d\n", n_gpu_layers);
+    printf("  Vision backend:%s\n", vision_backend.c_str());
     if (vision_backend == "coreml") {
         printf("  Vision CoreML: %s\n", vision_coreml_model_path.c_str());
     }
-    printf("  TTS bin dir: %s\n", tts_bin_dir.c_str());
-    printf("  Ref audio: %s\n", ref_audio_path.c_str());
+    printf("  TTS bin dir:   %s\n", tts_bin_dir.c_str());
+    printf("  Ref audio:     %s\n", ref_audio_path.c_str());
 
-    // Token2Wav 使用 GPU（Metal），已用 ggml_add+ggml_repeat 替代不支持的 ggml_add1
-    auto ctx_omni = omni_init(&params, media_type, use_tts, tts_bin_dir, -1, "gpu:0");
+    // media_type=2 表示 omni 模式（audio + vision）
+    auto ctx_omni = omni_init(&params, /*media_type=*/2, use_tts, tts_bin_dir, -1, "gpu:0");
     if (ctx_omni == nullptr) {
         fprintf(stderr, "Error: Failed to initialize omni context\n");
         return 1;
@@ -332,12 +321,11 @@ int main(int argc, char ** argv) {
     ctx_omni->async = true;
     ctx_omni->ref_audio_path = ref_audio_path;
 
-    printf("=== Running singleplex test ===\n");
-    printf("  Audio prefix: %s\n", test_audio_prefix.c_str());
-    printf("  Count: %d\n", test_count);
-    run_singleplex_test(ctx_omni, test_audio_prefix, test_count);
+    printf("=== Running omni (audio+vision) singleplex test ===\n");
+    printf("  Prefix: %s\n", test_audio_prefix.c_str());
+    printf("  Count:  %d\n", test_count);
+    run_omni_test(ctx_omni, test_audio_prefix, test_count);
 
-    // 等待 T2W 完成所有音频生成后再停止线程
     if (ctx_omni->async && ctx_omni->use_tts) {
         std::string done_flag = std::string(ctx_omni->base_output_dir) + "/round_000/tts_wav/generation_done.flag";
         fprintf(stderr, "Waiting for audio generation to complete...\n");
@@ -360,7 +348,6 @@ int main(int argc, char ** argv) {
     }
 
     llama_perf_context_print(ctx_omni->ctx_llama);
-
     omni_free(ctx_omni);
     return 0;
 }
