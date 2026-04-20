@@ -99,21 +99,28 @@ static TestModelPaths resolve_model_paths(const std::string & llm_path) {
     return paths;
 }
 
+// Per-chunk profiling report aggregated across the async pipeline stages.
+// Each duplex chunk goes through: ViT embedding → audio embedding → prefill → decode
+// and (if TTS enabled): TTS audio-token generation → Token2Wav waveform synthesis.
+// Timing values of -1.0 indicate the stage was not executed (e.g. no image → vit=-1).
 struct ChunkTimingReport {
     int chunk_idx = -1;
     bool has_image = false;
-    bool ended_with_listen = false;
-    std::string generated_text;
-    double vit_embedding_ms = -1.0;
-    double audio_embedding_ms = -1.0;
-    double stream_prefill_ms = -1.0;
-    double stream_decode_ms = -1.0;
-    double tts_audio_token_ms = -1.0;
-    double token2wav_ms = -1.0;
-    bool tts_done = false;
-    bool token2wav_done = false;
+    bool ended_with_listen = false;     // true if model decided <|listen|> (no speech output)
+    std::string generated_text;         // text generated during <|speak|> (empty for listen)
+    double vit_embedding_ms = -1.0;     // vision encoder (ViT) embedding time
+    double audio_embedding_ms = -1.0;   // audio encoder embedding time
+    double stream_prefill_ms = -1.0;    // LLM prefill (KV cache fill) time
+    double stream_decode_ms = -1.0;     // LLM autoregressive decode time
+    double tts_audio_token_ms = -1.0;   // TTS audio-token generation time (async, from TTS thread)
+    double token2wav_ms = -1.0;         // Token2Wav waveform synthesis time (async, from T2W thread)
+    bool tts_done = false;              // whether TTS stage has finished for this chunk
+    bool token2wav_done = false;        // whether T2W stage has finished for this chunk
 };
 
+// Format a stage timing value for display.
+// Returns "n/a" if the stage wasn't executed (value < 0), "pending" if the
+// async stage hasn't completed yet (allow_pending && !ready), or "X.X ms".
 static std::string format_stage_ms(double value_ms, bool ready = true, bool allow_pending = false) {
     if (value_ms >= 0.0) {
         char buf[64];
@@ -126,6 +133,7 @@ static std::string format_stage_ms(double value_ms, bool ready = true, bool allo
     return "n/a";
 }
 
+// Escape newlines/tabs so generated text prints on a single summary line.
 static std::string sanitize_summary_text(const std::string & text) {
     std::string out;
     out.reserve(text.size());
@@ -143,6 +151,9 @@ static std::string sanitize_summary_text(const std::string & text) {
     return out;
 }
 
+// Pull the latest async-stage timings (TTS, T2W) from the shared timing map
+// in omni_context. Called after each chunk and again after all threads finish
+// to capture final values that may arrive after stream_decode returns.
 static void refresh_chunk_timing_report(struct omni_context * ctx_omni, ChunkTimingReport & report) {
     omni_duplex_chunk_timing timing;
     if (!omni_get_duplex_chunk_timing(ctx_omni, report.chunk_idx, &timing)) {
@@ -156,6 +167,8 @@ static void refresh_chunk_timing_report(struct omni_context * ctx_omni, ChunkTim
     report.token2wav_done = timing.token2wav_done;
 }
 
+// Compute the arithmetic mean of a selected timing field across all chunks.
+// Skips entries where the field is < 0 (stage not executed for that chunk).
 static double average_stage_ms(const std::vector<ChunkTimingReport> & reports,
                                const std::function<double(const ChunkTimingReport &)> & picker) {
     double total = 0.0;
@@ -170,6 +183,9 @@ static double average_stage_ms(const std::vector<ChunkTimingReport> & reports,
     return count > 0 ? total / count : -1.0;
 }
 
+// Print a table of per-chunk stage timings plus a row of cross-chunk averages.
+// Covers the full duplex pipeline: ViT → audio → prefill → decode [→ TTS → T2W].
+// For <|speak|> chunks, also prints the truncated generated text.
 static void print_chunk_timing_summary(const std::vector<ChunkTimingReport> & reports, bool use_tts) {
     if (reports.empty()) {
         return;
