@@ -9,7 +9,6 @@ add_library(omni
             omni.cpp
             omni.h
             omni-runtime-messages.h
-            omni-worker-state.h
             omni-token-protocol.cpp
             omni-token-protocol.h
             omni-output.cpp

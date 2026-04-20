@@ -1,7 +1,7 @@
 #include "ggml.h"
 #include "llama.h"
 #include "omni-runtime-messages.h"
-#include "omni-worker-state.h"
+#include "omni-worker-coordinator.h"
 
 #include <thread>
 #include <memory>
