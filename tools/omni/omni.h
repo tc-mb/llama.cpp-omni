@@ -428,6 +428,11 @@ bool stream_prefill(struct omni_context * ctx_omni,
                             int index = 0,
                             int max_slice_nums = -1);  // -1 表示使用全局设置，>=1 表示本次 prefill 的 slice 数量
 
+// 将一段纯文本以同步方式 prefill 进 LLM 的 KV cache，
+// 用于在已经走过 stream_prefill(index=0) 系统 prompt 初始化后，
+// 把用户的文字内容追加到当前 user turn 里。
+bool omni_prefill_text(struct omni_context * ctx_omni, const std::string & text);
+
 bool stream_decode(struct omni_context * ctx_omni,
                         std::string debug_dir,
                         int round_idx = -1);  // round_idx: 由调用方指定的轮次索引，-1 表示使用内部计数

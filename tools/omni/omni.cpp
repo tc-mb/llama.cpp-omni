@@ -8978,6 +8978,18 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
     return true;
 }
 
+// 纯文本 prefill：把 text 以 UTF-8 字符串形式评估进 LLM KV cache。
+// 约定调用方已经先调用过 stream_prefill(index=0) 完成系统 prompt 初始化，
+// 此时 KV cache 末尾恰好处于 "<|im_start|>user\n..." 的 user turn 内部，
+// 可直接追加文字内容。stream_decode 会在 decode 前补上 <|im_end|> 和 assistant prompt。
+bool omni_prefill_text(struct omni_context * ctx_omni, const std::string & text) {
+    if (ctx_omni == nullptr || text.empty()) {
+        return true;
+    }
+    return eval_string(ctx_omni, ctx_omni->params, text.c_str(),
+                       ctx_omni->params->n_batch, &ctx_omni->n_past, false);
+}
+
 bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int round_idx) {
     // NOTE: 不再自动归档旧输出目录，因为这会导致同一 session 中每轮对话的输出被移走
     // 如果需要归档，可以在新 session 开始时（omni_init）手动调用

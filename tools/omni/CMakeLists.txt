@@ -94,6 +94,13 @@ endif()
 target_link_libraries  (${TARGET} PRIVATE common omni Threads::Threads)
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
 
+# 单工模式测试（批量 prefill + 单次 decode）
+set(TARGET_SINGLEPLEX_TEST llama-omni-test-singleplex)
+add_executable         (${TARGET_SINGLEPLEX_TEST} test/test-singleplex.cpp)
+set_target_properties  (${TARGET_SINGLEPLEX_TEST} PROPERTIES OUTPUT_NAME llama-omni-test-singleplex)
+target_link_libraries  (${TARGET_SINGLEPLEX_TEST} PRIVATE common omni Threads::Threads)
+target_compile_features(${TARGET_SINGLEPLEX_TEST} PRIVATE cxx_std_17)
+
 # 双工模式测试
 set(TARGET_DUPLEX_TEST llama-omni-test-duplex)
 add_executable         (${TARGET_DUPLEX_TEST} test/test-duplex.cpp)
