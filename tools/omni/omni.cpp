@@ -1066,6 +1066,16 @@ static const char * sample_with_hidden_and_token(struct common_sampler * smpl, s
             if (ctx_omni->special_token_tts_pad >= 0) {
                 logits[ctx_omni->special_token_tts_pad] = -INFINITY;
             }
+
+            // 3. Duplex 模式下对 <|turn_eos|> 应用长度惩罚，让 Python 透传的配置真正生效
+            if (ctx_omni->length_penalty != 1.0f && ctx_omni->special_token_turn_eos >= 0) {
+                float eos_logit = logits[ctx_omni->special_token_turn_eos];
+                if (eos_logit > 0) {
+                    logits[ctx_omni->special_token_turn_eos] = eos_logit / ctx_omni->length_penalty;
+                } else {
+                    logits[ctx_omni->special_token_turn_eos] = eos_logit * ctx_omni->length_penalty;
+                }
+            }
         }
     }
     
