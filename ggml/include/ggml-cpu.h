@@ -133,6 +133,13 @@ extern "C" {
 
     GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cpu_reg(void);
 
+    // --- omni token2wav op profiler (disabled unless OMNI_T2W_OP_PROFILE=1) ---
+    // Optional per-caller label.  When set, the per-OP wall-time table is tracked
+    // per-(label, op), so subsequent ggml_backend_graph_compute calls can be
+    // attributed to e.g. "t2m.compute" vs "voc.compute".  Label pointer must remain
+    // alive (use string literals).  Pass NULL to clear.
+    GGML_BACKEND_API void omni_ggml_cpu_op_profile_set_label(const char * label);
+
     GGML_BACKEND_API void ggml_cpu_fp32_to_fp32(const float *,       float *, int64_t);
     GGML_BACKEND_API void ggml_cpu_fp32_to_i32 (const float *,     int32_t *, int64_t);
     GGML_BACKEND_API void ggml_cpu_fp32_to_fp16(const float *, ggml_fp16_t *, int64_t);

@@ -43,6 +43,25 @@ target_include_directories(omni PRIVATE ../..)
 target_include_directories(omni PRIVATE ../../vendor)
 target_compile_features   (omni PRIVATE cxx_std_17)
 
+# Phase 0.3: 给 token2wav-impl.cpp 里所有 suspicious op 的返回值贴上
+# "OP@file:line" 的名字，配合 OMNI_T2W_PRINT_GRAPH=1 做源码级归因。
+# Debug / profile 用，release 保持关闭。
+option(OMNI_T2W_TRACK_OPS "tag token2wav ops with source location (debug only)" OFF)
+if (OMNI_T2W_TRACK_OPS)
+    set_source_files_properties(token2wav/token2wav-impl.cpp
+        PROPERTIES COMPILE_DEFINITIONS OMNI_T2W_TRACK_OPS=1)
+endif()
+
+# nsys-friendly NVTX 标注（仅在能找到 CUDA 头文件时启用，header-only，无需 link 库）
+if (GGML_CUDA OR GGML_USE_CUDA)
+    find_package(CUDAToolkit QUIET)
+    if (CUDAToolkit_FOUND)
+        target_include_directories(omni PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+    elseif (EXISTS "/usr/local/cuda/include/nvtx3/nvToolsExt.h")
+        target_include_directories(omni PRIVATE /usr/local/cuda/include)
+    endif()
+endif()
+
 # Link CoreML and Accelerate frameworks when CoreML is enabled
 if(ENABLE_COREML)
     target_link_libraries(omni PRIVATE

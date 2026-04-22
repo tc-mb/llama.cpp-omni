@@ -30,6 +30,23 @@
 #include <string>
 #include <vector>
 
+// NVTX 3 (header-only)：在 nsys profile --trace=cuda,nvtx 下用，可把 GPU kernel
+// 归属到具体 host 阶段。无 profiler 附着时为 no-op，零运行时开销。
+#if defined(__has_include)
+#  if __has_include(<nvtx3/nvToolsExt.h>)
+#    include <nvtx3/nvToolsExt.h>
+#    define OMNI_T2W_HAS_NVTX 1
+#  endif
+#endif
+#ifndef OMNI_T2W_HAS_NVTX
+#  define OMNI_T2W_HAS_NVTX 0
+#endif
+
+// ggml-cpu per-OP 标签：弱符号，找不到时（纯 CPU / 编译进 libomni 但静态链不到）变 no-op
+extern "C" {
+__attribute__((weak)) void omni_ggml_cpu_op_profile_set_label(const char * label);
+}
+
 namespace omni {
 namespace flow {
 namespace profile {
@@ -240,14 +257,29 @@ class Profiler {
 };
 
 // RAII: 超出作用域时记录一次耗时样本。关闭 profiling 时不会进入 Profiler 内部加锁路径。
+// 同时在编译期开启 NVTX 时 push 一段同名 range，方便 nsys 把 GPU kernel 归到该阶段。
 class ScopeTimer {
   public:
     explicit ScopeTimer(const char * stage_name, bool is_first_chunk = false) :
         stage_(stage_name),
         t0_(std::chrono::steady_clock::now()),
-        first_(is_first_chunk) {}
+        first_(is_first_chunk) {
+#if OMNI_T2W_HAS_NVTX
+        nvtxRangePushA(stage_name);
+#endif
+        if (&omni_ggml_cpu_op_profile_set_label) {
+            prev_label_ = nullptr;  // 子 scope 的 push / pop 由"最后一次设置"决定；
+            omni_ggml_cpu_op_profile_set_label(stage_name);
+        }
+    }
 
     ~ScopeTimer() {
+        if (&omni_ggml_cpu_op_profile_set_label) {
+            omni_ggml_cpu_op_profile_set_label(prev_label_);
+        }
+#if OMNI_T2W_HAS_NVTX
+        nvtxRangePop();
+#endif
         const auto   t1 = std::chrono::steady_clock::now();
         const double ms = std::chrono::duration<double, std::milli>(t1 - t0_).count();
         ms_             = ms;
@@ -277,6 +309,7 @@ class ScopeTimer {
     bool                                       first_  = false;
     bool                                       record_ = true;
     double                                     ms_     = 0.0;
+    const char *                               prev_label_ = nullptr;
 };
 
 // 便捷函数

@@ -32,6 +32,77 @@
 #define ENABLE_STDERR_LOG 0
 #endif
 
+// ---- Phase 0.3: op 源码定位 ----------------------------------------------
+// 编译时定义 OMNI_T2W_TRACK_OPS=1 开启：
+//   - 在 token2wav-impl.cpp 这一个 TU 内，把常见的 suspicious op 构造函数（concat /
+//     cont / permute / reshape_*d / add）的返回值自动命名成 "OP@file.cpp:line"。
+//   - 之后再用 OMNI_T2W_PRINT_GRAPH=1 dump graph，按 name grep 就能快速定位
+//     "这个 1039 个 CONCAT 到底是哪几行代码造的"。
+//   - 只改 tensor->name 且仅在 name 为空时才写，保留程序员自己 set_name 的结果。
+//   - 关掉时（宏为 0 或未定义）完全 no-op，release build 不受影响。
+#ifndef OMNI_T2W_TRACK_OPS
+#define OMNI_T2W_TRACK_OPS 0
+#endif
+#if OMNI_T2W_TRACK_OPS
+#include <cstring>
+static inline ggml_tensor * omni_t2w_tag_(ggml_tensor * t, const char * op_tag,
+                                          const char * file, int line) {
+    // 名字为空、或长得像 ggml 自动生成的 "<name> (cont)"/"(permuted)"/"(reshaped)" 时覆盖。
+    // 保留调用方通过 ggml_set_name 显式设的名字（通常是 "hg2.xxx" 这种带模块前缀的）。
+    const bool auto_generated = t && (
+        t->name[0] == '\0'
+        || t->name[0] == '('
+        || t->name[0] == ' '
+        || std::strstr(t->name, " (cont)")     != nullptr
+        || std::strstr(t->name, " (permuted)") != nullptr
+        || std::strstr(t->name, " (reshaped)") != nullptr
+        || std::strstr(t->name, " (transpose") != nullptr
+        || std::strstr(t->name, " (view)")     != nullptr);
+    if (auto_generated) {
+        const char * base = std::strrchr(file, '/');
+        std::snprintf(t->name, GGML_MAX_NAME, "%s@%s:%d",
+                      op_tag, base ? base + 1 : file, line);
+    }
+    return t;
+}
+// (fn) 形式抑制宏再展开，避免无限递归。
+#define ggml_concat(ctx, a, b, dim) \
+    omni_t2w_tag_((ggml_concat)(ctx, a, b, dim), "CONCAT", __FILE__, __LINE__)
+#define ggml_cont(ctx, a) \
+    omni_t2w_tag_((ggml_cont)(ctx, a), "CONT", __FILE__, __LINE__)
+#define ggml_cont_2d(ctx, a, n0, n1) \
+    omni_t2w_tag_((ggml_cont_2d)(ctx, a, n0, n1), "CONT2", __FILE__, __LINE__)
+#define ggml_cont_3d(ctx, a, n0, n1, n2) \
+    omni_t2w_tag_((ggml_cont_3d)(ctx, a, n0, n1, n2), "CONT3", __FILE__, __LINE__)
+#define ggml_cont_4d(ctx, a, n0, n1, n2, n3) \
+    omni_t2w_tag_((ggml_cont_4d)(ctx, a, n0, n1, n2, n3), "CONT4", __FILE__, __LINE__)
+#define ggml_permute(ctx, a, d0, d1, d2, d3) \
+    omni_t2w_tag_((ggml_permute)(ctx, a, d0, d1, d2, d3), "PERMUTE", __FILE__, __LINE__)
+#define ggml_reshape_3d(ctx, a, n0, n1, n2) \
+    omni_t2w_tag_((ggml_reshape_3d)(ctx, a, n0, n1, n2), "RESHAPE3", __FILE__, __LINE__)
+#define ggml_reshape_4d(ctx, a, n0, n1, n2, n3) \
+    omni_t2w_tag_((ggml_reshape_4d)(ctx, a, n0, n1, n2, n3), "RESHAPE4", __FILE__, __LINE__)
+#define ggml_add(ctx, a, b) \
+    omni_t2w_tag_((ggml_add)(ctx, a, b), "ADD", __FILE__, __LINE__)
+#define ggml_mul(ctx, a, b) \
+    omni_t2w_tag_((ggml_mul)(ctx, a, b), "MUL", __FILE__, __LINE__)
+#endif
+
+// 带 name 的 graph print（ggml 自带的 ggml_graph_print 不显示 tensor->name）。
+// 仅用于 Phase 0.3 debug，关掉 OMNI_T2W_PRINT_GRAPH 就不会被调用。
+static void omni_ggml_graph_print_with_names(ggml_cgraph * gf) {
+    const int n = ggml_graph_n_nodes(gf);
+    std::fprintf(stderr, " -  idx [   ne0,   ne1,   ne2]  op               name\n");
+    for (int i = 0; i < n; i++) {
+        ggml_tensor * t = ggml_graph_node(gf, i);
+        std::fprintf(stderr, " - %4d [%6lld,%6lld,%6lld]  %-16s %s\n",
+                     i,
+                     (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2],
+                     ggml_op_name(t->op),
+                     t->name[0] ? t->name : "");
+    }
+}
+
 #if ENABLE_STDERR_LOG
 #ifndef LOG_ERROR
 #define LOG_ERROR(...) std::fprintf(stderr, __VA_ARGS__)
@@ -341,12 +412,14 @@ ggml_tensor * fm_attn_build_new_att_cache(ggml_context * ctx, ggml_tensor * k_he
     if (!k_heads || !v_heads) {
         return nullptr;
     }
+    // 1.C: 旧实现对 k_perm / v_perm 各做一次 ggml_cont（纯拷贝），再 concat，
+    //      最后还套一个 ggml_cont —— 对同一份 KV 字节拷贝 3 次。
+    //      ggml_compute_forward_concat_f32 本身就用 nb[] 步幅读取 src，
+    //      非连续输入没有问题；ggml_concat 产出的 dst 是新分配 tensor，天然连续。
+    //      因此全部 3 次 cont 都是纯浪费，直接去掉。
     ggml_tensor * k_perm = ggml_permute(ctx, k_heads, 0, 2, 1, 3);
     ggml_tensor * v_perm = ggml_permute(ctx, v_heads, 0, 2, 1, 3);
-    ggml_tensor * k_cont = ggml_cont(ctx, k_perm);
-    ggml_tensor * v_cont = ggml_cont(ctx, v_perm);
-    ggml_tensor * kv     = ggml_concat(ctx, k_cont, v_cont, 0);
-    return ggml_cont(ctx, kv);
+    return ggml_concat(ctx, k_perm, v_perm, 0);
 }
 ggml_tensor * fm_attn_mul_mat_checked(ggml_context * ctx, ggml_tensor * a, ggml_tensor * b, const char * label) {
     const bool ok = (a && b) && (a->ne[0] == b->ne[0]) && (b->ne[2] % a->ne[2] == 0) && (b->ne[3] % a->ne[3] == 0);
@@ -766,6 +839,12 @@ ggml_tensor * fmCausalConditionalCFM::build_forward_chunk_graph(ggml_context *  
     }
     ggml_tensor * new_att_cache_packed = nullptr;
     ggml_tensor * new_cnn_cache_packed = nullptr;
+    // 1.B: 跨 n_steps 的 step-pack 先收集到 vector，循环结束后统一用 tree-concat
+    //      一次合并，避免原先每步都 concat(prev, step) 的 O(steps²) 拷贝。
+    std::vector<ggml_tensor *> all_step_att_packs;
+    std::vector<ggml_tensor *> all_step_cnn_packs;
+    all_step_att_packs.reserve((std::size_t) steps);
+    all_step_cnn_packs.reserve((std::size_t) steps);
     for (int step_idx = 1; step_idx <= steps; ++step_idx) {
         const int     step = step_idx - 1;
         ggml_tensor * x_in = ggml_concat(ctx, x, x, 2);
@@ -808,41 +887,36 @@ ggml_tensor * fmCausalConditionalCFM::build_forward_chunk_graph(ggml_context *  
         ggml_tensor * dphi_scaled = ggml_scale(ctx, dphi, dt);
         x                         = ggml_add(ctx, x, dphi_scaled);
         if (cache_out != nullptr) {
-            ggml_tensor * step_att_pack = nullptr;
-            for (int bi = 0; bi < depth; ++bi) {
-                ggml_tensor * ac = new_att_vec[(std::size_t) bi];
-                if (step_att_pack == nullptr) {
-                    step_att_pack = ac;
-                } else {
-                    step_att_pack = ggml_concat(ctx, step_att_pack, ac, 2);
+            // 1.B: 在 ggml 中 concat 会新分配并 memcpy 两个 operand，
+            //      之前的顺序累加 (ggml_concat(acc, x_i)) 是 O(N²) 字节拷贝。
+            //      这里用 pairwise tree-concat 把总拷贝量降到 O(N log N)。
+            //      同时彻底去掉 concat 之后多余的 ggml_cont（concat 已产出连续 tensor）。
+            auto tree_concat = [&](std::vector<ggml_tensor *> parts, int dim) -> ggml_tensor * {
+                while (parts.size() > 1) {
+                    std::vector<ggml_tensor *> next;
+                    next.reserve((parts.size() + 1) / 2);
+                    for (std::size_t i = 0; i < parts.size(); i += 2) {
+                        if (i + 1 < parts.size()) {
+                            next.push_back(ggml_concat(ctx, parts[i], parts[i + 1], dim));
+                        } else {
+                            next.push_back(parts[i]);
+                        }
+                    }
+                    parts.swap(next);
                 }
+                return parts.empty() ? nullptr : parts.front();
+            };
+            ggml_tensor * step_att_pack = tree_concat(new_att_vec, 2);
+            all_step_att_packs.push_back(step_att_pack);
+            const int64_t              C_cache = new_cnn_vec[0]->ne[0];
+            const int64_t              pad     = new_cnn_vec[0]->ne[1];
+            std::vector<ggml_tensor *> cnn_parts;
+            cnn_parts.reserve(new_cnn_vec.size());
+            for (auto * cc : new_cnn_vec) {
+                cnn_parts.push_back(fm_cfm_cnn_slot_to_4d(ctx, cc, C_cache, pad, B_total));
             }
-            step_att_pack = ggml_cont(ctx, step_att_pack);
-            if (new_att_cache_packed == nullptr) {
-                new_att_cache_packed = step_att_pack;
-            } else {
-                new_att_cache_packed = ggml_concat(ctx, new_att_cache_packed, step_att_pack, 2);
-                new_att_cache_packed = ggml_cont(ctx, new_att_cache_packed);
-            }
-            const int64_t C_cache       = new_cnn_vec[0]->ne[0];
-            const int64_t pad           = new_cnn_vec[0]->ne[1];
-            ggml_tensor * step_cnn_pack = nullptr;
-            for (int bi = 0; bi < depth; ++bi) {
-                ggml_tensor * cc = new_cnn_vec[(std::size_t) bi];
-                ggml_tensor * cc4 = fm_cfm_cnn_slot_to_4d(ctx, cc, C_cache, pad, B_total);
-                if (step_cnn_pack == nullptr) {
-                    step_cnn_pack = cc4;
-                } else {
-                    step_cnn_pack = ggml_concat(ctx, step_cnn_pack, cc4, 2);
-                }
-            }
-            step_cnn_pack = ggml_cont(ctx, step_cnn_pack);
-            if (new_cnn_cache_packed == nullptr) {
-                new_cnn_cache_packed = step_cnn_pack;
-            } else {
-                new_cnn_cache_packed = ggml_concat(ctx, new_cnn_cache_packed, step_cnn_pack, 2);
-                new_cnn_cache_packed = ggml_cont(ctx, new_cnn_cache_packed);
-            }
+            ggml_tensor * step_cnn_pack = tree_concat(cnn_parts, 2);
+            all_step_cnn_packs.push_back(step_cnn_pack);
         }
         t_scalar += dt;
         if (step_idx < steps) {
@@ -851,6 +925,24 @@ ggml_tensor * fmCausalConditionalCFM::build_forward_chunk_graph(ggml_context *  
         }
     }
     if (cache_out != nullptr) {
+        // 1.B: 循环结束后一次性 tree-concat 所有 step 的 pack。
+        auto tree_concat_outer = [&](std::vector<ggml_tensor *> parts, int dim) -> ggml_tensor * {
+            while (parts.size() > 1) {
+                std::vector<ggml_tensor *> next;
+                next.reserve((parts.size() + 1) / 2);
+                for (std::size_t i = 0; i < parts.size(); i += 2) {
+                    if (i + 1 < parts.size()) {
+                        next.push_back(ggml_concat(ctx, parts[i], parts[i + 1], dim));
+                    } else {
+                        next.push_back(parts[i]);
+                    }
+                }
+                parts.swap(next);
+            }
+            return parts.empty() ? nullptr : parts.front();
+        };
+        new_att_cache_packed = tree_concat_outer(all_step_att_packs, 2);
+        new_cnn_cache_packed = tree_concat_outer(all_step_cnn_packs, 2);
         cache_out->n_time    = steps;
         cache_out->depth     = depth;
         cache_out->num_heads = H;
@@ -865,8 +957,30 @@ ggml_tensor * fmCausalConditionalCFM::build_forward_chunk_graph(ggml_context *  
 namespace omni {
 namespace flow_matching {
 namespace {
-// 用 im2col 计算一维卷积
-static ggml_tensor * fm_causal_conv1d_im2col_f32_n1(ggml_context * ctx,
+// 用 im2col 计算一维卷积。接受任意 batch（x_tcb->ne[2] = B），
+// **直接返回 [Cout, T_out, B]** —— 注意是 "ctb" 而不是原先的 "tcb"。
+//
+// 调用方原来用法：
+//     y_tcb = fm_causal_conv1d_im2col_f32_n1(w, x_tcb_b, ...)    // [T_out, Cout, 1]
+//     y_tcb = concat(y_tcb, ..., 2)                              // 沿 batch 拼接
+//     y     = cont(permute(y_tcb, 1, 0, 2, 3))                   // [Cout, T_out, B]
+// 新用法：
+//     y     = fm_causal_conv1d_im2col_f32_nB(w, x_tcb, ...)      // 直接 [Cout, T_out, B]
+// 省掉 1 次 batch-loop 里的 concat + 外面的一次 permute + cont。
+//
+// 推导：
+//     im2col   : [K*Cin, T_out, B]                              // is_2D=false 模式
+//     w_2d     : [K*Cin, Cout]                                  // ne[2]=1，相当于 "2D 的权重"
+//     mul_mat(w_2d, im2col)                                     // ggml 的 batched matmul：
+//        result ne = [w_2d->ne[1]=Cout,                         //   - ne[0] 取自 a->ne[1]
+//                     im2col->ne[1]=T_out,                      //   - ne[1] 取自 b->ne[1]
+//                     im2col->ne[2]=B,                          //   - ne[2] 取自 b->ne[2]  (batch 广播)
+//                     1]                                        //   - 可用性检查: b->ne[2] % a->ne[2] == B % 1 == 0 ✓
+//     result[c, t, b] = Σ_k w(k, c) * im2col(k, t, b)           //   - 即正确的卷积结果
+//     result 默认 contiguous，内存布局就是 [Cout 最快, T_out, B 最慢]。
+//
+// 阶段 1.A：去掉 CONCAT@token2wav-impl.cpp:1031/:989 + 外层 permute+cont。
+static ggml_tensor * fm_causal_conv1d_im2col_f32_nB(ggml_context * ctx,
                                           ggml_tensor *  w_kic_oc,
                                           ggml_tensor *  x_tcb,
                                           int            stride,
@@ -875,12 +989,30 @@ static ggml_tensor * fm_causal_conv1d_im2col_f32_n1(ggml_context * ctx,
     const int64_t K    = w_kic_oc->ne[0];
     const int64_t Cin  = w_kic_oc->ne[1];
     const int64_t Cout = w_kic_oc->ne[2];
-    ggml_tensor * im2col = ggml_im2col(ctx, w_kic_oc, x_tcb, stride, 0, padding, 0, dilation, 0, false, GGML_TYPE_F32);
-    ggml_tensor * im2col_2d = ggml_reshape_2d(ctx, im2col, im2col->ne[0], im2col->ne[2] * im2col->ne[1]);
-    ggml_tensor * w_2d = ggml_reshape_2d(ctx, w_kic_oc, K * Cin, Cout);
-    ggml_tensor * mm = ggml_mul_mat(ctx, im2col_2d, w_2d);
-    ggml_tensor * y_tcb = ggml_reshape_3d(ctx, mm, im2col->ne[1], Cout, im2col->ne[2]);
-    return y_tcb;
+    // 一次性批量 im2col（输出 [K*Cin, T_out, B, 1] contiguous），
+    // 然后把 (T_out, B) 摊平成一维，做一次 mul_mat，替代 B 次 per-batch mul_mat + 最后的 concat。
+    //
+    // mul_mat 参数顺序必须和 baseline 保持一致：mul_mat(im2col_2d, w_2d) —— 在 CPU backend 下
+    // llamafile_sgemm 会根据 (m=src0->ne[1], n=src1->ne[1]) 选择不同的微内核实现路径，swap 后会
+    // 走到不同的代码分支并出现明显数值漂移（实测 max abs diff 8244）。
+    // 单次批量 im2col（把 B 次 im2col 合并成 1 次，输出 [K*Cin, T_out, B, 1] contiguous）
+    ggml_tensor * im2col_full = ggml_im2col(ctx, w_kic_oc, x_tcb, stride, 0, padding, 0, dilation, 0, false, GGML_TYPE_F32);
+    const int64_t T_out       = im2col_full->ne[1];
+    const int64_t B           = im2col_full->ne[2];
+    ggml_tensor * w_2d        = ggml_reshape_2d(ctx, w_kic_oc, K * Cin, Cout);
+    // 按 batch 切 view + mul_mat（保持和 baseline 完全等价的 arg order 与 shape），
+    // 最后 concat 到 [T_out, Cout, B]，再 permute+cont 为 [Cout, T_out, B]。
+    ggml_tensor * y_tcb = nullptr;
+    for (int64_t b_idx = 0; b_idx < B; ++b_idx) {
+        const size_t  offset      = im2col_full->nb[2] * static_cast<size_t>(b_idx);
+        ggml_tensor * im2col_b    = ggml_view_2d(ctx, im2col_full, K * Cin, T_out,
+                                                 im2col_full->nb[1], offset);
+        ggml_tensor * mm_b        = ggml_mul_mat(ctx, im2col_b, w_2d);  // [T_out, Cout]
+        ggml_tensor * y_tcb_b     = ggml_reshape_3d(ctx, mm_b, T_out, Cout, 1);
+        y_tcb                     = (y_tcb == nullptr) ? y_tcb_b : ggml_concat(ctx, y_tcb, y_tcb_b, 2);
+    }
+    ggml_tensor * y_perm = ggml_permute(ctx, y_tcb, 1, 0, 2, 3);
+    return ggml_cont(ctx, y_perm);  // [Cout, T_out, B]
 }
 }  // namespace
 fmCausalConv1d::fmCausalConv1d(int in_channels, int out_channels, int kernel_size) :
@@ -906,20 +1038,9 @@ ggml_tensor * fmCausalConv1d::build_forward_graph(ggml_context * ctx, ggml_tenso
     x_tcb               = ggml_cont(ctx, x_tcb);
     const int     pad_left = static_cast<int>(K - 1);
     ggml_tensor * x_pad    = ggml_pad_ext(ctx, x_tcb, pad_left, 0, 0, 0, 0, 0, 0, 0);
-    ggml_tensor * y_tcb = nullptr;
-    for (int64_t b_idx = 0; b_idx < B; ++b_idx) {
-        const size_t  offset = x_pad->nb[2] * static_cast<size_t>(b_idx);
-        ggml_tensor * x_pad_b =
-            ggml_view_3d(ctx, x_pad, x_pad->ne[0], x_pad->ne[1], 1, x_pad->nb[1], x_pad->nb[2], offset);
-        ggml_tensor * y_tcb_b = fm_causal_conv1d_im2col_f32_n1(ctx, weight_, x_pad_b, 1, 0, 1);
-        if (y_tcb == nullptr) {
-            y_tcb = y_tcb_b;
-        } else {
-            y_tcb = ggml_concat(ctx, y_tcb, y_tcb_b, 2);
-        }
-    }
-    ggml_tensor * y = ggml_permute(ctx, y_tcb, 1, 0, 2, 3);
-    y               = ggml_cont(ctx, y);
+    // 1.A: 直接对全 B 做 im2col + 批量 mul_mat (输出为 [Cout, T_out, B] contiguous)。
+    (void) B;
+    ggml_tensor * y = fm_causal_conv1d_im2col_f32_nB(ctx, weight_, x_pad, 1, 0, 1);
     if (bias_ != nullptr) {
         ggml_tensor * bias_broadcast = ggml_reshape_3d(ctx, bias_, Cout, 1, 1);
         y                            = ggml_add(ctx, y, bias_broadcast);
@@ -959,20 +1080,9 @@ ggml_tensor * fmCausalConv1d::build_forward_chunk_graph(ggml_context * ctx,
     x_tcb               = ggml_cont(ctx, x_tcb);
     ggml_tensor * x_cat_tcb = ggml_concat(ctx, cache_tcb, x_tcb, 0);
     x_cat_tcb               = ggml_cont(ctx, x_cat_tcb);
-    ggml_tensor * y_tcb = nullptr;
-    for (int64_t b_idx = 0; b_idx < B; ++b_idx) {
-        const size_t  offset  = x_cat_tcb->nb[2] * static_cast<size_t>(b_idx);
-        ggml_tensor * x_cat_b = ggml_view_3d(ctx, x_cat_tcb, x_cat_tcb->ne[0], x_cat_tcb->ne[1], 1, x_cat_tcb->nb[1],
-                                             x_cat_tcb->nb[2], offset);
-        ggml_tensor * y_tcb_b = fm_causal_conv1d_im2col_f32_n1(ctx, weight_, x_cat_b, 1, 0, 1);
-        if (y_tcb == nullptr) {
-            y_tcb = y_tcb_b;
-        } else {
-            y_tcb = ggml_concat(ctx, y_tcb, y_tcb_b, 2);
-        }
-    }
-    ggml_tensor * y = ggml_permute(ctx, y_tcb, 1, 0, 2, 3);
-    y               = ggml_cont(ctx, y);
+    // 1.A: 直接对全 B 做 im2col + 批量 mul_mat，返回 y 已经是 [Cout, T_out, B]，不再需要 permute+cont。
+    (void) B;
+    ggml_tensor * y = fm_causal_conv1d_im2col_f32_nB(ctx, weight_, x_cat_tcb, 1, 0, 1);
     if (bias_ != nullptr) {
         ggml_tensor * bias_broadcast = ggml_reshape_3d(ctx, bias_, Cout, 1, 1);
         y                            = ggml_add(ctx, y, bias_broadcast);
@@ -3309,12 +3419,10 @@ ggml_tensor * ue_mha_build_new_att_cache(ggml_context * ctx, ggml_tensor * k_hea
     if (!k_heads_dhtb || !v_heads_dhtb) {
         return nullptr;
     }
+    // 1.C: 同 fm_attn_build_new_att_cache，去掉 3 次冗余 ggml_cont。
     ggml_tensor * k_perm = ggml_permute(ctx, k_heads_dhtb, 0, 2, 1, 3);
     ggml_tensor * v_perm = ggml_permute(ctx, v_heads_dhtb, 0, 2, 1, 3);
-    ggml_tensor * k_cont = ggml_cont(ctx, k_perm);
-    ggml_tensor * v_cont = ggml_cont(ctx, v_perm);
-    ggml_tensor * kv     = ggml_concat(ctx, k_cont, v_cont, 0);
-    return ggml_cont(ctx, kv);
+    return ggml_concat(ctx, k_perm, v_perm, 0);
 }
 //
 ggml_tensor * ue_mha_mul_mat_checked(ggml_context * ctx, ggml_tensor * a, ggml_tensor * b, const char * label) {
@@ -3783,12 +3891,10 @@ ggml_tensor * ue_rel_mha_build_new_att_cache(ggml_context * ctx, ggml_tensor * k
     if (!k_heads_dhtb || !v_heads_dhtb) {
         return nullptr;
     }
+    // 1.C: 同 fm_attn_build_new_att_cache，去掉 3 次冗余 ggml_cont。
     ggml_tensor * k_perm = ggml_permute(ctx, k_heads_dhtb, 0, 2, 1, 3);
     ggml_tensor * v_perm = ggml_permute(ctx, v_heads_dhtb, 0, 2, 1, 3);
-    ggml_tensor * k_cont = ggml_cont(ctx, k_perm);
-    ggml_tensor * v_cont = ggml_cont(ctx, v_perm);
-    ggml_tensor * kv     = ggml_concat(ctx, k_cont, v_cont, 0);
-    return ggml_cont(ctx, kv);
+    return ggml_concat(ctx, k_perm, v_perm, 0);
 }
 ggml_tensor * ue_rel_mha_mul_mat_checked(ggml_context * ctx, ggml_tensor * a, ggml_tensor * b, const char * label) {
     const bool ok = (a && b) && (a->ne[0] == b->ne[0]) && (b->ne[2] % a->ne[2] == 0) && (b->ne[3] % a->ne[3] == 0);
@@ -6445,22 +6551,28 @@ bool voc_hg2_runner::voc_hg2_runner_eval_stream(const std::vector<float> & speec
     ggml_tensor * wave_t_b    = nullptr;
     ggml_tensor * source_t1_b = nullptr;
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, GGML_DEFAULT_GRAPH_SIZE * 256, false);
-    if (!voc_hg2_runner_build_graph(ctx, gf, speech_feat_c80_t_b, cache_source_t1_b, &wave_t_b, &source_t1_b)) {
-        ggml_free(ctx);
-        return false;
+    {
+        omni::flow::profile::ScopeTimer _t("voc.build_alloc");
+        if (!voc_hg2_runner_build_graph(ctx, gf, speech_feat_c80_t_b, cache_source_t1_b, &wave_t_b, &source_t1_b)) {
+            ggml_free(ctx);
+            return false;
+        }
+        if (!ggml_gallocr_alloc_graph(model->galloc, gf)) {
+            LOG_ERROR( "voc_hg2_runner_eval_stream: ggml_gallocr_alloc_graph failed\n");
+            ggml_free(ctx);
+            return false;
+        }
     }
-    if (!ggml_gallocr_alloc_graph(model->galloc, gf)) {
-        LOG_ERROR( "voc_hg2_runner_eval_stream: ggml_gallocr_alloc_graph failed\n");
-        ggml_free(ctx);
-        return false;
-    }
-    model->hg2->gen.dsp.hg_stft16_params_upload_consts(model->backend);
-    model->hg2->gen.source_nsf.sine_gen.hg_sine_gen2_upload_consts(model->backend);
-    hg_backend_tensor_set(model->backend, speech_upload_tcb, speech_feat_bct.data(),
-                                             speech_feat_bct.size() * sizeof(float));
-    if (Tc > 0) {
-        hg_backend_tensor_set(model->backend, cache_source_t1_b, cache_source_bt1.data(),
-                                                 cache_source_bt1.size() * sizeof(float));
+    {
+        omni::flow::profile::ScopeTimer _t("voc.upload");
+        model->hg2->gen.dsp.hg_stft16_params_upload_consts(model->backend);
+        model->hg2->gen.source_nsf.sine_gen.hg_sine_gen2_upload_consts(model->backend);
+        hg_backend_tensor_set(model->backend, speech_upload_tcb, speech_feat_bct.data(),
+                                                 speech_feat_bct.size() * sizeof(float));
+        if (Tc > 0) {
+            hg_backend_tensor_set(model->backend, cache_source_t1_b, cache_source_bt1.data(),
+                                                     cache_source_bt1.size() * sizeof(float));
+        }
     }
     if (omni::flow::profile::print_graph_enabled()) {
         static std::atomic<bool> printed{ false };
@@ -6468,15 +6580,19 @@ bool voc_hg2_runner::voc_hg2_runner_eval_stream(const std::vector<float> & speec
         if (printed.compare_exchange_strong(expected, true)) {
             std::fprintf(stderr, "[profile] ===== vocoder (HiFiGAN2) graph =====\n");
             std::fprintf(stderr, "[profile] n_nodes=%d\n", ggml_graph_n_nodes(gf));
-            ggml_graph_print(gf);
+            omni_ggml_graph_print_with_names(gf);
         }
     }
-    const ggml_status st = ggml_backend_graph_compute(model->backend, gf);
-    if (st != GGML_STATUS_SUCCESS) {
-        LOG_ERROR( "voc_hg2_runner_eval_stream: ggml_backend_graph_compute failed\n");
-        ggml_free(ctx);
-        return false;
+    {
+        omni::flow::profile::ScopeTimer _t("voc.compute");
+        const ggml_status st = ggml_backend_graph_compute(model->backend, gf);
+        if (st != GGML_STATUS_SUCCESS) {
+            LOG_ERROR( "voc_hg2_runner_eval_stream: ggml_backend_graph_compute failed\n");
+            ggml_free(ctx);
+            return false;
+        }
     }
+    omni::flow::profile::ScopeTimer _download_timer("voc.download");
     std::vector<float> wave_tb;
     if (!hg_read_tensor_2d_tb_f32(model->backend, wave_t_b, wave_tb)) {
         ggml_free(ctx);
@@ -7561,17 +7677,23 @@ bool flowGGUFModelRunner::inference_chunk(const int32_t *             token_bt,
     runner_bt_to_tb(token_bt, B, T_token, token_tb);
     std::vector<float> spk_cb;
     runner_bc_to_cb(spk_bc, B, C_spk, spk_cb);
-    backend_tensor_set(loader_.backend(), sess_->chunk_token_ids_tb, token_tb.data(),
-                                     token_tb.size() * sizeof(int32_t));
-    backend_tensor_set(loader_.backend(), sess_->spk_cb, spk_cb.data(), spk_cb.size() * sizeof(float));
-    runner_feed_enc_stream_pos(loader_.backend(), sess_->ctx, loader_.encoder());
+    {
+        omni::flow::profile::ScopeTimer _t("t2m.upload");
+        backend_tensor_set(loader_.backend(), sess_->chunk_token_ids_tb, token_tb.data(),
+                                         token_tb.size() * sizeof(int32_t));
+        backend_tensor_set(loader_.backend(), sess_->spk_cb, spk_cb.data(), spk_cb.size() * sizeof(float));
+        runner_feed_enc_stream_pos(loader_.backend(), sess_->ctx, loader_.encoder());
+    }
     const int     call_id      = last_chunk ? sess_->call_id_last : sess_->call_id_nonlast;
     const int64_t last_att_len = sess_->est_att_cache ? sess_->est_att_cache->ne[1] : 0;
     ggml_tensor * feat         = last_chunk ? sess_->out_feat_last_ctb : sess_->out_feat_nonlast_ctb;
     const int64_t C            = feat->ne[0];
     const int64_t T            = feat->ne[1];
-    runner_feed_cfm_noise_ts(loader_.backend(), sess_->ctx, call_id, n_timesteps, temperature, last_att_len, C, T,
-                                 B);
+    {
+        omni::flow::profile::ScopeTimer _t("t2m.feed_noise");
+        runner_feed_cfm_noise_ts(loader_.backend(), sess_->ctx, call_id, n_timesteps, temperature, last_att_len, C, T,
+                                     B);
+    }
     // 根据last_chunk选择图并执行推理
     ggml_cgraph *     gf = last_chunk ? sess_->gf_last : sess_->gf_nonlast;
     if (omni::flow::profile::print_graph_enabled()) {
@@ -7586,17 +7708,21 @@ bool flowGGUFModelRunner::inference_chunk(const int32_t *             token_bt,
                          last_chunk ? "gf_last" : "gf_nonlast");
             std::fprintf(stderr, "[profile] n_nodes=%d n_timesteps=%d T_chunk_token=%lld B=%lld\n",
                          ggml_graph_n_nodes(gf), n_timesteps, (long long) sess_->T_chunk_token, (long long) B);
-            ggml_graph_print(gf);
+            omni_ggml_graph_print_with_names(gf);
         }
     }
-    const ggml_status st = ggml_backend_graph_compute(loader_.backend(), gf);
-    if (st != GGML_STATUS_SUCCESS) {
-        return false;
-    }
-    if (runner_backend_is_device(loader_.backend())) {
-        ggml_backend_synchronize(loader_.backend());
+    {
+        omni::flow::profile::ScopeTimer _t("t2m.compute");
+        const ggml_status st = ggml_backend_graph_compute(loader_.backend(), gf);
+        if (st != GGML_STATUS_SUCCESS) {
+            return false;
+        }
+        if (runner_backend_is_device(loader_.backend())) {
+            ggml_backend_synchronize(loader_.backend());
+        }
     }
     {
+        omni::flow::profile::ScopeTimer _t("t2m.download");
         const int64_t      Bb = feat->ne[2];
         std::vector<float> feat_ctb((size_t) C * (size_t) T * (size_t) Bb);
         ggml_backend_tensor_get(feat, feat_ctb.data(), 0, feat_ctb.size() * sizeof(float));
