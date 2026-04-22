@@ -1,7 +1,9 @@
 
 
 #include "token2wav-impl.h"
+#include "token2wav-profile.h"
 
+#include <atomic>
 #include <cstdio>
 #include <string>
 #include <cmath>
@@ -6460,6 +6462,15 @@ bool voc_hg2_runner::voc_hg2_runner_eval_stream(const std::vector<float> & speec
         hg_backend_tensor_set(model->backend, cache_source_t1_b, cache_source_bt1.data(),
                                                  cache_source_bt1.size() * sizeof(float));
     }
+    if (omni::flow::profile::print_graph_enabled()) {
+        static std::atomic<bool> printed{ false };
+        bool                     expected = false;
+        if (printed.compare_exchange_strong(expected, true)) {
+            std::fprintf(stderr, "[profile] ===== vocoder (HiFiGAN2) graph =====\n");
+            std::fprintf(stderr, "[profile] n_nodes=%d\n", ggml_graph_n_nodes(gf));
+            ggml_graph_print(gf);
+        }
+    }
     const ggml_status st = ggml_backend_graph_compute(model->backend, gf);
     if (st != GGML_STATUS_SUCCESS) {
         LOG_ERROR( "voc_hg2_runner_eval_stream: ggml_backend_graph_compute failed\n");
@@ -7563,6 +7574,21 @@ bool flowGGUFModelRunner::inference_chunk(const int32_t *             token_bt,
                                  B);
     // 根据last_chunk选择图并执行推理
     ggml_cgraph *     gf = last_chunk ? sess_->gf_last : sess_->gf_nonlast;
+    if (omni::flow::profile::print_graph_enabled()) {
+        // 非 last 图和 last 图各打印一次（帮助 profile 阶段看清楚 encoder+flow 融合图的规模）
+        static std::atomic<bool> printed_nonlast{ false };
+        static std::atomic<bool> printed_last{ false };
+        std::atomic<bool> &      flag     = last_chunk ? printed_last : printed_nonlast;
+        bool                     expected = false;
+        if (flag.compare_exchange_strong(expected, true)) {
+            std::fprintf(stderr,
+                         "[profile] ===== token2mel graph (%s) =====\n",
+                         last_chunk ? "gf_last" : "gf_nonlast");
+            std::fprintf(stderr, "[profile] n_nodes=%d n_timesteps=%d T_chunk_token=%lld B=%lld\n",
+                         ggml_graph_n_nodes(gf), n_timesteps, (long long) sess_->T_chunk_token, (long long) B);
+            ggml_graph_print(gf);
+        }
+    }
     const ggml_status st = ggml_backend_graph_compute(loader_.backend(), gf);
     if (st != GGML_STATUS_SUCCESS) {
         return false;
@@ -8624,26 +8650,31 @@ bool Token2Wav::push_tokens_window(const int32_t *      tokens,
     }
 
     using clock = std::chrono::steady_clock;
-    const auto t_total0 = clock::now();
+    const auto                  t_total0 = clock::now();
+    static thread_local int64_t call_id  = 0;
+    const int64_t               cid      = call_id++;
+    const bool                  is_first = (cid == 0);
 
     std::vector<float> mel_bct;
-    const auto t_t2m0 = clock::now();
+    const auto         t_t2m0 = clock::now();
     if (!t2m_.push_tokens(tokens, n_tokens, is_final, mel_bct)) {
-        LOG_ERROR( "Token2Wav.push_tokens_window: Token2Mel.push_tokens failed\n");
+        LOG_ERROR("Token2Wav.push_tokens_window: Token2Mel.push_tokens failed\n");
         return false;
     }
-    const auto t_t2m1 = clock::now();
+    const auto   t_t2m1  = clock::now();
+    const double t2m_ms  = std::chrono::duration<double, std::milli>(t_t2m1 - t_t2m0).count();
 
     if (mel_bct.empty()) {
-        const double t2m_ms =
-            std::chrono::duration<double, std::milli>(t_t2m1 - t_t2m0).count();
-        const double total_ms =
-            std::chrono::duration<double, std::milli>(clock::now() - t_total0).count();
-        static thread_local int64_t call_id = 0;
-        const int64_t cid = call_id++;
-        std::fprintf(stderr,
-                     "[timing] call=%lld tokens=%lld final=%d token2mel=%.3fms vocoder=%.3fms total=%.3fms\n",
-                     (long long) cid, (long long) n_tokens, (int) is_final, t2m_ms, 0.0, total_ms);
+        const double total_ms = std::chrono::duration<double, std::milli>(clock::now() - t_total0).count();
+        omni::flow::profile::record_ms("token2mel", t2m_ms, is_first);
+        omni::flow::profile::record_ms("vocoder", 0.0, is_first);
+        omni::flow::profile::record_ms("total", total_ms, is_first);
+        if (omni::flow::profile::verbose()) {
+            std::fprintf(stderr,
+                         "[timing] call=%lld%s tokens=%lld final=%d token2mel=%.3fms vocoder=%.3fms total=%.3fms\n",
+                         (long long) cid, is_first ? "(first)" : "", (long long) n_tokens, (int) is_final, t2m_ms,
+                         0.0, total_ms);
+        }
         return true;
     }
     if (mel_bct.size() % (size_t) Token2Mel::kMelChannels != 0) {
@@ -8696,18 +8727,21 @@ bool Token2Wav::push_tokens_window(const int32_t *      tokens,
         out_T_audio = (int64_t) wave_bt_out.size();
     }
 
-    const double t2m_ms =
-        std::chrono::duration<double, std::milli>(t_t2m1 - t_t2m0).count();
-    const double voc_ms =
-        std::chrono::duration<double, std::milli>(t_voc1 - t_voc0).count();
-    const double total_ms =
-        std::chrono::duration<double, std::milli>(clock::now() - t_total0).count();
-    static thread_local int64_t call_id = 0;
-    const int64_t cid = call_id++;
-    std::fprintf(stderr,
-                 "[timing] call=%lld tokens=%lld final=%d token2mel=%.3fms vocoder=%.3fms total=%.3fms audio=%lld\n",
-                 (long long) cid, (long long) n_tokens, (int) is_final, t2m_ms, voc_ms, total_ms,
-                 (long long) out_T_audio);
+    const double voc_ms   = std::chrono::duration<double, std::milli>(t_voc1 - t_voc0).count();
+    const double total_ms = std::chrono::duration<double, std::milli>(clock::now() - t_total0).count();
+
+    omni::flow::profile::record_ms("token2mel", t2m_ms, is_first);
+    omni::flow::profile::record_ms("vocoder", voc_ms, is_first);
+    omni::flow::profile::record_ms("total", total_ms, is_first);
+    omni::flow::profile::record_audio_samples((int64_t) out_T_audio, (int32_t) Token2Wav::kSampleRate);
+
+    if (omni::flow::profile::verbose()) {
+        std::fprintf(
+            stderr,
+            "[timing] call=%lld%s tokens=%lld final=%d token2mel=%.3fms vocoder=%.3fms total=%.3fms audio=%lld\n",
+            (long long) cid, is_first ? "(first)" : "", (long long) n_tokens, (int) is_final, t2m_ms, voc_ms, total_ms,
+            (long long) out_T_audio);
+    }
 
     return true;
 }

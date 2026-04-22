@@ -1,4 +1,5 @@
 #include "token2wav-impl.h"
+#include "token2wav-profile.h"
 
 #include <algorithm>
 #include <cmath>
@@ -95,21 +96,30 @@ int main() {
     // token2wav-example：主要关注初始化和两种送入输出方式即可
     // 目前是使用读取prompt_cache.gguf的方式初始化然后以call的方式来流式输出pcm并转换为wav
 
-    // 默认路径，根据5个gguf和两个输出位置改动
-    std::string model_dir = "./tools/omni/convert/gguf/token2wav-gguf";
-    std::string encoder_gguf = model_dir + "/encoder.gguf";
+    // 默认路径，根据5个gguf和两个输出位置改动；可用环境变量覆盖，便于做纯 T2W profile。
+    //   OMNI_T2W_MODEL_DIR  : token2wav-gguf 目录（内含 encoder/flow_*/hifigan2/prompt_cache）
+    //   OMNI_T2W_DEVICE     : "cpu" / "gpu" / "gpu:<idx>"（对 token2mel 和 vocoder 同时生效）
+    //   OMNI_T2W_OUT_WAV    : 合并输出 WAV 路径
+    //   OMNI_T2W_OUT_CHUNK_DIR : 每个 callback chunk 的输出目录（空串 = 不落盘）
+    auto env_or = [](const char * name, const std::string & def) {
+        const char * v = std::getenv(name);
+        return (v && *v) ? std::string(v) : def;
+    };
+
+    std::string model_dir      = env_or("OMNI_T2W_MODEL_DIR", "./tools/omni/convert/gguf/token2wav-gguf");
+    std::string encoder_gguf       = model_dir + "/encoder.gguf";
     std::string flow_matching_gguf = model_dir + "/flow_matching.gguf";
-    std::string flow_extra_gguf = model_dir + "/flow_extra.gguf";
-    std::string vocoder_gguf = model_dir + "/hifigan2.gguf";
-    std::string prompt_cache_gguf = model_dir + "/prompt_cache.gguf";
+    std::string flow_extra_gguf    = model_dir + "/flow_extra.gguf";
+    std::string vocoder_gguf       = model_dir + "/hifigan2.gguf";
+    std::string prompt_cache_gguf  = model_dir + "/prompt_cache.gguf";
 
-    std::string out_wav = "/tmp/token2wav_example_stream.wav";
-    std::string out_chunk_wav_dir = "/tmp/token2wav_example_chunks";
+    std::string out_wav            = env_or("OMNI_T2W_OUT_WAV", "/tmp/token2wav_example_stream.wav");
+    std::string out_chunk_wav_dir  = env_or("OMNI_T2W_OUT_CHUNK_DIR", "/tmp/token2wav_example_chunks");
 
-    std::string device_token2mel = "gpu";
-    std::string device_vocoder   = "gpu";
+    std::string device_token2mel   = env_or("OMNI_T2W_DEVICE", "gpu");
+    std::string device_vocoder     = env_or("OMNI_T2W_DEVICE", "gpu");
 
-    int       n_timesteps = 10;
+    int       n_timesteps = std::atoi(env_or("OMNI_T2W_N_TIMESTEPS", "5").c_str());
     float     temperature = 1.0f;
     const int sr          = omni::flow::Token2Wav::kSampleRate;
 
@@ -130,8 +140,10 @@ int main() {
         return 2;
     }
 
+    const int repeat = std::max(1, std::atoi(env_or("OMNI_T2W_REPEAT", "1").c_str()));
+
     // 例子 token
-    const std::vector<int32_t> tokens = {
+    std::vector<int32_t> tokens_base = {
         1493, 4299, 4218, 2049, 528,  2752, 4850, 4569, 4575, 6372, 2127, 4068, 2312, 4993, 4769, 2300,
         226,  2175, 2160, 2152, 6311, 6065, 4859, 5102, 4615, 6534, 6426, 1763, 2249, 2209, 5938, 1725,
         6048, 3816, 6058, 958,  63,   4460, 5914, 2379, 735,  5319, 4593, 2328, 890,  35,   751,  1483,
@@ -139,6 +151,11 @@ int main() {
         2031, 414,  4366, 4366, 6059, 5300, 4814, 5092, 5100, 1923, 3054, 4320, 4296, 2148, 4371, 5831,
         5084, 5027, 4946, 4946, 2678, 575,  575,  521,  518,  638,  1367, 2804, 3402, 4299,
     };
+    std::vector<int32_t> tokens;
+    tokens.reserve(tokens_base.size() * (size_t) repeat);
+    for (int r = 0; r < repeat; ++r) {
+        tokens.insert(tokens.end(), tokens_base.begin(), tokens_base.end());
+    }
 
     omni::flow::Token2WavSession sess;
     // 初始化：加载 encoder/flow/vocoder 模型，导入 prompt_cache用于初始化
@@ -226,6 +243,9 @@ int main() {
     if (!out_chunk_wav_dir.empty()) {
         std::printf("[done] out_chunk_wav_dir=%s\n", out_chunk_wav_dir.c_str());
     }
+
+    // 汇总 profile 结果（OMNI_T2W_PROFILE=0 时会直接跳过）
+    omni::flow::profile::print_summary(stderr);
     return 0;
 }
 
