@@ -2636,6 +2636,14 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
 static bool check_node_graph_compatibility_and_refresh_copy_ops(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph,
     bool use_cuda_graph) {
 
+    // Opt-in: skip the batch-size-based GGML_OP_ADD guard. This guard was added for
+    // the llama.cpp decoder where batch size can change across tokens; for workloads
+    // where every graph invocation has identical shapes (our token2wav use case),
+    // disabling the guard lets CUDA graphs capture & replay, cutting per-op launch
+    // overhead to a single cudaGraphLaunch.
+    static const bool allow_batched_add_in_cuda_graph =
+        (getenv("GGML_CUDA_GRAPH_ALLOW_BATCHED_ADD") != nullptr);
+
     // Loop over nodes in GGML graph to obtain info needed for CUDA graph
     cuda_ctx->cuda_graph->cpy_dest_ptrs.clear();
 
@@ -2668,7 +2676,8 @@ static bool check_node_graph_compatibility_and_refresh_copy_ops(ggml_backend_cud
 #endif
         }
 
-        if (node->op == GGML_OP_ADD &&
+        if (!allow_batched_add_in_cuda_graph &&
+            node->op == GGML_OP_ADD &&
             node->src[1] && node->src[1]->ne[1] > 1 &&
             (node->src[0] ? node->src[0]->name != gemma3n_per_layer_proj_src0_name : true) &&
             (node->src[1] ? node->src[1]->name != gemma3n_per_layer_proj_src1_name : true) &&
