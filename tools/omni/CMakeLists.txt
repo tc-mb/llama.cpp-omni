@@ -17,6 +17,7 @@ add_library(omni
             token2wav/token2wav-impl.h
             token2wav/token2wav.cpp
             token2wav/token2wav.h
+            token2wav/token2wav-profile.h
             )
 
 # Add CoreML related files when enabled
@@ -115,8 +116,7 @@ set_target_properties  (${TARGET_DUPLEX_TEST} PROPERTIES OUTPUT_NAME llama-omni-
 target_link_libraries  (${TARGET_DUPLEX_TEST} PRIVATE common omni Threads::Threads)
 target_compile_features(${TARGET_DUPLEX_TEST} PRIVATE cxx_std_17)
 
-# # Token2Wav 测试程序 - 完整 C++ 语音合成
-# add_executable(token2wav-example token2wav/token2wav-example.cpp)
-# target_link_libraries(token2wav-example PRIVATE common omni Threads::Threads)
-# target_compile_features(token2wav-example PRIVATE cxx_std_17)
-
+# Token2Wav 测试程序 - 纯 C++ 单线程 baseline（用于 profile 对照，不占 LLM/TTS GPU）
+add_executable(token2wav-example token2wav/token2wav-example.cpp)
+target_link_libraries(token2wav-example PRIVATE common omni Threads::Threads)
+target_compile_features(token2wav-example PRIVATE cxx_std_17)
