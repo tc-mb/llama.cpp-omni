@@ -2636,6 +2636,15 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
 static bool check_node_graph_compatibility_and_refresh_copy_ops(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph,
     bool use_cuda_graph) {
 
+    // Per-backend-instance opt-in: skip the batch-size-based GGML_OP_ADD guard. This
+    // guard was added for the llama.cpp decoder where batch size can change across
+    // tokens; for workloads where every graph invocation on this backend has identical
+    // shapes (e.g. token2wav), disabling the guard lets CUDA graphs capture & replay,
+    // cutting per-op launch overhead to a single cudaGraphLaunch. The flag is scoped
+    // to this ggml_backend_cuda_context so other modules that share the same process
+    // (e.g. llama.cpp decoder on another backend) remain unaffected.
+    const bool allow_batched_add_in_cuda_graph = cuda_ctx->cuda_graph->allow_batched_add;
+
     // Loop over nodes in GGML graph to obtain info needed for CUDA graph
     cuda_ctx->cuda_graph->cpy_dest_ptrs.clear();
 
@@ -2668,7 +2677,8 @@ static bool check_node_graph_compatibility_and_refresh_copy_ops(ggml_backend_cud
 #endif
         }
 
-        if (node->op == GGML_OP_ADD &&
+        if (!allow_batched_add_in_cuda_graph &&
+            node->op == GGML_OP_ADD &&
             node->src[1] && node->src[1]->ne[1] > 1 &&
             (node->src[0] ? node->src[0]->name != gemma3n_per_layer_proj_src0_name : true) &&
             (node->src[1] ? node->src[1]->name != gemma3n_per_layer_proj_src1_name : true) &&
@@ -3827,6 +3837,30 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+// Extension setter reached via ggml_backend_reg_get_proc_address("ggml_backend_cuda_set_allow_batched_add").
+// Opts the given CUDA backend instance out of the "ADD with src[1]->ne[1]>1 disables CUDA graph"
+// guard. Only safe when every graph invocation on this backend has identical shapes.
+// Typical use (at call site):
+//   ggml_backend_t b = ggml_backend_cuda_init(dev);
+//   ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(b));
+//   auto fn = (void(*)(ggml_backend_t, bool))
+//       ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_set_allow_batched_add");
+//   if (fn) fn(b, true);
+// Becomes a no-op when ggml-cuda was built without USE_CUDA_GRAPH.
+static void ggml_backend_cuda_set_allow_batched_add(ggml_backend_t backend, bool allow) {
+    GGML_ASSERT(ggml_backend_is_cuda(backend));
+#ifdef USE_CUDA_GRAPH
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    if (cuda_ctx->cuda_graph == nullptr) {
+        cuda_ctx->cuda_graph.reset(new ggml_cuda_graph());
+    }
+    cuda_ctx->cuda_graph->allow_batched_add = allow;
+#else
+    GGML_UNUSED(backend);
+    GGML_UNUSED(allow);
+#endif
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_split_buffer_type") == 0) {
@@ -3840,6 +3874,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    if (strcmp(name, "ggml_backend_cuda_set_allow_batched_add") == 0) {
+        return (void *)ggml_backend_cuda_set_allow_batched_add;
     }
     return nullptr;
 }
