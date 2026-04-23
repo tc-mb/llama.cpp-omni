@@ -42,7 +42,7 @@
 //   - 扩展点不存在时（老版本 ggml、或非 CUDA 构建、或 ggml-cuda 未启用 USE_CUDA_GRAPH），
 //     proc_address 返回 nullptr，本函数直接 no-op，继续走原来的 eager 路径。
 // 用户仍可通过导出 GGML_CUDA_DISABLE_GRAPHS=1 在运行时全局禁用 CUDA Graph。
-static void omni_try_enable_cuda_batched_add(ggml_backend_t backend) {
+static void omni_set_cuda_batched_add(ggml_backend_t backend, bool allow) {
     if (!backend) {
         return;
     }
@@ -57,8 +57,11 @@ static void omni_try_enable_cuda_batched_add(ggml_backend_t backend) {
     auto setter = (ggml_backend_cuda_set_allow_batched_add_t)
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_set_allow_batched_add");
     if (setter) {
-        setter(backend, /*allow=*/true);
+        setter(backend, allow);
     }
+}
+static inline void omni_try_enable_cuda_batched_add(ggml_backend_t backend) {
+    omni_set_cuda_batched_add(backend, /*allow=*/true);
 }
 
 #if ENABLE_STDERR_LOG
@@ -7713,7 +7716,23 @@ bool flowGGUFModelRunner::inference_chunk(const int32_t *             token_bt,
     }
     {
         omni::flow::profile::ScopeTimer _t("t2m.compute");
+        // [PR25-GF_LAST-EAGER] 默认对 last_chunk 走 eager path；可 OMNI_T2W_DISABLE_LAST_GRAPH=0 回退。
+        // 原因：ggml-cuda 只维护 1 slot 的 CUDA Graph instance，gf_last 和 gf_nonlast 的 node 数/shape
+        // 不同 → 每次 chunk 切换（nonlast → last → nonlast）都会 destroy+re-instantiate，
+        // gf_last 会吃到 ~+50ms 的 graph capture 开销（在端到端 A/B 中表现为 wav_2 +79% 回归）。
+        // 把 gf_last 暂时关掉 allow_batched_add 让它走 eager 路径，gf_nonlast 不受影响，仍可 cache。
+        // 需要显式 OMNI_T2W_DISABLE_LAST_GRAPH=0 才会回到"gf_last 也走 CUDA Graph"的原行为。
+        const bool disable_last_graph = last_chunk && [] {
+            const char * e = std::getenv("OMNI_T2W_DISABLE_LAST_GRAPH");
+            return !e || std::string(e) != "0";
+        }();
+        if (disable_last_graph) {
+            omni_set_cuda_batched_add(loader_.backend(), /*allow=*/false);
+        }
         const ggml_status st = ggml_backend_graph_compute(loader_.backend(), gf);
+        if (disable_last_graph) {
+            omni_set_cuda_batched_add(loader_.backend(), /*allow=*/true);
+        }
         if (st != GGML_STATUS_SUCCESS) {
             return false;
         }
