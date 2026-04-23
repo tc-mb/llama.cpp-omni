@@ -119,10 +119,6 @@ int main() {
     std::string device_token2mel   = env_or("OMNI_T2W_DEVICE", "gpu");
     std::string device_vocoder     = env_or("OMNI_T2W_DEVICE", "gpu");
 
-    // 注：token2wav 的 CUDA Graph opt-in 已在 backend 创建完成之后通过 per-instance
-    // 扩展 API `ggml_backend_cuda_set_allow_batched_add` 完成（见 token2wav-impl.cpp
-    // 中的 omni_try_enable_cuda_batched_add），这里不再需要设置任何进程级 env。
-
     int       n_timesteps = std::atoi(env_or("OMNI_T2W_N_TIMESTEPS", "5").c_str());
     float     temperature = 1.0f;
     const int sr          = omni::flow::Token2Wav::kSampleRate;

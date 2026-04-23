@@ -32,77 +32,6 @@
 #define ENABLE_STDERR_LOG 0
 #endif
 
-// ---- Phase 0.3: op 源码定位 ----------------------------------------------
-// 编译时定义 OMNI_T2W_TRACK_OPS=1 开启：
-//   - 在 token2wav-impl.cpp 这一个 TU 内，把常见的 suspicious op 构造函数（concat /
-//     cont / permute / reshape_*d / add）的返回值自动命名成 "OP@file.cpp:line"。
-//   - 之后再用 OMNI_T2W_PRINT_GRAPH=1 dump graph，按 name grep 就能快速定位
-//     "这个 1039 个 CONCAT 到底是哪几行代码造的"。
-//   - 只改 tensor->name 且仅在 name 为空时才写，保留程序员自己 set_name 的结果。
-//   - 关掉时（宏为 0 或未定义）完全 no-op，release build 不受影响。
-#ifndef OMNI_T2W_TRACK_OPS
-#define OMNI_T2W_TRACK_OPS 0
-#endif
-#if OMNI_T2W_TRACK_OPS
-#include <cstring>
-static inline ggml_tensor * omni_t2w_tag_(ggml_tensor * t, const char * op_tag,
-                                          const char * file, int line) {
-    // 名字为空、或长得像 ggml 自动生成的 "<name> (cont)"/"(permuted)"/"(reshaped)" 时覆盖。
-    // 保留调用方通过 ggml_set_name 显式设的名字（通常是 "hg2.xxx" 这种带模块前缀的）。
-    const bool auto_generated = t && (
-        t->name[0] == '\0'
-        || t->name[0] == '('
-        || t->name[0] == ' '
-        || std::strstr(t->name, " (cont)")     != nullptr
-        || std::strstr(t->name, " (permuted)") != nullptr
-        || std::strstr(t->name, " (reshaped)") != nullptr
-        || std::strstr(t->name, " (transpose") != nullptr
-        || std::strstr(t->name, " (view)")     != nullptr);
-    if (auto_generated) {
-        const char * base = std::strrchr(file, '/');
-        std::snprintf(t->name, GGML_MAX_NAME, "%s@%s:%d",
-                      op_tag, base ? base + 1 : file, line);
-    }
-    return t;
-}
-// (fn) 形式抑制宏再展开，避免无限递归。
-#define ggml_concat(ctx, a, b, dim) \
-    omni_t2w_tag_((ggml_concat)(ctx, a, b, dim), "CONCAT", __FILE__, __LINE__)
-#define ggml_cont(ctx, a) \
-    omni_t2w_tag_((ggml_cont)(ctx, a), "CONT", __FILE__, __LINE__)
-#define ggml_cont_2d(ctx, a, n0, n1) \
-    omni_t2w_tag_((ggml_cont_2d)(ctx, a, n0, n1), "CONT2", __FILE__, __LINE__)
-#define ggml_cont_3d(ctx, a, n0, n1, n2) \
-    omni_t2w_tag_((ggml_cont_3d)(ctx, a, n0, n1, n2), "CONT3", __FILE__, __LINE__)
-#define ggml_cont_4d(ctx, a, n0, n1, n2, n3) \
-    omni_t2w_tag_((ggml_cont_4d)(ctx, a, n0, n1, n2, n3), "CONT4", __FILE__, __LINE__)
-#define ggml_permute(ctx, a, d0, d1, d2, d3) \
-    omni_t2w_tag_((ggml_permute)(ctx, a, d0, d1, d2, d3), "PERMUTE", __FILE__, __LINE__)
-#define ggml_reshape_3d(ctx, a, n0, n1, n2) \
-    omni_t2w_tag_((ggml_reshape_3d)(ctx, a, n0, n1, n2), "RESHAPE3", __FILE__, __LINE__)
-#define ggml_reshape_4d(ctx, a, n0, n1, n2, n3) \
-    omni_t2w_tag_((ggml_reshape_4d)(ctx, a, n0, n1, n2, n3), "RESHAPE4", __FILE__, __LINE__)
-#define ggml_add(ctx, a, b) \
-    omni_t2w_tag_((ggml_add)(ctx, a, b), "ADD", __FILE__, __LINE__)
-#define ggml_mul(ctx, a, b) \
-    omni_t2w_tag_((ggml_mul)(ctx, a, b), "MUL", __FILE__, __LINE__)
-#endif
-
-// 带 name 的 graph print（ggml 自带的 ggml_graph_print 不显示 tensor->name）。
-// 仅用于 Phase 0.3 debug，关掉 OMNI_T2W_PRINT_GRAPH 就不会被调用。
-static void omni_ggml_graph_print_with_names(ggml_cgraph * gf) {
-    const int n = ggml_graph_n_nodes(gf);
-    std::fprintf(stderr, " -  idx [   ne0,   ne1,   ne2]  op               name\n");
-    for (int i = 0; i < n; i++) {
-        ggml_tensor * t = ggml_graph_node(gf, i);
-        std::fprintf(stderr, " - %4d [%6lld,%6lld,%6lld]  %-16s %s\n",
-                     i,
-                     (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2],
-                     ggml_op_name(t->op),
-                     t->name[0] ? t->name : "");
-    }
-}
-
 // token2wav 每次调用图的形状完全固定（chunk_size、n_timesteps、head_dim 都是编译期常量，
 // KV cache 到达 max_t_cache 后也不再增长），因此 ggml-cuda 对 GGML_OP_ADD 的
 // "src[1]->ne[1]>1 -> disable CUDA graph" 这条保守防御不适用。ggml-cuda 提供了
@@ -6650,7 +6579,7 @@ bool voc_hg2_runner::voc_hg2_runner_eval_stream(const std::vector<float> & speec
         if (printed.compare_exchange_strong(expected, true)) {
             std::fprintf(stderr, "[profile] ===== vocoder (HiFiGAN2) graph =====\n");
             std::fprintf(stderr, "[profile] n_nodes=%d\n", ggml_graph_n_nodes(gf));
-            omni_ggml_graph_print_with_names(gf);
+            ggml_graph_print(gf);
         }
     }
     {
@@ -7779,7 +7708,7 @@ bool flowGGUFModelRunner::inference_chunk(const int32_t *             token_bt,
                          last_chunk ? "gf_last" : "gf_nonlast");
             std::fprintf(stderr, "[profile] n_nodes=%d n_timesteps=%d T_chunk_token=%lld B=%lld\n",
                          ggml_graph_n_nodes(gf), n_timesteps, (long long) sess_->T_chunk_token, (long long) B);
-            omni_ggml_graph_print_with_names(gf);
+            ggml_graph_print(gf);
         }
     }
     {
