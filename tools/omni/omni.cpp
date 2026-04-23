@@ -3283,12 +3283,16 @@ void sliding_window_register_system_prompt(struct omni_context * ctx_omni) {
 /**
  * 从 KV cache 中删除指定数量的 tokens
  * 删除位于 [preserve, preserve + length) 区间的 tokens
- * 
- * 注意：llama.cpp 的 llama_memory_seq_rm 函数可以直接删除指定范围的 tokens
- * 但删除后需要进行 RoPE 位置重对齐（暂时不支持，需要更深入的修改）
- * 
- * 当前实现：使用简化的策略，删除 tokens 后更新 position_offset
- * 后续生成时使用 position_offset 来调整 position_ids
+ *
+ * 实现要点：
+ *   1. llama_memory_seq_rm 只是把指定区间的 KV 标记为空，
+ *      并不会移动后面 token 的 position；
+ *   2. 因此必须紧接着调用 llama_memory_seq_add(... , -length)，
+ *      把 [preserve + length, cache_len_before) 范围内剩余 token 的 position
+ *      整体向前平移 length，使 KV 中的 position 重新连续；
+ *   3. 否则下一次 llama_decode 会报
+ *      "inconsistent sequence positions: X = old_pmax, Y = n_past, requires Y = X + 1"
+ *      这与 kv_cache_slide_window 里采用的策略保持一致。
  */
 bool sliding_window_drop_tokens_from_cache(struct omni_context * ctx_omni, int length) {
     if (!ctx_omni || !ctx_omni->ctx_llama || length <= 0) {
@@ -3312,26 +3316,33 @@ bool sliding_window_drop_tokens_from_cache(struct omni_context * ctx_omni, int l
         return false;
     }
     
-    // 使用 llama_memory_seq_rm 删除 [preserve, preserve + length) 区间的 tokens
     llama_memory_t mem = llama_get_memory(ctx_omni->ctx_llama);
     if (!mem) {
         print_with_timestamp("[SW] drop_tokens: failed to get llama memory\n");
         return false;
     }
     
-    // 删除指定范围的 tokens
-    // llama_memory_seq_rm(mem, seq_id, p0, p1) 删除 [p0, p1) 范围的 tokens
+    // 1) 删除 [preserve, preserve + length) 区间的 KV
     bool success = llama_memory_seq_rm(mem, 0, preserve, preserve + length);
     
     if (success) {
-        // 更新 n_past
+        // 2) 把后段 [preserve + length, cache_len_before) 的 position
+        //    整体往前平移 length，保证 KV 中 position 连续，下一次 decode 不会触发
+        //    "inconsistent sequence positions" 错误。
+        //    与 kv_cache_slide_window 的处理方式一致。
+        if (cache_len_before > preserve + length) {
+            llama_memory_seq_add(mem, 0, preserve + length, cache_len_before, -length);
+        }
+
         ctx_omni->n_past = cache_len_before - length;
-        
-        // 更新 position_offset（用于后续 RoPE 计算）
+
+        // position_offset 字段已不再用于位置修正，仅保留累计值用于诊断/兼容旧日志
         ctx_omni->position_offset += length;
-        
-        print_with_timestamp("[SW] drop_tokens: SUCCESS, dropped %d tokens from [%d, %d), cache %d -> %d, offset=%d\n",
-                            length, preserve, preserve + length, cache_len_before, ctx_omni->n_past, ctx_omni->position_offset);
+
+        print_with_timestamp("[SW] drop_tokens: SUCCESS, dropped %d tokens from [%d, %d), shifted [%d, %d) by -%d, cache %d -> %d\n",
+                            length, preserve, preserve + length,
+                            preserve + length, cache_len_before, length,
+                            cache_len_before, ctx_omni->n_past);
     } else {
         print_with_timestamp("[SW] drop_tokens: FAILED to drop %d tokens\n", length);
     }
@@ -9106,7 +9117,18 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
     // 🔧 [诊断] 打印 stream_decode 开始时的关键状态
     print_with_timestamp("📍 stream_decode 开始: n_past=%d, n_keep=%d, n_ctx=%d, duplex_mode=%d\n",
                          ctx_omni->n_past, ctx_omni->n_keep, ctx_omni->params->n_ctx, ctx_omni->duplex_mode);
-    
+
+    // 🔧 [unit 记账] decode_start_cache_len 不在这里取值！
+    // 这里的 n_past 还是 prefill 之前的值；stream_decode 内部其实是
+    //     prefill (audio/vision/omni) 写入 KV  →  decode 采样
+    // 顺序，prefill 那段 KV 已经被 sliding_window_register_unit_start/_end
+    // 算成 omni/audio unit 了，如果在这里就把 n_past 锁住，结束时 end - start 会
+    // 把 prefill 那段重复算到 response unit 里（一段 KV 同时被两条 unit 记账，
+    // 后果就是日志里反复出现的 "❌ CONSISTENCY ERROR! sum(units) >> cache" 以及
+    // 滑窗 drop response unit 时多删 KV）。所以 decode_start_cache_len 必须等到
+    // 下面的 "wait prefill done" 之后再取。
+    int decode_start_cache_len = -1;
+
     // 🔧 [双工模式] 重置 ended_with_listen 标志
     // 每次 decode 开始时，假设会以非 listen 结束（需要清理 KV cache）
     // 如果 LLM 线程检测到 <|listen|>，会设置为 true
@@ -9178,6 +9200,16 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
         g_decode_cv.wait(lock, []{ return prefill_done; });
         prefill_done = false;
     }
+
+    // 🔧 [unit 记账] 现在 prefill 已经写完 KV、unit_history 里也已经
+    //   有对应的 omni/audio unit 了；这里取的 n_past 才是"decode 真正
+    //   要写入的起始位置"。后面 register response unit 时用
+    //   (n_past_now - decode_start_cache_len)，正好等于 decode 自身写入的长度
+    //   （包括单工模式下面 eval 的 <|im_end|>...<|tts_bos|> assistant prompt，
+    //    那段也算到 response unit 里一起删，不会重复记账，因为它没经过
+    //    prefill 的 register_unit_start/_end）。
+    decode_start_cache_len = ctx_omni->n_past;
+
     // 只有启用 TTS 时才设置 speek_done 为 false
     if (ctx_omni->use_tts) {
         ctx_omni->speek_done = false;
@@ -9693,6 +9725,74 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
         print_with_timestamp("📍 为下一轮准备: eval <|im_end|>\\n<|im_start|>user\\n, n_past=%d\n", ctx_omni->n_past);
     }
     
+    // ==================== response unit 注册 ====================
+    // 把这一轮 decode 期间通过采样写入 KV 的所有 token 打包成一个
+    // type = "response" 的 UnitEntry，挂到 unit_history 里。
+    //
+    // 为什么必须做这件事：
+    //   1. unit-based 滑窗（sliding_window_enforce + sliding_window_drop_next_unit）
+    //      只会按 unit_history 里的条目去 drop。如果 response 段从来没被注册，
+    //      它就永远停留在 KV 里，谁也删不掉，长会话下迟早把上下文撑爆。
+    //   2. 一致性检查 expected = preserve + sum(units.length) 也要求每一段
+    //      占用 KV 的 token 都有对应记账，否则会反复打印
+    //      "❌ CONSISTENCY ERROR! preserve=X + sum(units)=Y != cache=Z"。
+    //
+    // 注意点：
+    //   - type 必须不是 "system"，这样 sliding_window_drop_next_unit 才愿意删它
+    //     （那里是 `if (entry.type == "system") continue;`）。
+    //   - 真正释放 KV 的链路是
+    //       sliding_window_drop_next_unit
+    //         -> sliding_window_drop_unit
+    //         -> sliding_window_drop_tokens_from_cache
+    //     而 sliding_window_drop_tokens_from_cache 已经在前面修过：
+    //     llama_memory_seq_rm 之后会跟一次 llama_memory_seq_add(..., -length)，
+    //     把后段 position 向前平移，所以删 response unit 也是安全的、
+    //     不会再触发 "inconsistent sequence positions"。
+    //   - length 用 (n_past - decode_start_cache_len)，这是 decode 期间
+    //     KV 实际增长的字节数，和 prefill 路径上 register_unit_end 的算法
+    //     （current_cache_len - pending_unit_start_cache_len）保持一致。
+    //   - 必须只在 sliding_window_config.mode != "off" 时执行，跟 prefill 路径上
+    //     的 sliding_window_register_unit_start/_end 保持一致。
+    //     原因：mode == "off" 时谁都不会消费 unit_history，如果在这里继续 push，
+    //     会得到一个只增不减的 vector（轻度内存泄漏），而且一旦中途切回 basic，
+    //     里面残留的 response 条目会让一致性检查直接对不上。
+    if (ctx_omni->sliding_window_config.mode != "off") {
+        int decode_end_cache_len = ctx_omni->n_past;
+
+        // decode_start_cache_len 默认值是 -1，正常路径上会在 "wait prefill done"
+        // 之后被赋成"prefill 完成时的 n_past"。如果中途异常退出导致没赋值，
+        // 就跳过本次记账，避免把整段 cache 当 response 误记。
+        if (decode_start_cache_len < 0) {
+            print_with_timestamp(
+                "[SW] register response unit: skipped, decode_start_cache_len 未初始化"
+                " (可能 prefill 没正常完成)，跳过记账\n");
+        } else {
+            int response_len = decode_end_cache_len - decode_start_cache_len;
+            if (response_len > 0) {
+                UnitEntry entry;
+                entry.unit_id = ctx_omni->next_unit_id++;
+                entry.length  = response_len;
+                entry.type    = "response";
+                entry.is_listen = ctx_omni->ended_with_listen.load();
+                // generated_tokens 暂不在这里收集：decode 的 token 流已经通过
+                // text_queue / TTS 通道处理掉了，这里只关心 KV 长度的记账。
+                ctx_omni->unit_history.push_back(entry);
+
+                print_with_timestamp(
+                    "[SW] register response unit: unit_id=%d type=response len=%d "
+                    "is_listen=%d | cache=%d preserve=%d total_units=%zu\n",
+                    entry.unit_id, entry.length, (int)entry.is_listen,
+                    decode_end_cache_len, ctx_omni->system_preserve_length,
+                    ctx_omni->unit_history.size());
+            } else {
+                print_with_timestamp(
+                    "[SW] register response unit: skipped, response_len=%d "
+                    "(start=%d, end=%d) — decode 没有写入新 token，无需记账\n",
+                    response_len, decode_start_cache_len, decode_end_cache_len);
+            }
+        }
+    }
+
     // 双工模式：只在 LISTEN 结束时记录 round 边界（一个完整的"说+听"轮次结束）
     // 这样 round 覆盖完整的 [unit+SPEAK...unit+LISTEN] 序列，
     // 滑窗按 round 截断时不会把连续 SPEAK 或 unit 从中间切开
