@@ -839,6 +839,15 @@ ggml_tensor * fmCausalConditionalCFM::build_forward_chunk_graph(ggml_context *  
     }
     ggml_tensor * new_att_cache_packed = nullptr;
     ggml_tensor * new_cnn_cache_packed = nullptr;
+    // Opt #1: 在 ODE N 步循环外预先构建 cond_cat = [mu_in ⊕ spks_in(广播) ⊕ cond_in]。
+    // 5 步循环共享同一个 cond_cat 指针，ggml graph 只算 1 次，节省 (N-1)*2 个 concat 节点。
+    // 严格等价于原 fmDiT::build_forward_chunk_graph 内部的 L1457-1464 concat 链。
+    ggml_tensor * cond_cat = estimator_->build_cond_cat(ctx, mu_in, spks_in, cond_in, T, B_total);
+    if (cond_cat == nullptr) {
+        // 理论上只有 mu_in == nullptr 才会返回 nullptr，这里 mu 前面已 early-return 过了
+        return nullptr;
+    }
+    ggml_set_name(cond_cat, "fm_cfm_cond_cat_shared");
     // 1.B: 跨 n_steps 的 step-pack 先收集到 vector，循环结束后统一用 tree-concat
     //      一次合并，避免原先每步都 concat(prev, step) 的 O(steps²) 拷贝。
     std::vector<ggml_tensor *> all_step_att_packs;
@@ -875,8 +884,8 @@ ggml_tensor * fmCausalConditionalCFM::build_forward_chunk_graph(ggml_context *  
         }
         std::vector<ggml_tensor *> new_cnn_vec;
         std::vector<ggml_tensor *> new_att_vec;
-        ggml_tensor * dphi_all = estimator_->build_forward_chunk_graph(
-            ctx, x_in, mu_in, t_in, spks_in, cond_in, prev_cnn_cache, prev_att_cache, new_cnn_vec, new_att_vec);
+        ggml_tensor * dphi_all = estimator_->build_forward_chunk_graph_pre(
+            ctx, x_in, cond_cat, t_in, prev_cnn_cache, prev_att_cache, new_cnn_vec, new_att_vec);
         ggml_tensor * dphi_main = ggml_view_3d(ctx, dphi_all, C, T, B, dphi_all->nb[1], dphi_all->nb[2], 0);
         const size_t  offset_cfg = static_cast<size_t>(B) * dphi_all->nb[2];
         ggml_tensor * dphi_cfg   = ggml_view_3d(ctx, dphi_all, C, T, B, dphi_all->nb[1], dphi_all->nb[2], offset_cfg);
@@ -1463,6 +1472,53 @@ ggml_tensor * fmDiT::build_forward_chunk_graph(ggml_context *                   
         x_cat = ggml_concat(ctx, x_cat, cond, 0);
     }
     ggml_tensor * mask = nullptr;
+    return build_blocks_forward_chunk_graph(ctx, x_cat, t_embed_3d, mask, prev_cnn_cache, prev_att_cache, new_cnn_cache,
+                                            new_att_cache);
+}
+// Opt #1: 在 ODE N 步循环外预先构建 [mu ⊕ spks_bt ⊕ cond]。
+// 等价于 build_forward_chunk_graph 内部 L1457-1464 的 concat 链，区别是：
+// - 只依赖 caller 传入的 mu/spks/cond（ODE 外 tensor），不需要 x/t
+// - 返回的 cond_cat 节点是"对 graph 的一个引用"；caller 可把它传给 5 次不同 step 的
+//   build_forward_chunk_graph_pre，ggml 在 graph 执行时只对该节点计算一次
+// concat 顺序严格保持原样：((mu, spks_bt), cond)；保证与原代码 bit-exact
+ggml_tensor * fmDiT::build_cond_cat(ggml_context * ctx,
+                                     ggml_tensor *  mu,
+                                     ggml_tensor *  spks,
+                                     ggml_tensor *  cond,
+                                     int64_t        T,
+                                     int64_t        B_total) const {
+    if (ctx == nullptr || mu == nullptr) {
+        return nullptr;
+    }
+    ggml_tensor * cat = mu;
+    if (spks != nullptr) {
+        ggml_tensor * spks_bt = fm_dit_broadcast_spks_over_time(ctx, spks, T, B_total);
+        cat                   = ggml_concat(ctx, cat, spks_bt, 0);
+    }
+    if (cond != nullptr) {
+        cat = ggml_concat(ctx, cat, cond, 0);
+    }
+    return cat;
+}
+// Opt #1: 使用预构建 cond_cat 的 chunk 前向。每步只做一次 concat(x, cond_cat, 0)。
+// 等价于 build_forward_chunk_graph 在 caller 已显式算出 cond_cat = [mu ⊕ spks_bt ⊕ cond] 的场景。
+ggml_tensor * fmDiT::build_forward_chunk_graph_pre(ggml_context *                     ctx,
+                                                   ggml_tensor *                      x,
+                                                   ggml_tensor *                      cond_cat,
+                                                   ggml_tensor *                      t,
+                                                   const std::vector<ggml_tensor *> & prev_cnn_cache,
+                                                   const std::vector<ggml_tensor *> & prev_att_cache,
+                                                   std::vector<ggml_tensor *> &       new_cnn_cache,
+                                                   std::vector<ggml_tensor *> &       new_att_cache) const {
+    if (ctx == nullptr || x == nullptr || cond_cat == nullptr || t == nullptr) {
+        new_cnn_cache.clear();
+        new_att_cache.clear();
+        return nullptr;
+    }
+    ggml_tensor * t_embed    = t_embedder_->build_forward_graph(ctx, t);
+    ggml_tensor * t_embed_3d = ggml_reshape_3d(ctx, t_embed, hidden_size_, 1, t_embed->ne[1]);
+    ggml_tensor * x_cat      = ggml_concat(ctx, x, cond_cat, 0);
+    ggml_tensor * mask       = nullptr;
     return build_blocks_forward_chunk_graph(ctx, x_cat, t_embed_3d, mask, prev_cnn_cache, prev_att_cache, new_cnn_cache,
                                             new_att_cache);
 }

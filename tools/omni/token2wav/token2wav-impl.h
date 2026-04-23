@@ -349,6 +349,23 @@ class fmDiT {
                                             const std::vector<ggml_tensor *> & prev_att_cache,
                                             std::vector<ggml_tensor *> &       new_cnn_cache,
                                             std::vector<ggml_tensor *> &       new_att_cache) const;
+    // Opt #1: 在 ODE N 步外预先构建一次 [mu ⊕ spks_bt ⊕ cond]，节点可在 graph 里
+    // 被多步共享。build_forward_chunk_graph_pre 接受该预算好的 cond_cat，每步
+    // 内只做 concat(x, cond_cat, dim=0) 一次，省掉 spks_bt / cond 的重复 concat。
+    ggml_tensor * build_cond_cat(ggml_context * ctx,
+                                 ggml_tensor *  mu,
+                                 ggml_tensor *  spks,
+                                 ggml_tensor *  cond,
+                                 int64_t        T,
+                                 int64_t        B_total) const;
+    ggml_tensor * build_forward_chunk_graph_pre(ggml_context *                     ctx,
+                                                ggml_tensor *                      x,
+                                                ggml_tensor *                      cond_cat,
+                                                ggml_tensor *                      t,
+                                                const std::vector<ggml_tensor *> & prev_cnn_cache,
+                                                const std::vector<ggml_tensor *> & prev_att_cache,
+                                                std::vector<ggml_tensor *> &       new_cnn_cache,
+                                                std::vector<ggml_tensor *> &       new_att_cache) const;
     ggml_tensor * build_blocks_forward_chunk_graph(ggml_context *                     ctx,
                                                    ggml_tensor *                      x,
                                                    ggml_tensor *                      t_embed,
