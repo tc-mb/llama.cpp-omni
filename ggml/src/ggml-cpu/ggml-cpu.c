@@ -2865,119 +2865,6 @@ struct ggml_cplan ggml_graph_plan(
     return cplan;
 }
 
-// ---- omni token2wav per-OP wall-time profiler (header-light) ----
-// 通过环境变量 OMNI_T2W_OP_PROFILE=1 开启。仅在 thread 0 计时，atexit 时 dump。
-// 设计上对 cgraph_compute 的影响 < 1 µs/node，相比 op 自身耗时（µs~ms 级别）可忽略。
-//
-// 支持"按调用方标签分列"：调用方（如 ScopeTimer）可以调用
-// omni_ggml_cpu_op_profile_set_label("t2m.compute") 来把之后的计时归到某一列。
-//
-// 标签数上限 OMNI_LABEL_MAX = 16；超过时溢出到 "_overflow_" 列。
-#define OMNI_LABEL_MAX 16
-static int          g_omni_op_profile_state = -1; // -1=未初始化, 0=关闭, 1=开启
-static const char * g_omni_op_labels[OMNI_LABEL_MAX];
-static int          g_omni_op_n_labels = 0;
-static int64_t      g_omni_op_time_ns[OMNI_LABEL_MAX + 1][GGML_OP_COUNT];
-static int64_t      g_omni_op_count  [OMNI_LABEL_MAX + 1][GGML_OP_COUNT];
-static _Thread_local const char * g_omni_op_tls_label = NULL;
-
-void omni_ggml_cpu_op_profile_set_label(const char * label) {
-    g_omni_op_tls_label = label;
-}
-
-// 返回 [0..OMNI_LABEL_MAX]，OMNI_LABEL_MAX 表示"未标签/溢出"
-static int g_omni_label_slot(void) {
-    const char * l = g_omni_op_tls_label;
-    if (!l) return OMNI_LABEL_MAX;
-    for (int i = 0; i < g_omni_op_n_labels; i++) {
-        if (g_omni_op_labels[i] == l || strcmp(g_omni_op_labels[i], l) == 0) return i;
-    }
-    if (g_omni_op_n_labels < OMNI_LABEL_MAX) {
-        int s = g_omni_op_n_labels++;
-        g_omni_op_labels[s] = l;
-        return s;
-    }
-    return OMNI_LABEL_MAX;
-}
-
-static void g_omni_op_profile_dump(void) {
-    // 选出实际用到的 label（+ "unlabeled" 列如果有数据）
-    int label_slots[OMNI_LABEL_MAX + 1];
-    int n_slots = 0;
-    int64_t col_total[OMNI_LABEL_MAX + 1] = {0};
-    for (int s = 0; s <= OMNI_LABEL_MAX; s++) {
-        int64_t sum = 0;
-        for (int i = 0; i < GGML_OP_COUNT; i++) sum += g_omni_op_time_ns[s][i];
-        if (sum > 0) {
-            label_slots[n_slots] = s;
-            col_total[n_slots]   = sum;
-            n_slots++;
-        }
-    }
-    if (n_slots == 0) return;
-
-    // 打印表头
-    fprintf(stderr, "[op-profile] ===== ggml-cpu per-OP wall time =====\n");
-    fprintf(stderr, "[op-profile] columns:\n");
-    for (int c = 0; c < n_slots; c++) {
-        const int s = label_slots[c];
-        fprintf(stderr, "[op-profile]   [%d] %-20s total=%.3f ms\n",
-                c, (s == OMNI_LABEL_MAX) ? "<unlabeled>" : g_omni_op_labels[s],
-                col_total[c] / 1.0e6);
-    }
-    fprintf(stderr, "[op-profile] %-22s", "op");
-    for (int c = 0; c < n_slots; c++) fprintf(stderr, " | %12s[%d]", "ms", c);
-    fprintf(stderr, " | %12s\n", "row_total_ms");
-
-    // 按 row 总时间排序
-    int64_t row_total[GGML_OP_COUNT] = {0};
-    for (int i = 0; i < GGML_OP_COUNT; i++) {
-        for (int c = 0; c < n_slots; c++) row_total[i] += g_omni_op_time_ns[label_slots[c]][i];
-    }
-    int idx[GGML_OP_COUNT];
-    for (int i = 0; i < GGML_OP_COUNT; i++) idx[i] = i;
-    for (int i = 0; i < GGML_OP_COUNT; i++) {
-        for (int j = i + 1; j < GGML_OP_COUNT; j++) {
-            if (row_total[idx[j]] > row_total[idx[i]]) {
-                int t = idx[i]; idx[i] = idx[j]; idx[j] = t;
-            }
-        }
-    }
-    int64_t grand = 0;
-    for (int i = 0; i < GGML_OP_COUNT; i++) grand += row_total[i];
-    if (grand == 0) return;
-
-    for (int i = 0; i < GGML_OP_COUNT; i++) {
-        const int op = idx[i];
-        if (row_total[op] == 0) continue;
-        fprintf(stderr, "[op-profile] %-22s", ggml_op_name(op));
-        for (int c = 0; c < n_slots; c++) {
-            const int s = label_slots[c];
-            double ms = g_omni_op_time_ns[s][op] / 1.0e6;
-            fprintf(stderr, " | %15.3f", ms);
-        }
-        fprintf(stderr, " | %12.3f  (%5.2f%%)\n",
-                row_total[op] / 1.0e6, 100.0 * row_total[op] / grand);
-    }
-    fprintf(stderr, "[op-profile] %-22s", "TOTAL");
-    for (int c = 0; c < n_slots; c++) fprintf(stderr, " | %15.3f", col_total[c] / 1.0e6);
-    fprintf(stderr, " | %12.3f\n", grand / 1.0e6);
-}
-
-static int g_omni_op_profile_enabled(void) {
-    if (g_omni_op_profile_state == -1) {
-        const char * v = getenv("OMNI_T2W_OP_PROFILE");
-        g_omni_op_profile_state = (v && *v && *v != '0') ? 1 : 0;
-        if (g_omni_op_profile_state) atexit(g_omni_op_profile_dump);
-    }
-    return g_omni_op_profile_state;
-}
-static inline int64_t g_omni_now_ns(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (int64_t) ts.tv_sec * 1000000000LL + (int64_t) ts.tv_nsec;
-}
-
 static thread_ret_t ggml_graph_compute_thread(void * data) {
     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
     struct ggml_threadpool    * tp    = state->threadpool;
@@ -2995,12 +2882,8 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         /*.threadpool=*/ tp,
     };
 
-    const int omni_op_prof = g_omni_op_profile_enabled();
-
     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
-
-        const int64_t t_op_begin = (omni_op_prof && state->ith == 0) ? g_omni_now_ns() : 0;
 
         ggml_compute_forward(&params, node);
 
@@ -3012,13 +2895,6 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
         if (node_n + 1 < cgraph->n_nodes) {
             ggml_barrier(state->threadpool);
-        }
-
-        if (omni_op_prof && state->ith == 0) {
-            const int64_t t_op_end = g_omni_now_ns();
-            const int     slot     = g_omni_label_slot();
-            g_omni_op_time_ns[slot][node->op] += (t_op_end - t_op_begin);
-            g_omni_op_count[slot][node->op]   += 1;
         }
     }
 
