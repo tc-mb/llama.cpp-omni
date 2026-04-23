@@ -424,7 +424,9 @@ void fmAttention::set_parameters(ggml_tensor * to_q_weight,
                                  ggml_tensor * k_norm_weight,
                                  ggml_tensor * k_norm_bias,
                                  ggml_tensor * proj_weight,
-                                 ggml_tensor * proj_bias) {
+                                 ggml_tensor * proj_bias,
+                                 ggml_tensor * to_qkv_weight,
+                                 ggml_tensor * to_qkv_bias) {
     to_q_weight_ = to_q_weight;
     to_q_bias_   = to_q_bias;
     to_k_weight_ = to_k_weight;
@@ -437,6 +439,8 @@ void fmAttention::set_parameters(ggml_tensor * to_q_weight,
     k_norm_bias_   = k_norm_bias;
     proj_weight_ = proj_weight;
     proj_bias_   = proj_bias;
+    to_qkv_weight_ = to_qkv_weight;
+    to_qkv_bias_   = to_qkv_bias;
 }
 // 构建注意力计算图并维护缓存
 ggml_tensor * fmAttention::build_forward_graph(ggml_context * ctx, ggml_tensor * x, ggml_tensor * attn_mask) const {
@@ -448,14 +452,38 @@ ggml_tensor * fmAttention::build_forward_graph(ggml_context * ctx, ggml_tensor *
     const int64_t B = x->ne[2];
     const int H = num_heads_;
     const int D = head_dim_;
-    ggml_tensor * q = build_linear(ctx, x, to_q_weight_, to_q_bias_);
-    ggml_tensor * k = build_linear(ctx, x, to_k_weight_, to_k_bias_);
-    ggml_tensor * v = build_linear(ctx, x, to_v_weight_, to_v_bias_);
-    ggml_tensor * q_heads = fm_attn_reshape_heads_4d(ctx, q, D, H, T, B);
-    ggml_set_name(q_heads, "fm_att_q_heads");
-    ggml_tensor * k_heads = fm_attn_reshape_heads_4d(ctx, k, D, H, T, B);
-    ggml_set_name(k_heads, "fm_att_k_heads");
-    ggml_tensor * v_heads = fm_attn_reshape_heads_4d(ctx, v, D, H, T, B);
+    ggml_tensor * q_heads = nullptr;
+    ggml_tensor * k_heads = nullptr;
+    ggml_tensor * v_heads = nullptr;
+    if (to_qkv_weight_ != nullptr) {
+        // Phase 2.3 fused QKV: one mul_mat + add replaces three linear projections.
+        // qkv is contiguous, shape [3*C, T, B]; slice each Q/K/V into [head_dim,
+        // num_heads, T, B] via ggml_view_4d, matching reshape_heads_4d's layout.
+        ggml_tensor * qkv = ggml_mul_mat(ctx, to_qkv_weight_, x);
+        if (to_qkv_bias_ != nullptr) {
+            qkv = ggml_add(ctx, qkv, to_qkv_bias_);
+        }
+        ggml_set_name(qkv, "fm_att_qkv_fused");
+        const size_t es       = sizeof(float);
+        const size_t nb1_head = (size_t) D * es;
+        const size_t nb2_row  = qkv->nb[1];
+        const size_t nb3_plane = qkv->nb[2];
+        q_heads = ggml_view_4d(ctx, qkv, D, H, T, B, nb1_head, nb2_row, nb3_plane, 0 * (size_t) C * es);
+        k_heads = ggml_view_4d(ctx, qkv, D, H, T, B, nb1_head, nb2_row, nb3_plane, 1 * (size_t) C * es);
+        v_heads = ggml_view_4d(ctx, qkv, D, H, T, B, nb1_head, nb2_row, nb3_plane, 2 * (size_t) C * es);
+        ggml_set_name(q_heads, "fm_att_q_heads_fused");
+        ggml_set_name(k_heads, "fm_att_k_heads_fused");
+        ggml_set_name(v_heads, "fm_att_v_heads_fused");
+    } else {
+        ggml_tensor * q = build_linear(ctx, x, to_q_weight_, to_q_bias_);
+        ggml_tensor * k = build_linear(ctx, x, to_k_weight_, to_k_bias_);
+        ggml_tensor * v = build_linear(ctx, x, to_v_weight_, to_v_bias_);
+        q_heads = fm_attn_reshape_heads_4d(ctx, q, D, H, T, B);
+        ggml_set_name(q_heads, "fm_att_q_heads");
+        k_heads = fm_attn_reshape_heads_4d(ctx, k, D, H, T, B);
+        ggml_set_name(k_heads, "fm_att_k_heads");
+        v_heads = fm_attn_reshape_heads_4d(ctx, v, D, H, T, B);
+    }
     if (qk_norm_) {
         q_heads = fm_attn_apply_qk_norm(ctx, q_heads, norm_eps_, q_norm_weight_, q_norm_bias_);
         k_heads = fm_attn_apply_qk_norm(ctx, k_heads, norm_eps_, k_norm_weight_, k_norm_bias_);
@@ -489,12 +517,34 @@ ggml_tensor * fmAttention::build_forward_chunk_graph(ggml_context * ctx,
     const int64_t B  = x->ne[2];
     const int H = num_heads_;
     const int D = head_dim_;
-    ggml_tensor * q = build_linear(ctx, x, to_q_weight_, to_q_bias_);
-    ggml_tensor * k = build_linear(ctx, x, to_k_weight_, to_k_bias_);
-    ggml_tensor * v = build_linear(ctx, x, to_v_weight_, to_v_bias_);
-    ggml_tensor * q_heads = fm_attn_reshape_heads_4d(ctx, q, D, H, dt, B);
-    ggml_tensor * k_heads = fm_attn_reshape_heads_4d(ctx, k, D, H, dt, B);
-    ggml_tensor * v_heads = fm_attn_reshape_heads_4d(ctx, v, D, H, dt, B);
+    ggml_tensor * q_heads = nullptr;
+    ggml_tensor * k_heads = nullptr;
+    ggml_tensor * v_heads = nullptr;
+    if (to_qkv_weight_ != nullptr) {
+        // Phase 2.3 fused QKV (chunk/streaming path); see build_forward_graph.
+        ggml_tensor * qkv = ggml_mul_mat(ctx, to_qkv_weight_, x);
+        if (to_qkv_bias_ != nullptr) {
+            qkv = ggml_add(ctx, qkv, to_qkv_bias_);
+        }
+        ggml_set_name(qkv, "fm_att_qkv_fused_chunk");
+        const size_t es        = sizeof(float);
+        const size_t nb1_head  = (size_t) D * es;
+        const size_t nb2_row   = qkv->nb[1];
+        const size_t nb3_plane = qkv->nb[2];
+        q_heads = ggml_view_4d(ctx, qkv, D, H, dt, B, nb1_head, nb2_row, nb3_plane, 0 * (size_t) C * es);
+        k_heads = ggml_view_4d(ctx, qkv, D, H, dt, B, nb1_head, nb2_row, nb3_plane, 1 * (size_t) C * es);
+        v_heads = ggml_view_4d(ctx, qkv, D, H, dt, B, nb1_head, nb2_row, nb3_plane, 2 * (size_t) C * es);
+        ggml_set_name(q_heads, "fm_att_q_heads_fused_chunk");
+        ggml_set_name(k_heads, "fm_att_k_heads_fused_chunk");
+        ggml_set_name(v_heads, "fm_att_v_heads_fused_chunk");
+    } else {
+        ggml_tensor * q = build_linear(ctx, x, to_q_weight_, to_q_bias_);
+        ggml_tensor * k = build_linear(ctx, x, to_k_weight_, to_k_bias_);
+        ggml_tensor * v = build_linear(ctx, x, to_v_weight_, to_v_bias_);
+        q_heads = fm_attn_reshape_heads_4d(ctx, q, D, H, dt, B);
+        k_heads = fm_attn_reshape_heads_4d(ctx, k, D, H, dt, B);
+        v_heads = fm_attn_reshape_heads_4d(ctx, v, D, H, dt, B);
+    }
     if (qk_norm_) {
         q_heads = fm_attn_apply_qk_norm(ctx, q_heads, norm_eps_, q_norm_weight_, q_norm_bias_);
         k_heads = fm_attn_apply_qk_norm(ctx, k_heads, norm_eps_, k_norm_weight_, k_norm_bias_);
@@ -1534,10 +1584,13 @@ void fmDiTBlock::set_attention_parameters(ggml_tensor * to_q_weight,
                                           ggml_tensor * k_norm_weight,
                                           ggml_tensor * k_norm_bias,
                                           ggml_tensor * proj_weight,
-                                          ggml_tensor * proj_bias) {
+                                          ggml_tensor * proj_bias,
+                                          ggml_tensor * to_qkv_weight,
+                                          ggml_tensor * to_qkv_bias) {
     if (attn_ != nullptr) {
         attn_->set_parameters(to_q_weight, to_q_bias, to_k_weight, to_k_bias, to_v_weight, to_v_bias, q_norm_weight,
-                              q_norm_bias, k_norm_weight, k_norm_bias, proj_weight, proj_bias);
+                              q_norm_bias, k_norm_weight, k_norm_bias, proj_weight, proj_bias, to_qkv_weight,
+                              to_qkv_bias);
     }
 }
 void fmDiTBlock::set_conv_parameters(ggml_tensor * conv1_weight,
@@ -1717,6 +1770,11 @@ fmFlowMatchingModelLoaderGGUF::~fmFlowMatchingModelLoaderGGUF() {
 // 释放旧资源并重置状态
 void fmFlowMatchingModelLoaderGGUF::reset() {
     tensors_.clear();
+    fused_qkv_.clear();
+    free_backend_buffer(buf_fused_);
+    buf_fused_ = nullptr;
+    free_ggml_context(ctx_fused_);
+    ctx_fused_ = nullptr;
     free_backend_buffer(buf_weights_);
     buf_weights_ = nullptr;
     free_ggml_context(ctx_data_);
@@ -1836,6 +1894,101 @@ bool fmFlowMatchingModelLoaderGGUF::load_from_file(const std::string & gguf_path
     }
     return true;
 }
+// Phase 2.3: build fused QKV weight/bias for all `depth` DiT blocks.
+// Allocates one extra backend buffer (ctx_fused_/buf_fused_) that holds
+// depth*(dim*3*dim + 3*dim) F32 scalars, downloads the existing to_{q,k,v}
+// weights/biases from backend via ggml_backend_tensor_get, concatenates them
+// on the host along the output dim (row axis ne[1] in ggml row-major), and
+// uploads the result back. Safe to call multiple times; a repeat call is a
+// no-op as long as depth/dim match the prior invocation.
+bool fmFlowMatchingModelLoaderGGUF::build_fused_qkv(int depth, int dim) {
+    if (depth <= 0 || dim <= 0) {
+        LOG_ERROR("fmFlowMatchingModelLoaderGGUF::build_fused_qkv: bad depth=%d dim=%d\n", depth, dim);
+        return false;
+    }
+    if (!backend_) {
+        LOG_ERROR("fmFlowMatchingModelLoaderGGUF::build_fused_qkv: backend is null\n");
+        return false;
+    }
+    if (!fused_qkv_.empty()) {
+        return static_cast<int>(fused_qkv_.size()) == depth;
+    }
+    const int64_t D    = static_cast<int64_t>(dim);
+    const int64_t D3   = 3 * D;
+    const size_t   es  = sizeof(float);
+    const size_t   w_elems = static_cast<size_t>(D * D3);
+    const size_t   b_elems = static_cast<size_t>(D3);
+    ggml_init_params fused_params{};
+    fused_params.mem_size   = static_cast<size_t>(2 * depth + 1) * ggml_tensor_overhead();
+    fused_params.mem_buffer = nullptr;
+    fused_params.no_alloc   = true;
+    ctx_fused_              = ggml_init(fused_params);
+    if (!ctx_fused_) {
+        LOG_ERROR("fmFlowMatchingModelLoaderGGUF::build_fused_qkv: ggml_init(ctx_fused) failed\n");
+        return false;
+    }
+    fused_qkv_.assign(static_cast<size_t>(depth), fmFusedQKV{});
+    for (int i = 0; i < depth; ++i) {
+        ggml_tensor * w = ggml_new_tensor_2d(ctx_fused_, GGML_TYPE_F32, D, D3);
+        ggml_tensor * b = ggml_new_tensor_1d(ctx_fused_, GGML_TYPE_F32, D3);
+        if (!w || !b) {
+            LOG_ERROR("fmFlowMatchingModelLoaderGGUF::build_fused_qkv: ggml_new_tensor_{1d,2d} failed at block %d\n", i);
+            return false;
+        }
+        const std::string tag_w = "fm.fused_qkv.w." + std::to_string(i);
+        const std::string tag_b = "fm.fused_qkv.b." + std::to_string(i);
+        ggml_set_name(w, tag_w.c_str());
+        ggml_set_name(b, tag_b.c_str());
+        fused_qkv_[static_cast<size_t>(i)] = fmFusedQKV{ w, b };
+    }
+    ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend_);
+    buf_fused_                       = ggml_backend_alloc_ctx_tensors_from_buft(ctx_fused_, buft);
+    if (!buf_fused_) {
+        LOG_ERROR("fmFlowMatchingModelLoaderGGUF::build_fused_qkv: alloc_ctx_tensors_from_buft failed\n");
+        return false;
+    }
+    ggml_backend_buffer_set_usage(buf_fused_, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    std::vector<float> host_w(w_elems);
+    std::vector<float> host_b(b_elems);
+    const size_t seg_w = static_cast<size_t>(D * D);  // per-(q|k|v) weight slab in floats
+    for (int i = 0; i < depth; ++i) {
+        const std::string prefix = "estimator.blocks." + std::to_string(i) + ".attn.";
+        ggml_tensor * q_w = get_tensor(prefix + "to_q.weight");
+        ggml_tensor * k_w = get_tensor(prefix + "to_k.weight");
+        ggml_tensor * v_w = get_tensor(prefix + "to_v.weight");
+        ggml_tensor * q_b = get_tensor(prefix + "to_q.bias");
+        ggml_tensor * k_b = get_tensor(prefix + "to_k.bias");
+        ggml_tensor * v_b = get_tensor(prefix + "to_v.bias");
+        if (!q_w || !k_w || !v_w || !q_b || !k_b || !v_b) {
+            LOG_ERROR("fmFlowMatchingModelLoaderGGUF::build_fused_qkv: missing src tensor at block %d\n", i);
+            return false;
+        }
+        auto shape_ok = [D](const ggml_tensor * t, int ndim_expected) {
+            if (!t || t->type != GGML_TYPE_F32) return false;
+            if (ndim_expected == 2) {
+                return t->ne[0] == D && t->ne[1] == D && t->ne[2] == 1 && t->ne[3] == 1;
+            }
+            return t->ne[0] == D && t->ne[1] == 1 && t->ne[2] == 1 && t->ne[3] == 1;
+        };
+        if (!shape_ok(q_w, 2) || !shape_ok(k_w, 2) || !shape_ok(v_w, 2) ||
+            !shape_ok(q_b, 1) || !shape_ok(k_b, 1) || !shape_ok(v_b, 1)) {
+            LOG_ERROR("fmFlowMatchingModelLoaderGGUF::build_fused_qkv: shape mismatch at block %d (expected [%lld,%lld] weight / [%lld] bias)\n",
+                      i, (long long) D, (long long) D, (long long) D);
+            return false;
+        }
+        ggml_backend_tensor_get(q_w, host_w.data() + 0 * seg_w, 0, seg_w * es);
+        ggml_backend_tensor_get(k_w, host_w.data() + 1 * seg_w, 0, seg_w * es);
+        ggml_backend_tensor_get(v_w, host_w.data() + 2 * seg_w, 0, seg_w * es);
+        ggml_backend_tensor_get(q_b, host_b.data() + 0 * D, 0, D * es);
+        ggml_backend_tensor_get(k_b, host_b.data() + 1 * D, 0, D * es);
+        ggml_backend_tensor_get(v_b, host_b.data() + 2 * D, 0, D * es);
+        ggml_tensor * w = fused_qkv_[static_cast<size_t>(i)].weight;
+        ggml_tensor * b = fused_qkv_[static_cast<size_t>(i)].bias;
+        ggml_backend_tensor_set(w, host_w.data(), 0, w_elems * es);
+        ggml_backend_tensor_set(b, host_b.data(), 0, b_elems * es);
+    }
+    return true;
+}
 // 按名称获取张量
 ggml_tensor * fmFlowMatchingModelLoaderGGUF::get_tensor(const std::string & name) const {
     const auto it = tensors_.find(name);
@@ -1948,19 +2101,39 @@ void backend_tensor_set(ggml_backend_t backend,
         ggml_backend_tensor_set(tensor, data, 0, size_bytes);
     }
 }
+// Phase 2.3: env gate for fused QKV. Default ON (returns true when unset or
+// non-"0"), opt-out with OMNI_T2W_FUSED_QKV=0.  Evaluated once per process.
+bool fm_fused_qkv_enabled() {
+    static const bool enabled = [] {
+        const char * s = std::getenv("OMNI_T2W_FUSED_QKV");
+        return (s == nullptr) || (s[0] != '0');
+    }();
+    return enabled;
+}
 // 把 gguf 权重绑定到 DiT 模型
-void fm_loader_bind_all_weights(const fmFlowMatchingModelLoaderGGUF & loader, fmDiT & dit) {
+void fm_loader_bind_all_weights(fmFlowMatchingModelLoaderGGUF & loader, fmDiT & dit) {
     fmTimestepEmbedder * te = dit.timestep_embedder();
     te->set_parameters(
         loader.get_tensor("estimator.t_embedder.mlp.0.weight"), loader.get_tensor("estimator.t_embedder.mlp.0.bias"),
         loader.get_tensor("estimator.t_embedder.mlp.2.weight"), loader.get_tensor("estimator.t_embedder.mlp.2.bias"));
     dit.set_parameters(loader.get_tensor("estimator.in_proj.weight"), loader.get_tensor("estimator.in_proj.bias"));
     auto & blocks = dit.blocks();
-    for (int i = 0; i < (int) blocks.size(); ++i) {
+    const int depth = (int) blocks.size();
+    // Phase 2.3: optionally pre-build fused QKV weights once per loader.
+    const bool fused_enabled = fm_fused_qkv_enabled() && depth > 0 && dit.hidden_size() > 0 &&
+                               loader.build_fused_qkv(depth, dit.hidden_size());
+    const auto & fused_qkv = loader.fused_qkv();
+    for (int i = 0; i < depth; ++i) {
         fmDiTBlock * blk = blocks[(size_t) i];
         blk->set_parameters(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
                             loader.get_tensor("estimator.blocks." + std::to_string(i) + ".adaLN_modulation.1.weight"),
                             loader.get_tensor("estimator.blocks." + std::to_string(i) + ".adaLN_modulation.1.bias"));
+        ggml_tensor * qkv_w = nullptr;
+        ggml_tensor * qkv_b = nullptr;
+        if (fused_enabled && (size_t) i < fused_qkv.size()) {
+            qkv_w = fused_qkv[(size_t) i].weight;
+            qkv_b = fused_qkv[(size_t) i].bias;
+        }
         blk->set_attention_parameters(
             loader.get_tensor("estimator.blocks." + std::to_string(i) + ".attn.to_q.weight"),
             loader.get_tensor("estimator.blocks." + std::to_string(i) + ".attn.to_q.bias"),
@@ -1973,7 +2146,7 @@ void fm_loader_bind_all_weights(const fmFlowMatchingModelLoaderGGUF & loader, fm
             loader.get_tensor("estimator.blocks." + std::to_string(i) + ".attn.k_norm.weight"),
             loader.get_tensor("estimator.blocks." + std::to_string(i) + ".attn.k_norm.bias"),
             loader.get_tensor("estimator.blocks." + std::to_string(i) + ".attn.proj.weight"),
-            loader.get_tensor("estimator.blocks." + std::to_string(i) + ".attn.proj.bias"));
+            loader.get_tensor("estimator.blocks." + std::to_string(i) + ".attn.proj.bias"), qkv_w, qkv_b);
         blk->set_conv_parameters(loader.get_tensor("estimator.blocks." + std::to_string(i) + ".conv.block.1.weight"),
                                  loader.get_tensor("estimator.blocks." + std::to_string(i) + ".conv.block.1.bias"),
                                  loader.get_tensor("estimator.blocks." + std::to_string(i) + ".conv.block.6.weight"),
@@ -6642,8 +6815,8 @@ bool bind_flow_extra_weights(const flowExtraModelLoaderGGUF & loader, flowCausal
     return true;
 }
 // 用于绑定flow_matching(DiT/CFM)权重
-bool bind_flow_matching_weights(const flow_matching::fmFlowMatchingModelLoaderGGUF & loader,
-                                flow_matching::fmDiT &                               dit) {
+bool bind_flow_matching_weights(flow_matching::fmFlowMatchingModelLoaderGGUF & loader,
+                                flow_matching::fmDiT &                         dit) {
     flow_matching::fmTimestepEmbedder * te = dit.timestep_embedder();
     if (!te) {
         LOG_ERROR( "bind_flow_matching_weights: timestep_embedder is null\n");
@@ -6654,8 +6827,17 @@ bool bind_flow_matching_weights(const flow_matching::fmFlowMatchingModelLoaderGG
         loader.get_tensor("estimator.t_embedder.mlp.2.weight"), loader.get_tensor("estimator.t_embedder.mlp.2.bias"));
     dit.set_parameters(loader.get_tensor("estimator.in_proj.weight"), loader.get_tensor("estimator.in_proj.bias"));
     auto & blocks = dit.blocks();
+    const int depth = (int) blocks.size();
+    // Phase 2.3: env gate for fused QKV (same policy as fm_loader_bind_all_weights).
+    static const bool fused_env_on = [] {
+        const char * s = std::getenv("OMNI_T2W_FUSED_QKV");
+        return (s == nullptr) || (s[0] != '0');
+    }();
+    const bool fused_enabled = fused_env_on && depth > 0 && dit.hidden_size() > 0 &&
+                               loader.build_fused_qkv(depth, dit.hidden_size());
+    const auto & fused_qkv = loader.fused_qkv();
     // 按block索引绑定每层注意力/卷积/MLP参数
-    for (int i = 0; i < (int) blocks.size(); ++i) {
+    for (int i = 0; i < depth; ++i) {
         flow_matching::fmDiTBlock * blk = blocks[(size_t) i];
         if (!blk) {
             LOG_ERROR( "bind_flow_matching_weights: null block at %d\n", i);
@@ -6664,6 +6846,12 @@ bool bind_flow_matching_weights(const flow_matching::fmFlowMatchingModelLoaderGG
         blk->set_parameters(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
                             loader.get_tensor("estimator.blocks." + std::to_string(i) + ".adaLN_modulation.1.weight"),
                             loader.get_tensor("estimator.blocks." + std::to_string(i) + ".adaLN_modulation.1.bias"));
+        ggml_tensor * qkv_w = nullptr;
+        ggml_tensor * qkv_b = nullptr;
+        if (fused_enabled && (size_t) i < fused_qkv.size()) {
+            qkv_w = fused_qkv[(size_t) i].weight;
+            qkv_b = fused_qkv[(size_t) i].bias;
+        }
         blk->set_attention_parameters(
             loader.get_tensor("estimator.blocks." + std::to_string(i) + ".attn.to_q.weight"),
             loader.get_tensor("estimator.blocks." + std::to_string(i) + ".attn.to_q.bias"),
@@ -6676,7 +6864,7 @@ bool bind_flow_matching_weights(const flow_matching::fmFlowMatchingModelLoaderGG
             loader.get_tensor("estimator.blocks." + std::to_string(i) + ".attn.k_norm.weight"),
             loader.get_tensor("estimator.blocks." + std::to_string(i) + ".attn.k_norm.bias"),
             loader.get_tensor("estimator.blocks." + std::to_string(i) + ".attn.proj.weight"),
-            loader.get_tensor("estimator.blocks." + std::to_string(i) + ".attn.proj.bias"));
+            loader.get_tensor("estimator.blocks." + std::to_string(i) + ".attn.proj.bias"), qkv_w, qkv_b);
         blk->set_conv_parameters(loader.get_tensor("estimator.blocks." + std::to_string(i) + ".conv.block.1.weight"),
                                  loader.get_tensor("estimator.blocks." + std::to_string(i) + ".conv.block.1.bias"),
                                  loader.get_tensor("estimator.blocks." + std::to_string(i) + ".conv.block.6.weight"),

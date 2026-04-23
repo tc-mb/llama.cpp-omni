@@ -27,8 +27,8 @@ namespace flow {
 class flowCausalMaskedDiffWithXvec;
 class flowExtraModelLoaderGGUF;
 bool bind_flow_extra_weights(const flowExtraModelLoaderGGUF & loader, flowCausalMaskedDiffWithXvec & flow);
-bool bind_flow_matching_weights(const flow_matching::fmFlowMatchingModelLoaderGGUF & loader,
-                                flow_matching::fmDiT &                               dit);
+bool bind_flow_matching_weights(flow_matching::fmFlowMatchingModelLoaderGGUF & loader,
+                                flow_matching::fmDiT &                         dit);
 bool bind_upsample_encoder_weights(const upsample_encoder_v2::ueUpsampleEncoderModelLoaderGGUF & loader,
                                    upsample_encoder_v2::ueUpsampleConformerEncoderV2 &           encoder);
 }  // namespace flow
@@ -164,7 +164,9 @@ class fmAttention {
                         ggml_tensor * k_norm_weight,
                         ggml_tensor * k_norm_bias,
                         ggml_tensor * proj_weight,
-                        ggml_tensor * proj_bias);
+                        ggml_tensor * proj_bias,
+                        ggml_tensor * to_qkv_weight = nullptr,
+                        ggml_tensor * to_qkv_bias   = nullptr);
     ggml_tensor * build_forward_graph(ggml_context * ctx, ggml_tensor * x, ggml_tensor * attn_mask) const;
     ggml_tensor * build_forward_chunk_graph(ggml_context * ctx,
                                             ggml_tensor *  x,
@@ -195,6 +197,12 @@ class fmAttention {
     ggml_tensor * k_norm_bias_   = nullptr;
     ggml_tensor * proj_weight_ = nullptr;
     ggml_tensor * proj_bias_   = nullptr;
+    // Phase 2.3: fused Q/K/V linear weights and bias (optional).
+    // When non-null, build_forward_graph / build_forward_chunk_graph replace
+    // three separate mul_mat+add with a single fused mul_mat+add, then slice
+    // via ggml_view_4d directly into [head_dim, num_heads, T, B] heads layout.
+    ggml_tensor * to_qkv_weight_ = nullptr;  // [dim, 3*dim]
+    ggml_tensor * to_qkv_bias_   = nullptr;  // [3*dim]
 };
 }  // namespace flow_matching
 }  // namespace omni
@@ -422,7 +430,9 @@ class fmDiTBlock {
                                   ggml_tensor * k_norm_weight,
                                   ggml_tensor * k_norm_bias,
                                   ggml_tensor * proj_weight,
-                                  ggml_tensor * proj_bias);
+                                  ggml_tensor * proj_bias,
+                                  ggml_tensor * to_qkv_weight = nullptr,
+                                  ggml_tensor * to_qkv_bias   = nullptr);
     void set_conv_parameters(ggml_tensor * conv1_weight,
                              ggml_tensor * conv1_bias,
                              ggml_tensor * conv2_weight,
@@ -519,6 +529,17 @@ class fmFlowMatchingModelLoaderGGUF {
     ggml_context * ctx_meta() const { return ctx_meta_; }
     ggml_context * ctx_data() const { return ctx_data_; }
     const std::string & path() const { return path_; }
+    ggml_backend_t backend() const { return backend_; }
+    // Phase 2.3: build fused QKV weight + bias for `depth` blocks.
+    // Returns nullptr on failure.  Pointers are owned by this loader and live
+    // as long as the loader instance.  Safe to call multiple times; repeat
+    // calls are a no-op.
+    struct fmFusedQKV {
+        ggml_tensor * weight = nullptr;  // [dim, 3*dim]
+        ggml_tensor * bias   = nullptr;  // [3*dim]
+    };
+    bool build_fused_qkv(int depth, int dim);
+    const std::vector<fmFusedQKV> & fused_qkv() const { return fused_qkv_; }
   private:
     void reset();
     std::string path_;
@@ -528,6 +549,12 @@ class fmFlowMatchingModelLoaderGGUF {
     ggml_backend_t        backend_     = nullptr;
     ggml_backend_buffer_t buf_weights_ = nullptr;
     std::unordered_map<std::string, ggml_tensor *> tensors_;
+    // Phase 2.3: dedicated context + backend buffer for fused qkv weights.
+    // Kept separate from ctx_data_/buf_weights_ so the original gguf-sourced
+    // tensors are untouched and ordinary bind still works when fused is off.
+    ggml_context *        ctx_fused_ = nullptr;
+    ggml_backend_buffer_t buf_fused_ = nullptr;
+    std::vector<fmFusedQKV> fused_qkv_;
 };
 }  // namespace flow_matching
 }  // namespace omni
