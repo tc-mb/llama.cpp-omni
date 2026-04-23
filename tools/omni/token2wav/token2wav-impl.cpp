@@ -966,30 +966,8 @@ ggml_tensor * fmCausalConditionalCFM::build_forward_chunk_graph(ggml_context *  
 namespace omni {
 namespace flow_matching {
 namespace {
-// 用 im2col 计算一维卷积。接受任意 batch（x_tcb->ne[2] = B），
-// **直接返回 [Cout, T_out, B]** —— 注意是 "ctb" 而不是原先的 "tcb"。
-//
-// 调用方原来用法：
-//     y_tcb = fm_causal_conv1d_im2col_f32_n1(w, x_tcb_b, ...)    // [T_out, Cout, 1]
-//     y_tcb = concat(y_tcb, ..., 2)                              // 沿 batch 拼接
-//     y     = cont(permute(y_tcb, 1, 0, 2, 3))                   // [Cout, T_out, B]
-// 新用法：
-//     y     = fm_causal_conv1d_im2col_f32_nB(w, x_tcb, ...)      // 直接 [Cout, T_out, B]
-// 省掉 1 次 batch-loop 里的 concat + 外面的一次 permute + cont。
-//
-// 推导：
-//     im2col   : [K*Cin, T_out, B]                              // is_2D=false 模式
-//     w_2d     : [K*Cin, Cout]                                  // ne[2]=1，相当于 "2D 的权重"
-//     mul_mat(w_2d, im2col)                                     // ggml 的 batched matmul：
-//        result ne = [w_2d->ne[1]=Cout,                         //   - ne[0] 取自 a->ne[1]
-//                     im2col->ne[1]=T_out,                      //   - ne[1] 取自 b->ne[1]
-//                     im2col->ne[2]=B,                          //   - ne[2] 取自 b->ne[2]  (batch 广播)
-//                     1]                                        //   - 可用性检查: b->ne[2] % a->ne[2] == B % 1 == 0 ✓
-//     result[c, t, b] = Σ_k w(k, c) * im2col(k, t, b)           //   - 即正确的卷积结果
-//     result 默认 contiguous，内存布局就是 [Cout 最快, T_out, B 最慢]。
-//
-// 阶段 1.A：去掉 CONCAT@token2wav-impl.cpp:1031/:989 + 外层 permute+cont。
-static ggml_tensor * fm_causal_conv1d_im2col_f32_nB(ggml_context * ctx,
+// 用 im2col 计算一维卷积
+static ggml_tensor * fm_causal_conv1d_im2col_f32_n1(ggml_context * ctx,
                                           ggml_tensor *  w_kic_oc,
                                           ggml_tensor *  x_tcb,
                                           int            stride,
@@ -998,30 +976,12 @@ static ggml_tensor * fm_causal_conv1d_im2col_f32_nB(ggml_context * ctx,
     const int64_t K    = w_kic_oc->ne[0];
     const int64_t Cin  = w_kic_oc->ne[1];
     const int64_t Cout = w_kic_oc->ne[2];
-    // 一次性批量 im2col（输出 [K*Cin, T_out, B, 1] contiguous），
-    // 然后把 (T_out, B) 摊平成一维，做一次 mul_mat，替代 B 次 per-batch mul_mat + 最后的 concat。
-    //
-    // mul_mat 参数顺序必须和 baseline 保持一致：mul_mat(im2col_2d, w_2d) —— 在 CPU backend 下
-    // llamafile_sgemm 会根据 (m=src0->ne[1], n=src1->ne[1]) 选择不同的微内核实现路径，swap 后会
-    // 走到不同的代码分支并出现明显数值漂移（实测 max abs diff 8244）。
-    // 单次批量 im2col（把 B 次 im2col 合并成 1 次，输出 [K*Cin, T_out, B, 1] contiguous）
-    ggml_tensor * im2col_full = ggml_im2col(ctx, w_kic_oc, x_tcb, stride, 0, padding, 0, dilation, 0, false, GGML_TYPE_F32);
-    const int64_t T_out       = im2col_full->ne[1];
-    const int64_t B           = im2col_full->ne[2];
-    ggml_tensor * w_2d        = ggml_reshape_2d(ctx, w_kic_oc, K * Cin, Cout);
-    // 按 batch 切 view + mul_mat（保持和 baseline 完全等价的 arg order 与 shape），
-    // 最后 concat 到 [T_out, Cout, B]，再 permute+cont 为 [Cout, T_out, B]。
-    ggml_tensor * y_tcb = nullptr;
-    for (int64_t b_idx = 0; b_idx < B; ++b_idx) {
-        const size_t  offset      = im2col_full->nb[2] * static_cast<size_t>(b_idx);
-        ggml_tensor * im2col_b    = ggml_view_2d(ctx, im2col_full, K * Cin, T_out,
-                                                 im2col_full->nb[1], offset);
-        ggml_tensor * mm_b        = ggml_mul_mat(ctx, im2col_b, w_2d);  // [T_out, Cout]
-        ggml_tensor * y_tcb_b     = ggml_reshape_3d(ctx, mm_b, T_out, Cout, 1);
-        y_tcb                     = (y_tcb == nullptr) ? y_tcb_b : ggml_concat(ctx, y_tcb, y_tcb_b, 2);
-    }
-    ggml_tensor * y_perm = ggml_permute(ctx, y_tcb, 1, 0, 2, 3);
-    return ggml_cont(ctx, y_perm);  // [Cout, T_out, B]
+    ggml_tensor * im2col = ggml_im2col(ctx, w_kic_oc, x_tcb, stride, 0, padding, 0, dilation, 0, false, GGML_TYPE_F32);
+    ggml_tensor * im2col_2d = ggml_reshape_2d(ctx, im2col, im2col->ne[0], im2col->ne[2] * im2col->ne[1]);
+    ggml_tensor * w_2d = ggml_reshape_2d(ctx, w_kic_oc, K * Cin, Cout);
+    ggml_tensor * mm = ggml_mul_mat(ctx, im2col_2d, w_2d);
+    ggml_tensor * y_tcb = ggml_reshape_3d(ctx, mm, im2col->ne[1], Cout, im2col->ne[2]);
+    return y_tcb;
 }
 }  // namespace
 fmCausalConv1d::fmCausalConv1d(int in_channels, int out_channels, int kernel_size) :
@@ -1047,9 +1007,20 @@ ggml_tensor * fmCausalConv1d::build_forward_graph(ggml_context * ctx, ggml_tenso
     x_tcb               = ggml_cont(ctx, x_tcb);
     const int     pad_left = static_cast<int>(K - 1);
     ggml_tensor * x_pad    = ggml_pad_ext(ctx, x_tcb, pad_left, 0, 0, 0, 0, 0, 0, 0);
-    // 1.A: 直接对全 B 做 im2col + 批量 mul_mat (输出为 [Cout, T_out, B] contiguous)。
-    (void) B;
-    ggml_tensor * y = fm_causal_conv1d_im2col_f32_nB(ctx, weight_, x_pad, 1, 0, 1);
+    ggml_tensor * y_tcb = nullptr;
+    for (int64_t b_idx = 0; b_idx < B; ++b_idx) {
+        const size_t  offset = x_pad->nb[2] * static_cast<size_t>(b_idx);
+        ggml_tensor * x_pad_b =
+            ggml_view_3d(ctx, x_pad, x_pad->ne[0], x_pad->ne[1], 1, x_pad->nb[1], x_pad->nb[2], offset);
+        ggml_tensor * y_tcb_b = fm_causal_conv1d_im2col_f32_n1(ctx, weight_, x_pad_b, 1, 0, 1);
+        if (y_tcb == nullptr) {
+            y_tcb = y_tcb_b;
+        } else {
+            y_tcb = ggml_concat(ctx, y_tcb, y_tcb_b, 2);
+        }
+    }
+    ggml_tensor * y = ggml_permute(ctx, y_tcb, 1, 0, 2, 3);
+    y               = ggml_cont(ctx, y);
     if (bias_ != nullptr) {
         ggml_tensor * bias_broadcast = ggml_reshape_3d(ctx, bias_, Cout, 1, 1);
         y                            = ggml_add(ctx, y, bias_broadcast);
@@ -1089,9 +1060,20 @@ ggml_tensor * fmCausalConv1d::build_forward_chunk_graph(ggml_context * ctx,
     x_tcb               = ggml_cont(ctx, x_tcb);
     ggml_tensor * x_cat_tcb = ggml_concat(ctx, cache_tcb, x_tcb, 0);
     x_cat_tcb               = ggml_cont(ctx, x_cat_tcb);
-    // 1.A: 直接对全 B 做 im2col + 批量 mul_mat，返回 y 已经是 [Cout, T_out, B]，不再需要 permute+cont。
-    (void) B;
-    ggml_tensor * y = fm_causal_conv1d_im2col_f32_nB(ctx, weight_, x_cat_tcb, 1, 0, 1);
+    ggml_tensor * y_tcb = nullptr;
+    for (int64_t b_idx = 0; b_idx < B; ++b_idx) {
+        const size_t  offset  = x_cat_tcb->nb[2] * static_cast<size_t>(b_idx);
+        ggml_tensor * x_cat_b = ggml_view_3d(ctx, x_cat_tcb, x_cat_tcb->ne[0], x_cat_tcb->ne[1], 1, x_cat_tcb->nb[1],
+                                             x_cat_tcb->nb[2], offset);
+        ggml_tensor * y_tcb_b = fm_causal_conv1d_im2col_f32_n1(ctx, weight_, x_cat_b, 1, 0, 1);
+        if (y_tcb == nullptr) {
+            y_tcb = y_tcb_b;
+        } else {
+            y_tcb = ggml_concat(ctx, y_tcb, y_tcb_b, 2);
+        }
+    }
+    ggml_tensor * y = ggml_permute(ctx, y_tcb, 1, 0, 2, 3);
+    y               = ggml_cont(ctx, y);
     if (bias_ != nullptr) {
         ggml_tensor * bias_broadcast = ggml_reshape_3d(ctx, bias_, Cout, 1, 1);
         y                            = ggml_add(ctx, y, bias_broadcast);
