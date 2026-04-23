@@ -103,6 +103,35 @@ static void omni_ggml_graph_print_with_names(ggml_cgraph * gf) {
     }
 }
 
+// token2wav 每次调用图的形状完全固定（chunk_size、n_timesteps、head_dim 都是编译期常量，
+// KV cache 到达 max_t_cache 后也不再增长），因此 ggml-cuda 对 GGML_OP_ADD 的
+// "src[1]->ne[1]>1 -> disable CUDA graph" 这条保守防御不适用。ggml-cuda 提供了
+// per-backend-instance 的 opt-in 扩展 "ggml_backend_cuda_set_allow_batched_add"，
+// 通过 ggml_backend_reg_get_proc_address 动态查询。这样：
+//   - 只影响当前这一条 CUDA backend 实例（t2m / vocoder），不会以 env/setenv 的方式
+//     污染整个进程；同进程内 llama.cpp decoder 等其他模块完全不受影响。
+//   - 扩展点不存在时（老版本 ggml、或非 CUDA 构建、或 ggml-cuda 未启用 USE_CUDA_GRAPH），
+//     proc_address 返回 nullptr，本函数直接 no-op，继续走原来的 eager 路径。
+// 用户仍可通过导出 GGML_CUDA_DISABLE_GRAPHS=1 在运行时全局禁用 CUDA Graph。
+static void omni_try_enable_cuda_batched_add(ggml_backend_t backend) {
+    if (!backend) {
+        return;
+    }
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    if (!dev) {
+        return;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (!reg) {
+        return;
+    }
+    auto setter = (ggml_backend_cuda_set_allow_batched_add_t)
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_set_allow_batched_add");
+    if (setter) {
+        setter(backend, /*allow=*/true);
+    }
+}
+
 #if ENABLE_STDERR_LOG
 #ifndef LOG_ERROR
 #define LOG_ERROR(...) std::fprintf(stderr, __VA_ARGS__)
@@ -2067,6 +2096,7 @@ ggml_backend_t fm_loader_init_backend_gpu_idx(int gpu_idx, std::string & backend
     }
     if (backend) {
         backend_name_out = ggml_backend_name(backend);
+        omni_try_enable_cuda_batched_add(backend);
     }
     return backend;
 }
@@ -3045,6 +3075,7 @@ ggml_backend_t ue_loader_init_backend_gpu_idx(int gpu_idx, std::string & backend
     }
     if (backend) {
         backend_name_out = ggml_backend_name(backend);
+        omni_try_enable_cuda_batched_add(backend);
     }
     return backend;
 }
@@ -6463,6 +6494,7 @@ bool voc_hg2_model::voc_hg2_model_init_from_gguf(const std::string & gguf_path_i
         voc_hg2_model_free();
         return false;
     }
+    omni_try_enable_cuda_batched_add(backend);
 
     if (!hg_backend_is_device(backend) && num_threads > 1) {
         ggml_backend_cpu_set_n_threads(backend, num_threads);
@@ -7073,6 +7105,7 @@ bool flowGGUFModelLoader::init_backend(const std::string & device) {
         }
         if (backend_) {
             backend_name_ = ggml_backend_name(backend_);
+            omni_try_enable_cuda_batched_add(backend_);
         }
         std::fprintf(stderr, "flowGGUFModelLoader: init_backend device=%s, gpu_idx=%d, backend=%s\n",
                 device.c_str(), gpu_idx, backend_name_.c_str());

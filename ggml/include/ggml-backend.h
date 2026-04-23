@@ -210,6 +210,11 @@ extern "C" {
         const char * value;
     };
     typedef struct ggml_backend_feature * (*ggml_backend_get_features_t)(ggml_backend_reg_t reg);
+    // (ggml-cuda only) Opt the given CUDA backend instance out of the
+    // "GGML_OP_ADD with src[1]->ne[1]>1 disables CUDA graph" guard.
+    // Only safe when every graph invocation on this backend has identical shapes.
+    // Obtain via ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_set_allow_batched_add").
+    typedef void                         (*ggml_backend_cuda_set_allow_batched_add_t)(ggml_backend_t backend, bool allow);
 
     //
     // Backend registry

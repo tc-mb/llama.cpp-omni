@@ -119,14 +119,9 @@ int main() {
     std::string device_token2mel   = env_or("OMNI_T2W_DEVICE", "gpu");
     std::string device_vocoder     = env_or("OMNI_T2W_DEVICE", "gpu");
 
-    // token2wav 每次调用图的形状完全固定（chunk_size、n_timesteps、head_dim 都是编译期常量，
-    // KV cache 到达 max_t_cache 后也不再增长），因此 CUDA Graph 的「ADD.ne[1]>1 -> disable」
-    // 这条保守防御不适用。开关该保护后，ggml-cuda 才能把 ~1000 次 cudaLaunchKernel 合并为
-    // 1 次 cudaGraphLaunch，把 GPU 总时长从 ~58ms/chunk 压到 ~40ms/chunk（-30%，MD5 完全一致）。
-    // 用户仍可通过导出 GGML_CUDA_DISABLE_GRAPHS=1 关闭 CUDA Graph。
-    if (device_token2mel.rfind("gpu", 0) == 0 || device_vocoder.rfind("gpu", 0) == 0) {
-        setenv("GGML_CUDA_GRAPH_ALLOW_BATCHED_ADD", "1", /*overwrite=*/0);
-    }
+    // 注：token2wav 的 CUDA Graph opt-in 已在 backend 创建完成之后通过 per-instance
+    // 扩展 API `ggml_backend_cuda_set_allow_batched_add` 完成（见 token2wav-impl.cpp
+    // 中的 omni_try_enable_cuda_batched_add），这里不再需要设置任何进程级 env。
 
     int       n_timesteps = std::atoi(env_or("OMNI_T2W_N_TIMESTEPS", "5").c_str());
     float     temperature = 1.0f;
