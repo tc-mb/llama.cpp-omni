@@ -64,6 +64,29 @@ static inline void omni_try_enable_cuda_batched_add(ggml_backend_t backend) {
     omni_set_cuda_batched_add(backend, /*allow=*/true);
 }
 
+// Temporarily bypass CUDA graph capture on this backend for a single compute call,
+// so that ONE graph ("gf_last" in token2wav's case) can run in eager mode WITHOUT
+// polluting the hot graph's properties cache / evicting its cached instance.
+// Becomes a no-op when the ggml-cuda build does not expose this setter.
+static void omni_set_cuda_disable_graph(ggml_backend_t backend, bool disable) {
+    if (!backend) {
+        return;
+    }
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    if (!dev) {
+        return;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (!reg) {
+        return;
+    }
+    auto setter = (ggml_backend_cuda_set_disable_graph_t)
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_set_disable_graph");
+    if (setter) {
+        setter(backend, disable);
+    }
+}
+
 #if ENABLE_STDERR_LOG
 #ifndef LOG_ERROR
 #define LOG_ERROR(...) std::fprintf(stderr, __VA_ARGS__)
@@ -7716,22 +7739,28 @@ bool flowGGUFModelRunner::inference_chunk(const int32_t *             token_bt,
     }
     {
         omni::flow::profile::ScopeTimer _t("t2m.compute");
-        // [PR25-GF_LAST-EAGER] 默认对 last_chunk 走 eager path；可 OMNI_T2W_DISABLE_LAST_GRAPH=0 回退。
-        // 原因：ggml-cuda 只维护 1 slot 的 CUDA Graph instance，gf_last 和 gf_nonlast 的 node 数/shape
-        // 不同 → 每次 chunk 切换（nonlast → last → nonlast）都会 destroy+re-instantiate，
-        // gf_last 会吃到 ~+50ms 的 graph capture 开销（在端到端 A/B 中表现为 wav_2 +79% 回归）。
-        // 把 gf_last 暂时关掉 allow_batched_add 让它走 eager 路径，gf_nonlast 不受影响，仍可 cache。
-        // 需要显式 OMNI_T2W_DISABLE_LAST_GRAPH=0 才会回到"gf_last 也走 CUDA Graph"的原行为。
+        // [PR25-GF_LAST-EAGER] 默认对 last_chunk 走 eager path：
+        // 此 backend 上两个图 gf_nonlast / gf_last 形状不同，而 ggml-cuda 每 backend 只保留 1 slot
+        // 的 CUDA graph instance。如果让 gf_last 也进 capture 路径（即使启用了 allow_batched_add），
+        // is_cuda_graph_update_required 会把 gf_last 的 properties 写进 cache，
+        // 下一个 gf_nonlast 立刻 update_required=true → 重 instantiate，稳态 instance 反复被驱逐。
+        //
+        // 策略：用 ggml-cuda 的扩展 setter set_disable_graph(backend, true) 在 last compute 周围
+        // 包一层"软关"——这条路径会在 compute 顶部短路 use_cuda_graph=false，
+        // is_cuda_graph_update_required 根本不会被调用，properties / instance 都不碰 → gf_nonlast
+        // 的 cache 保持热。跑完立刻恢复 false。
+        //
+        // 可通过 OMNI_T2W_DISABLE_LAST_GRAPH=0 强制关闭此行为（所有 chunk 一视同仁，仅用于对照实验）。
         const bool disable_last_graph = last_chunk && [] {
             const char * e = std::getenv("OMNI_T2W_DISABLE_LAST_GRAPH");
-            return !e || std::string(e) != "0";
+            return !e || std::string(e) != "0"; // default on; "0" to opt out
         }();
         if (disable_last_graph) {
-            omni_set_cuda_batched_add(loader_.backend(), /*allow=*/false);
+            omni_set_cuda_disable_graph(loader_.backend(), /*disable=*/true);
         }
         const ggml_status st = ggml_backend_graph_compute(loader_.backend(), gf);
         if (disable_last_graph) {
-            omni_set_cuda_batched_add(loader_.backend(), /*allow=*/true);
+            omni_set_cuda_disable_graph(loader_.backend(), /*disable=*/false);
         }
         if (st != GGML_STATUS_SUCCESS) {
             return false;
