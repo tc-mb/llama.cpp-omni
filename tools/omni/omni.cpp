@@ -3186,11 +3186,14 @@ void sliding_window_reset(struct omni_context * ctx_omni) {
     ctx_omni->pending_unit_start_cache_len = 0;
     ctx_omni->system_preserve_length = 0;
     ctx_omni->position_offset = 0;
-    
+    ctx_omni->current_turn_id = 0;
+
     // 统计信息
     ctx_omni->sliding_event_count = 0;
     ctx_omni->total_dropped_tokens = 0;
     ctx_omni->total_dropped_units = 0;
+    ctx_omni->total_dropped_turns = 0;
+    ctx_omni->total_unit_fallbacks = 0;
     
     if (old_unit_count > 0) {
         print_with_timestamp("[SW] reset: cleared %d units, all sliding window state reset\n", old_unit_count);
@@ -3250,12 +3253,14 @@ void sliding_window_register_unit_end(struct omni_context * ctx_omni,
         entry.type = input_type;
         entry.generated_tokens = generated_tokens;
         entry.is_listen = is_listen;
-        
+        // 归属到当前正在构建的 turn；turn 边界处由 stream_decode 负责 current_turn_id++
+        entry.turn_id = ctx_omni->current_turn_id;
+
         ctx_omni->unit_history.push_back(entry);
-        
-        print_with_timestamp("[SW] unit_end: unit_id=%d type=%s len=%d gen_tokens=%zu is_listen=%d | cache=%d preserve=%d total_units=%zu\n",
+
+        print_with_timestamp("[SW] unit_end: unit_id=%d type=%s len=%d gen_tokens=%zu is_listen=%d turn_id=%d | cache=%d preserve=%d total_units=%zu\n",
                             entry.unit_id, entry.type.c_str(), entry.length,
-                            entry.generated_tokens.size(), entry.is_listen,
+                            entry.generated_tokens.size(), entry.is_listen, entry.turn_id,
                             current_cache_len, ctx_omni->system_preserve_length,
                             ctx_omni->unit_history.size());
     } else {
@@ -3388,6 +3393,96 @@ static bool sliding_window_drop_unit(struct omni_context * ctx_omni, int unit_id
 }
 
 /**
+ * 🔧 [turn 级滑窗] 删除最早的一个已完成 turn（按 turn 粒度一次性丢）
+ *
+ * 行为：
+ *   1. 在 unit_history 里找到第一条非 system unit 的 turn_id（记为 earliest）。
+ *   2. 如果 earliest >= current_turn_id，说明 unit_history 里只剩下当前还没收尾的 turn，
+ *      这种情况下函数返回 false，交给上层退化成按 unit 删。
+ *   3. 否则收集"前缀"中所有非 system 且 turn_id == earliest 的 unit，把它们的 length
+ *      累加起来一次性从 KV cache 中丢掉，并从 unit_history 里擦除对应条目。
+ *
+ * 设计依据：
+ *   - UnitEntry 是按时间顺序 push 进 unit_history 的，turn_id 单调不降，
+ *     所以最小 turn_id 的 unit 一定集中在 unit_history 的前缀段。
+ *   - 用一次 sliding_window_drop_tokens_from_cache(total_len) 来移动 KV，
+ *     比 per-unit 循环调用更省：只做一次 llama_memory_seq_rm + 一次 seq_add。
+ *
+ * @return true 成功丢掉一个完整 turn；false 表示当前没有"已完成且非 system"的 turn 可丢
+ */
+static bool sliding_window_drop_next_turn(struct omni_context * ctx_omni) {
+    if (!ctx_omni || ctx_omni->unit_history.empty()) {
+        return false;
+    }
+
+    // 1) 找到最早一条非 system unit 的 turn_id
+    int earliest_turn = -1;
+    for (const auto & e : ctx_omni->unit_history) {
+        if (e.type == "system") continue;
+        earliest_turn = e.turn_id;
+        break;
+    }
+    if (earliest_turn < 0) {
+        // 只剩 system 条目，没什么可丢的
+        return false;
+    }
+
+    // 2) 判断这个 turn 是否已经完结
+    //    - current_turn_id 指向"正在构建中的 turn"，它 ≥ earliest_turn
+    //    - 只有当 earliest_turn < current_turn_id 时，earliest_turn 才真正已经收尾，
+    //      这时按 turn 一次性丢掉才安全（不会把活跃轮次从中间砍半）
+    //    - 否则（只剩当前 turn）返回 false，让 enforce 退化到按 unit 丢
+    if (earliest_turn >= ctx_omni->current_turn_id) {
+        print_with_timestamp("[SW] drop_next_turn: only current turn (turn_id=%d) left in history, "
+                             "fall back to unit-level drop\n", earliest_turn);
+        return false;
+    }
+
+    // 3) 收集前缀里所有 turn_id == earliest_turn 的非 system unit
+    //    （遇到 turn_id 更大的 unit 就停；system 单独跳过但不打断）
+    int total_len = 0;
+    int n_units   = 0;
+    for (const auto & e : ctx_omni->unit_history) {
+        if (e.type == "system") continue;
+        if (e.turn_id != earliest_turn) break;
+        total_len += e.length;
+        n_units++;
+    }
+
+    if (total_len <= 0 || n_units == 0) {
+        // 理论上不会走到这里（turn 内若全是零长度 unit 也没必要丢），保底
+        print_with_timestamp("[SW] drop_next_turn: turn_id=%d has no droppable length (n_units=%d)\n",
+                             earliest_turn, n_units);
+        return false;
+    }
+
+    int cache_before = get_cache_length(ctx_omni);
+    if (!sliding_window_drop_tokens_from_cache(ctx_omni, total_len)) {
+        print_with_timestamp("[SW] drop_next_turn: drop_tokens_from_cache failed "
+                             "(turn_id=%d, total_len=%d)\n", earliest_turn, total_len);
+        return false;
+    }
+
+    // 4) 从 unit_history 里擦除刚刚丢掉的 n_units 条非 system unit（保留可能混入的 system 条目）
+    int removed = 0;
+    for (auto it = ctx_omni->unit_history.begin();
+         it != ctx_omni->unit_history.end() && removed < n_units; ) {
+        if (it->type == "system") { ++it; continue; }
+        if (it->turn_id != earliest_turn) break;  // 防御性：不该跨 turn
+        it = ctx_omni->unit_history.erase(it);
+        removed++;
+    }
+
+    int cache_after = get_cache_length(ctx_omni);
+    print_with_timestamp("[SW] 🗑️ DROPPED turn_id=%d: %d units, %d tokens | cache %d -> %d, "
+                         "remaining_units=%zu, current_turn_id=%d\n",
+                         earliest_turn, n_units, total_len,
+                         cache_before, cache_after,
+                         ctx_omni->unit_history.size(), ctx_omni->current_turn_id);
+    return true;
+}
+
+/**
  * 删除最早的一个非 system unit
  */
 static bool sliding_window_drop_next_unit(struct omni_context * ctx_omni) {
@@ -3433,39 +3528,100 @@ bool sliding_window_enforce(struct omni_context * ctx_omni) {
         return false;  // 未超过高水位线，不触发
     }
     
-    // 超过高水位线，开始滑窗
-    print_with_timestamp("[SW] ⚡ SLIDING TRIGGERED: cache=%d > high_water=%d, target=low_water=%d\n",
-                        cache_len_before, cfg.high_water_tokens, cfg.low_water_tokens);
-    
-    int dropped_count = 0;
+    // 🔧 [增量开发] 只有新增的 "turn" 模式才走 turn-first / unit-fallback 的新路径，
+    //   其它任何已有模式（"basic"/"context"/未来扩展）继续按 unit 粒度丢，保证老行为一字不动。
+    const bool turn_mode = (cfg.mode == "turn");
+
+    if (turn_mode) {
+        print_with_timestamp("[SW] ⚡ SLIDING TRIGGERED: mode=turn cache=%d > high_water=%d, target=low_water=%d, "
+                            "current_turn_id=%d, units=%zu\n",
+                            cache_len_before, cfg.high_water_tokens, cfg.low_water_tokens,
+                            ctx_omni->current_turn_id, ctx_omni->unit_history.size());
+    } else {
+        // 老日志格式保持原样，避免已有分析脚本/对照测试被扰动
+        print_with_timestamp("[SW] ⚡ SLIDING TRIGGERED: cache=%d > high_water=%d, target=low_water=%d\n",
+                            cache_len_before, cfg.high_water_tokens, cfg.low_water_tokens);
+    }
+
+    // 命名约定（与 omni_context 字段对齐，避免 turn / 非 turn 两套含义混淆）：
+    //   dropped_turns      : 本次 enforce 里"整 turn 丢"成功的次数
+    //   dropped_units      : 本次 enforce 里被移除的 UnitEntry 总条目数
+    //                        （turn 模式 = 整 turn 丢带走的 + fallback 丢的；非 turn 模式 = 按 unit 丢的）
+    //   unit_fallbacks     : 仅 turn 模式 —— 整 turn 丢不动退化到按 unit 丢的次数
+    int dropped_turns   = 0;
+    int dropped_units   = 0;
+    int unit_fallbacks  = 0;
     int cache_len = cache_len_before;
-    
+
     while (cache_len > cfg.low_water_tokens) {
-        if (!sliding_window_drop_next_unit(ctx_omni)) {
-            print_with_timestamp("[SW] enforce_window: no more units to drop, stopping\n");
+        bool dropped_one = false;
+
+        if (turn_mode) {
+            // 🔧 [turn 级滑窗 + unit 级兜底]
+            //   - 主策略：整 turn 丢（把"用户输入 + 模型回复"当一块记忆），语义连贯；
+            //   - 兜底：当 unit_history 里只剩下当前还没收尾的 turn（drop_next_turn 返回 false）
+            //     时退化到按 unit 丢，避免"一轮超长、整 turn 又丢不动"把长对话卡死。
+            int units_before = (int)ctx_omni->unit_history.size();
+            if (sliding_window_drop_next_turn(ctx_omni)) {
+                dropped_turns++;
+                dropped_units += units_before - (int)ctx_omni->unit_history.size();
+                dropped_one = true;
+            } else if (sliding_window_drop_next_unit(ctx_omni)) {
+                unit_fallbacks++;   // fallback 计数（turn 模式专属）
+                dropped_units++;    // 同时计入总量
+                dropped_one = true;
+            }
+        } else {
+            // 原有行为：按 unit 丢（basic / context / 其它未列模式）
+            if (sliding_window_drop_next_unit(ctx_omni)) {
+                dropped_units++;
+                dropped_one = true;
+            }
+        }
+
+        if (!dropped_one) {
+            print_with_timestamp("[SW] enforce_window: no more %s to drop, stopping (cache=%d, units=%zu)\n",
+                                turn_mode ? "turns/units" : "units",
+                                cache_len, ctx_omni->unit_history.size());
             break;
         }
-        dropped_count++;
         cache_len = get_cache_length(ctx_omni);
     }
-    
-    if (dropped_count > 0) {
+
+    // 兼容旧返回语义：是否发生过任意"丢"动作
+    int dropped_actions = dropped_turns + (turn_mode ? unit_fallbacks : dropped_units);
+    if (dropped_units > 0 || dropped_turns > 0) {
         // 更新统计
         ctx_omni->sliding_event_count++;
-        ctx_omni->total_dropped_tokens += cache_len_before - cache_len;
-        ctx_omni->total_dropped_units += dropped_count;
-        
+        ctx_omni->total_dropped_tokens    += cache_len_before - cache_len;
+        ctx_omni->total_dropped_units     += dropped_units;     // 两种模式语义统一：被移除的 UnitEntry 总数
+        ctx_omni->total_dropped_turns     += dropped_turns;     // 仅 turn 模式 > 0
+        ctx_omni->total_unit_fallbacks    += unit_fallbacks;    // 仅 turn 模式 > 0
+
         // 一致性检查
         int expected = ctx_omni->system_preserve_length;
         for (const auto& u : ctx_omni->unit_history) {
             expected += u.length;
         }
         bool is_consistent = (expected == cache_len);
-        
-        print_with_timestamp("[SW] ✅ SLIDING DONE: cache %d -> %d, dropped %d units, remaining %zu units | consistency: expected=%d actual=%d %s\n",
-                            cache_len_before, cache_len, dropped_count, ctx_omni->unit_history.size(),
-                            expected, cache_len, is_consistent ? "✓" : "✗ MISMATCH!");
-        
+
+        if (turn_mode) {
+            print_with_timestamp("[SW] ✅ SLIDING DONE: cache %d -> %d, "
+                                "dropped %d turns + %d unit-fallbacks (total %d unit entries removed), "
+                                "remaining %zu units | consistency: expected=%d actual=%d %s\n",
+                                cache_len_before, cache_len,
+                                dropped_turns, unit_fallbacks, dropped_units,
+                                ctx_omni->unit_history.size(),
+                                expected, cache_len, is_consistent ? "✓" : "✗ MISMATCH!");
+        } else {
+            // 保持老日志格式不变，方便已有分析脚本 / 对照测试
+            print_with_timestamp("[SW] ✅ SLIDING DONE: cache %d -> %d, dropped %d units, remaining %zu units | "
+                                "consistency: expected=%d actual=%d %s\n",
+                                cache_len_before, cache_len, dropped_units,
+                                ctx_omni->unit_history.size(),
+                                expected, cache_len, is_consistent ? "✓" : "✗ MISMATCH!");
+        }
+
         if (!is_consistent) {
             print_with_timestamp("[SW] ❌ CONSISTENCY ERROR! preserve=%d + sum(units)=%d != cache=%d, offset=%d\n",
                                 ctx_omni->system_preserve_length,
@@ -3473,8 +3629,8 @@ bool sliding_window_enforce(struct omni_context * ctx_omni) {
                                 cache_len, ctx_omni->position_offset);
         }
     }
-    
-    return dropped_count > 0;
+
+    return dropped_actions > 0;
 }
 
 //
@@ -9717,6 +9873,8 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
         ctx_omni->round_start_positions.push_back(ctx_omni->n_past);
         print_with_timestamp("📍 轮次 %zu 结束，记录边界于 n_past=%d\n",
                              ctx_omni->round_start_positions.size(), ctx_omni->n_past);
+        // 🔧 [turn 级滑窗] 本 turn 已完结，之后注册的 UnitEntry 归入下一个 turn
+        ctx_omni->current_turn_id++;
         
         // 🔧 [整合] 为下一轮准备 <|im_end|>\n<|im_start|>user\n
         // 第一轮的 <|im_start|>user\n 在 sys prompt 末尾
@@ -9774,14 +9932,17 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
                 entry.length  = response_len;
                 entry.type    = "response";
                 entry.is_listen = ctx_omni->ended_with_listen.load();
+                // response 段和同轮的 prefill unit 共享 turn_id，
+                // 这样按 turn 丢时会把“用户输入 + 模型回复”作为一个整体一次性丢掉。
+                entry.turn_id = ctx_omni->current_turn_id;
                 // generated_tokens 暂不在这里收集：decode 的 token 流已经通过
                 // text_queue / TTS 通道处理掉了，这里只关心 KV 长度的记账。
                 ctx_omni->unit_history.push_back(entry);
 
                 print_with_timestamp(
                     "[SW] register response unit: unit_id=%d type=response len=%d "
-                    "is_listen=%d | cache=%d preserve=%d total_units=%zu\n",
-                    entry.unit_id, entry.length, (int)entry.is_listen,
+                    "is_listen=%d turn_id=%d | cache=%d preserve=%d total_units=%zu\n",
+                    entry.unit_id, entry.length, (int)entry.is_listen, entry.turn_id,
                     decode_end_cache_len, ctx_omni->system_preserve_length,
                     ctx_omni->unit_history.size());
             } else {
@@ -9801,6 +9962,9 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
             ctx_omni->round_start_positions.push_back(ctx_omni->n_past);
             print_with_timestamp("📍 round boundary at n_past=%d, total rounds=%zu\n",
                                  ctx_omni->n_past, ctx_omni->round_start_positions.size());
+            // 🔧 [turn 级滑窗] 双工下以 ended_with_listen 作为一个完整 turn 的结束
+            //   （一个 turn 覆盖 [unit+SPEAK...unit+LISTEN] 的完整闭环）
+            ctx_omni->current_turn_id++;
         }
     } else {
         // clean_kvcache(ctx_omni);
