@@ -97,9 +97,15 @@ struct SlidingWindowConfig {
 struct UnitEntry {
     int unit_id = -1;              // Unit ID
     int length = 0;                // 该 unit 在 cache 中的长度（tokens 数）
-    std::string type;              // 类型: "audio" / "video" / "omni" / "system"
+    std::string type;              // 类型: "audio" / "video" / "omni" / "system" / "response"
     std::vector<llama_token> generated_tokens;  // 生成的 tokens
     bool is_listen = false;        // 是否是 listen 状态
+    // 🔧 [turn 级滑窗] 该 unit 所属 turn 的 id
+    // 一个 turn = 一轮完整的 [用户输入 prefill + 模型 response] 序列
+    // 同一 turn 内的 prefill unit 和 response unit 共享同一个 turn_id，
+    // turn 结束（TURN_EOS / ended_with_listen 等）时 current_turn_id++，
+    // 滑窗时优先把整个最早的已完成 turn 一次性丢掉。
+    int turn_id = 0;
 };
 
 struct projector_hparams {
@@ -186,9 +192,21 @@ struct omni_context {
     int position_offset = 0;
     
     // 滑窗统计
-    int sliding_event_count = 0;    // 滑窗触发次数
-    int total_dropped_tokens = 0;   // 总共丢弃的 token 数
-    int total_dropped_units = 0;    // 总共丢弃的 unit 数
+    int sliding_event_count = 0;         // 滑窗触发次数
+    int total_dropped_tokens = 0;        // 总共丢弃的 token 数
+    int total_dropped_units = 0;         // 总共被移除的 UnitEntry 条目数；
+                                         //   两种模式语义统一：turn 模式下含"整 turn 丢带走的 + fallback 丢的"，
+                                         //   非 turn 模式下就是按 unit 丢的总数
+    int total_dropped_turns = 0;         // 总共丢弃的 turn 数（按 turn 粒度）；非 turn 模式恒为 0
+    int total_unit_fallbacks = 0;        // 仅 turn 模式：整 turn 丢不动 → 退化按 unit 丢的次数；
+                                         //   非 turn 模式恒为 0
+
+    // 🔧 [turn 级滑窗] 当前正在构建的 turn id
+    // 每个 UnitEntry 注册时会被打上 current_turn_id，
+    // 在 turn 边界（round_start_positions 推进处）会把 current_turn_id++。
+    // sliding_window_enforce 先按 turn 丢，当 unit_history 里只剩 turn_id == current_turn_id
+    // 的 unit（即只剩当前正在构建、还没收尾的 turn）时，退化为按 unit 丢。
+    int current_turn_id = 0;
     
     bool async = false;
     std::thread llm_thread;
