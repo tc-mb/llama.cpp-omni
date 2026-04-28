@@ -3123,7 +3123,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     if (disable_cuda_graphs_due_to_env
         || cuda_ctx->cuda_graph->disable_due_to_gpu_arch
         || cuda_ctx->cuda_graph->disable_due_to_too_many_updates
-        || cuda_ctx->cuda_graph->disable_due_to_failed_graph_capture) {
+        || cuda_ctx->cuda_graph->disable_due_to_failed_graph_capture
+        || cuda_ctx->cuda_graph->disable_graph) {
         use_cuda_graph = false;
     }
 
@@ -3861,6 +3862,28 @@ static void ggml_backend_cuda_set_allow_batched_add(ggml_backend_t backend, bool
 #endif
 }
 
+// Extension setter reached via ggml_backend_reg_get_proc_address("ggml_backend_cuda_set_disable_graph").
+// When set to true on a backend instance, the NEXT ggml_backend_graph_compute call on
+// that backend bypasses the CUDA graph machinery entirely (no properties-cache update,
+// no capture, no instantiate). Intended for callers that alternate between a hot
+// graph (kept cached) and a rare "cold" graph that should NOT evict the hot graph's
+// cached instance — e.g. token2wav's gf_nonlast (hot) vs gf_last (cold).
+// The caller is expected to re-set it to false after the cold compute completes.
+// No-op when ggml-cuda was built without USE_CUDA_GRAPH.
+static void ggml_backend_cuda_set_disable_graph(ggml_backend_t backend, bool disable) {
+    GGML_ASSERT(ggml_backend_is_cuda(backend));
+#ifdef USE_CUDA_GRAPH
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    if (cuda_ctx->cuda_graph == nullptr) {
+        cuda_ctx->cuda_graph.reset(new ggml_cuda_graph());
+    }
+    cuda_ctx->cuda_graph->disable_graph = disable;
+#else
+    GGML_UNUSED(backend);
+    GGML_UNUSED(disable);
+#endif
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_split_buffer_type") == 0) {
@@ -3877,6 +3900,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_set_allow_batched_add") == 0) {
         return (void *)ggml_backend_cuda_set_allow_batched_add;
+    }
+    if (strcmp(name, "ggml_backend_cuda_set_disable_graph") == 0) {
+        return (void *)ggml_backend_cuda_set_disable_graph;
     }
     return nullptr;
 }

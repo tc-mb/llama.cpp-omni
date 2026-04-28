@@ -215,6 +215,15 @@ extern "C" {
     // Only safe when every graph invocation on this backend has identical shapes.
     // Obtain via ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_set_allow_batched_add").
     typedef void                         (*ggml_backend_cuda_set_allow_batched_add_t)(ggml_backend_t backend, bool allow);
+    // (ggml-cuda only) Temporarily bypass the CUDA graph capture machinery on the given
+    // backend instance. When set to true, the next ggml_backend_graph_compute() skips
+    // is_cuda_graph_update_required / capture / instantiate entirely — the cached
+    // ggml_graph_properties and instance are NOT touched, so a *hot* graph's cache
+    // stays intact across a *cold* graph's one-off eager run. The caller must set it
+    // back to false afterwards. Intended for workloads that alternate between two
+    // structurally different graphs where only the hot one benefits from CUDA graph.
+    // Obtain via ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_set_disable_graph").
+    typedef void                         (*ggml_backend_cuda_set_disable_graph_t)(ggml_backend_t backend, bool disable);
 
     //
     // Backend registry
