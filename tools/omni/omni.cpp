@@ -685,46 +685,143 @@ struct omni_embed * omni_audio_embed_make_with_filename(struct audition_ctx * ct
 //
 static void kv_cache_slide_window(struct omni_context* ctx_omni, common_params* params, int chunk_size) {
     const int n_ctx = params->n_ctx;
-    
-    // 检查是否需要滑动窗口
+
+    // ==================== 双工模式：按轮次边界智能清理 ====================
+    if (ctx_omni->duplex_mode) {
+        const int duplex_trigger = std::max(ctx_omni->n_keep, n_ctx - 2048);
+
+        if (ctx_omni->n_past + chunk_size < duplex_trigger) {
+            return;
+        }
+
+        // defer：生成中 / TTS 忙 / 正在 SPEAK 时不滑窗，除非快要撞上 n_ctx 硬限制
+        bool generating    = ctx_omni->text_streaming;
+        bool tts_busy      = !ctx_omni->speek_done;
+        bool mid_speak     = !ctx_omni->slide_last_was_listen.load();
+        bool force_slide   = (ctx_omni->n_past + chunk_size >= n_ctx - 512);
+
+        if (!force_slide && (generating || tts_busy || mid_speak)) {
+            return;
+        }
+        if (force_slide) {
+            print_with_timestamp("⚠️ slide FORCE: n_past=%d approaching n_ctx=%d\n",
+                                 ctx_omni->n_past, n_ctx);
+        }
+
+        int old_n_past = ctx_omni->n_past;
+        const auto& rounds = ctx_omni->round_start_positions;
+        const int total_rounds = (int)rounds.size();
+
+        print_with_timestamp("⚠️ slide TRIGGERED: n_past=%d, chunk=%d, trigger=%d, n_ctx=%d, n_keep=%d, rounds=%d\n",
+                             ctx_omni->n_past, chunk_size, duplex_trigger, n_ctx,
+                             ctx_omni->n_keep, total_rounds);
+
+        if (total_rounds < 2) {
+            // 轮次边界不足（一轮超长对话）：不做全量清空，尽量保留最近一段 KV。
+            // 原行为是丢掉 [n_keep, n_past)，模型立刻失忆 → 连续长对话下触发后模型会
+            // 陷入长时间 LISTEN / 彻底失控（case 3、case 4）。
+            // 改为按 tail window 保留最近 target_keep_tokens，通过左移 KV 对齐位置。
+            const int target_keep_tokens = std::max(n_ctx / 4, 2048);
+            int keep_from = ctx_omni->n_past - target_keep_tokens;
+            keep_from = std::max(keep_from, ctx_omni->n_keep);
+            int n_discard = keep_from - ctx_omni->n_keep;
+
+            if (n_discard <= 0) {
+                print_with_timestamp("⚠️ slide skipped (rounds<2): nothing to discard (n_past=%d, target_keep=%d)\n",
+                                     ctx_omni->n_past, target_keep_tokens);
+            } else {
+                llama_memory_t mem = llama_get_memory(ctx_omni->ctx_llama);
+                if (mem) {
+                    llama_memory_seq_rm(mem, 0, ctx_omni->n_keep, keep_from);
+                    llama_memory_seq_add(mem, 0, keep_from, ctx_omni->n_past, -n_discard);
+                }
+                ctx_omni->n_past -= n_discard;
+                // 没有可信的 round boundary 了，清空以避免后续按错位的 boundary 切割
+                ctx_omni->round_start_positions.clear();
+                if (ctx_omni->ctx_tts_llama) {
+                    llama_memory_t tts_mem = llama_get_memory(ctx_omni->ctx_tts_llama);
+                    if (tts_mem) llama_memory_seq_rm(tts_mem, 0, 0, -1);
+                    ctx_omni->tts_n_past_accumulated = 0;
+                    ctx_omni->tts_all_generated_tokens.clear();
+                    ctx_omni->tts_condition_saved = false;
+                }
+                print_with_timestamp("⚠️ slide DONE: rounds<2 tail-keep: n_past %d→%d, freed %d (kept last %d), TTS KV cleared\n",
+                                     old_n_past, ctx_omni->n_past, n_discard, target_keep_tokens);
+            }
+        } else {
+            // 保留约 n_ctx/4 的上下文，按 round boundary 对齐截断
+            const int target_keep_tokens = std::max(n_ctx / 4, 2048);
+            const int min_keep_from_pos  = ctx_omni->n_past - target_keep_tokens;
+
+            int keep_from = rounds[total_rounds - 2];
+            for (int i = 0; i <= total_rounds - 2; i++) {
+                if (rounds[i] >= min_keep_from_pos) {
+                    keep_from = rounds[i];
+                    break;
+                }
+            }
+            keep_from = std::max(keep_from, ctx_omni->n_keep);
+
+            int n_discard = keep_from - ctx_omni->n_keep;
+
+            if (n_discard <= 0) {
+                print_with_timestamp("⚠️ slide: nothing to discard (keep_from=%d <= n_keep=%d)\n",
+                                     keep_from, ctx_omni->n_keep);
+            } else {
+                llama_memory_t mem = llama_get_memory(ctx_omni->ctx_llama);
+                if (mem) {
+                    llama_memory_seq_rm(mem, 0, ctx_omni->n_keep, keep_from);
+                    llama_memory_seq_add(mem, 0, keep_from, ctx_omni->n_past, -n_discard);
+                }
+                ctx_omni->n_past -= n_discard;
+
+                std::vector<int> new_rounds;
+                for (int i = 0; i < total_rounds; i++) {
+                    if (rounds[i] > keep_from) {
+                        new_rounds.push_back(rounds[i] - n_discard);
+                    }
+                }
+                ctx_omni->round_start_positions = new_rounds;
+
+                if (ctx_omni->ctx_tts_llama) {
+                    llama_memory_t tts_mem = llama_get_memory(ctx_omni->ctx_tts_llama);
+                    if (tts_mem) llama_memory_seq_rm(tts_mem, 0, 0, -1);
+                    ctx_omni->tts_n_past_accumulated = 0;
+                    ctx_omni->tts_all_generated_tokens.clear();
+                    ctx_omni->tts_condition_saved = false;
+                }
+
+                print_with_timestamp("⚠️ slide DONE: n_past %d→%d, freed %d, boundaries_kept=%d, TTS KV cleared\n",
+                                     old_n_past, ctx_omni->n_past, n_discard, (int)new_rounds.size());
+            }
+        }
+        return;
+    }
+
+    // ==================== 非双工模式：原有滑窗逻辑 ====================
     if (ctx_omni->n_past + chunk_size < n_ctx) {
-        return; // 还有足够空间，无需滑动
+        return;
     }
     
-    // 🔧 [诊断] 打印滑动窗口触发信息
     print_with_timestamp("⚠️ KV Cache 滑动窗口触发: n_past=%d, chunk_size=%d, n_ctx=%d, n_keep=%d, 轮次数=%zu\n",
                          ctx_omni->n_past, chunk_size, n_ctx, ctx_omni->n_keep, 
                          ctx_omni->round_start_positions.size());
     
     int n_discard = 0;
-    int delete_end_pos = ctx_omni->n_keep;  // 删除范围的结束位置
+    int delete_end_pos = ctx_omni->n_keep;
     
-    // ==================== 按轮次边界删除（优先使用） ====================
-    // 🔧 [重要] round_start_positions 记录的是轮次**结束**位置（也是下一轮开始位置）
-    // 轮次布局：
-    //   轮次 0: [n_keep, round_start_positions[0])
-    //   轮次 1: [round_start_positions[0], round_start_positions[1])
-    //   轮次 i: [round_start_positions[i-1], round_start_positions[i])
-    //   当前轮（未结束）: [round_start_positions[size-1], n_past)
     if (ctx_omni->max_preserved_context > 0 && ctx_omni->round_start_positions.size() >= 1) {
-        // 策略：保留尽可能多的最近轮次，但总长度不超过 max_preserved_context
-        // 从最新轮次往前数，累计长度直到超过 max_preserved_context
-        
         const auto& rounds = ctx_omni->round_start_positions;
         int cumulative_length = 0;
-        int keep_from_round = rounds.size();  // 从哪个轮次开始保留（0-indexed）
-        int total_rounds = rounds.size();  // 总轮次数（已完成的轮次）
+        int keep_from_round = rounds.size();
+        int total_rounds = rounds.size();
         
-        // 从最后一个已完成轮次往前遍历
         for (int i = total_rounds - 1; i >= 0; --i) {
-            // 计算第 i 轮的长度
-            // 轮次 i 的范围是 [round_start(i), round_end(i))
             int round_start = (i == 0) ? ctx_omni->n_keep : rounds[i - 1];
             int round_end = rounds[i];
             int round_length = round_end - round_start;
             
             if (cumulative_length + round_length > ctx_omni->max_preserved_context) {
-                // 加上这一轮会超过限制，停止
                 break;
             }
             
@@ -732,90 +829,54 @@ static void kv_cache_slide_window(struct omni_context* ctx_omni, common_params* 
             keep_from_round = i;
         }
         
-        // 至少保留最近一轮
         if (keep_from_round >= total_rounds) {
             keep_from_round = total_rounds - 1;
         }
         
-        // 计算要删除的范围
-        // 保留轮次 [keep_from_round, total_rounds)
-        // 删除轮次 [0, keep_from_round)
-        // 删除范围：[n_keep, 轮次 keep_from_round 的开始位置)
         int delete_start = ctx_omni->n_keep;
         delete_end_pos = (keep_from_round == 0) ? ctx_omni->n_keep : rounds[keep_from_round - 1];
         
         if (delete_end_pos > delete_start) {
             n_discard = delete_end_pos - delete_start;
             
-            print_with_timestamp("⚠️ 按轮次删除: 删除轮次 0-%d，保留轮次 %d-%d，保留长度=%d\n",
-                                 keep_from_round - 1, keep_from_round, total_rounds - 1, cumulative_length);
-            
-            // 更新 round_start_positions：删除早期轮次，调整剩余轮次的位置
             std::vector<int> new_rounds;
             for (int i = keep_from_round; i < total_rounds; ++i) {
                 new_rounds.push_back(rounds[i] - n_discard);
             }
             ctx_omni->round_start_positions = new_rounds;
-            
-            print_with_timestamp("⚠️ 更新轮次边界: 新边界数=%zu，首轮结束位置=%d\n",
-                                 new_rounds.size(), new_rounds.empty() ? -1 : new_rounds[0]);
         } else {
-            // 没有可删除的完整轮次，回退到按比例删除
-            print_with_timestamp("⚠️ 没有可删除的完整轮次（keep_from_round=%d），回退到按比例删除\n", keep_from_round);
             n_discard = 0;
         }
     }
     
-    // ==================== 回退策略：按比例删除（旧逻辑） ====================
     if (n_discard == 0) {
         const int n_left = ctx_omni->n_past - ctx_omni->n_keep;
         n_discard = n_left / 2;
         delete_end_pos = ctx_omni->n_keep + n_discard;
         
-        // 边界检查
         if (n_left <= 0 || n_discard <= 0) {
-            print_with_timestamp("⚠️ KV Cache 滑动窗口: 边界检查失败 n_left=%d, n_discard=%d，跳过滑动\n",
-                                 n_left, n_discard);
             return;
         }
         
-        // 按比例删除时，更新 round_start_positions
-        // round_start_positions[i] 表示第 i 轮的结束位置
-        // 删除范围 [n_keep, delete_end_pos) 会影响轮次边界
         std::vector<int> new_rounds;
         for (int pos : ctx_omni->round_start_positions) {
             if (pos > delete_end_pos) {
-                // 这个轮次结束位置在删除范围之后，需要前移
                 new_rounds.push_back(pos - n_discard);
             }
-            // 如果 pos <= delete_end_pos，说明这个轮次被删除或部分删除，丢弃
         }
         ctx_omni->round_start_positions = new_rounds;
-        
-        print_with_timestamp("⚠️ 按比例删除后轮次边界: 剩余 %zu 个轮次\n", new_rounds.size());
-        
-        print_with_timestamp("⚠️ 按比例删除: n_left=%d, n_discard=%d, 删除范围=[%d, %d)\n",
-                             n_left, n_discard, ctx_omni->n_keep, delete_end_pos);
     }
-    
-    // ==================== 执行 KV Cache 操作 ====================
-    print_with_timestamp("⚠️ KV Cache 滑动窗口执行: 删除范围=[%d, %d), n_discard=%d\n",
-                         ctx_omni->n_keep, delete_end_pos, n_discard);
     
     llama_memory_t mem = llama_get_memory(ctx_omni->ctx_llama);
     if (mem) {
-        // 1. 删除 [n_keep, delete_end_pos) 范围的 token
         bool rm_ok = llama_memory_seq_rm(mem, 0, ctx_omni->n_keep, delete_end_pos);
         (void)rm_ok;
-        
-        // 2. 将 [delete_end_pos, n_past) 范围的 token 位置前移 n_discard
         llama_memory_seq_add(mem, 0, delete_end_pos, ctx_omni->n_past, -n_discard);
     }
     
-    // 3. 更新 n_past
     int old_n_past = ctx_omni->n_past;
     ctx_omni->n_past -= n_discard;
-    print_with_timestamp("⚠️ KV Cache 滑动窗口完成: n_past 从 %d 减少到 %d\n", old_n_past, ctx_omni->n_past);
+    print_with_timestamp("⚠️ KV Cache 滑动窗口完成: n_past %d→%d\n", old_n_past, ctx_omni->n_past);
 }
 
 static bool eval_tokens(struct omni_context* ctx_omni, common_params* params, std::vector<llama_token> tokens, int n_batch, int * n_past, bool get_emb = false) {
@@ -1004,6 +1065,16 @@ static const char * sample_with_hidden_and_token(struct common_sampler * smpl, s
             // 如果不禁止，模型可能生成 <|speak|> → <|tts_pad|> → <|chunk_eos|>，导致无有效输出
             if (ctx_omni->special_token_tts_pad >= 0) {
                 logits[ctx_omni->special_token_tts_pad] = -INFINITY;
+            }
+
+            // 3. Duplex 模式下对 <|turn_eos|> 应用长度惩罚，让 Python 透传的配置真正生效
+            if (ctx_omni->length_penalty != 1.0f && ctx_omni->special_token_turn_eos >= 0) {
+                float eos_logit = logits[ctx_omni->special_token_turn_eos];
+                if (eos_logit > 0) {
+                    logits[ctx_omni->special_token_turn_eos] = eos_logit / ctx_omni->length_penalty;
+                } else {
+                    logits[ctx_omni->special_token_turn_eos] = eos_logit * ctx_omni->length_penalty;
+                }
             }
         }
     }
@@ -3115,11 +3186,14 @@ void sliding_window_reset(struct omni_context * ctx_omni) {
     ctx_omni->pending_unit_start_cache_len = 0;
     ctx_omni->system_preserve_length = 0;
     ctx_omni->position_offset = 0;
-    
+    ctx_omni->current_turn_id = 0;
+
     // 统计信息
     ctx_omni->sliding_event_count = 0;
     ctx_omni->total_dropped_tokens = 0;
     ctx_omni->total_dropped_units = 0;
+    ctx_omni->total_dropped_turns = 0;
+    ctx_omni->total_unit_fallbacks = 0;
     
     if (old_unit_count > 0) {
         print_with_timestamp("[SW] reset: cleared %d units, all sliding window state reset\n", old_unit_count);
@@ -3179,12 +3253,14 @@ void sliding_window_register_unit_end(struct omni_context * ctx_omni,
         entry.type = input_type;
         entry.generated_tokens = generated_tokens;
         entry.is_listen = is_listen;
-        
+        // 归属到当前正在构建的 turn；turn 边界处由 stream_decode 负责 current_turn_id++
+        entry.turn_id = ctx_omni->current_turn_id;
+
         ctx_omni->unit_history.push_back(entry);
-        
-        print_with_timestamp("[SW] unit_end: unit_id=%d type=%s len=%d gen_tokens=%zu is_listen=%d | cache=%d preserve=%d total_units=%zu\n",
+
+        print_with_timestamp("[SW] unit_end: unit_id=%d type=%s len=%d gen_tokens=%zu is_listen=%d turn_id=%d | cache=%d preserve=%d total_units=%zu\n",
                             entry.unit_id, entry.type.c_str(), entry.length,
-                            entry.generated_tokens.size(), entry.is_listen,
+                            entry.generated_tokens.size(), entry.is_listen, entry.turn_id,
                             current_cache_len, ctx_omni->system_preserve_length,
                             ctx_omni->unit_history.size());
     } else {
@@ -3212,12 +3288,16 @@ void sliding_window_register_system_prompt(struct omni_context * ctx_omni) {
 /**
  * 从 KV cache 中删除指定数量的 tokens
  * 删除位于 [preserve, preserve + length) 区间的 tokens
- * 
- * 注意：llama.cpp 的 llama_memory_seq_rm 函数可以直接删除指定范围的 tokens
- * 但删除后需要进行 RoPE 位置重对齐（暂时不支持，需要更深入的修改）
- * 
- * 当前实现：使用简化的策略，删除 tokens 后更新 position_offset
- * 后续生成时使用 position_offset 来调整 position_ids
+ *
+ * 实现要点：
+ *   1. llama_memory_seq_rm 只是把指定区间的 KV 标记为空，
+ *      并不会移动后面 token 的 position；
+ *   2. 因此必须紧接着调用 llama_memory_seq_add(... , -length)，
+ *      把 [preserve + length, cache_len_before) 范围内剩余 token 的 position
+ *      整体向前平移 length，使 KV 中的 position 重新连续；
+ *   3. 否则下一次 llama_decode 会报
+ *      "inconsistent sequence positions: X = old_pmax, Y = n_past, requires Y = X + 1"
+ *      这与 kv_cache_slide_window 里采用的策略保持一致。
  */
 bool sliding_window_drop_tokens_from_cache(struct omni_context * ctx_omni, int length) {
     if (!ctx_omni || !ctx_omni->ctx_llama || length <= 0) {
@@ -3241,26 +3321,33 @@ bool sliding_window_drop_tokens_from_cache(struct omni_context * ctx_omni, int l
         return false;
     }
     
-    // 使用 llama_memory_seq_rm 删除 [preserve, preserve + length) 区间的 tokens
     llama_memory_t mem = llama_get_memory(ctx_omni->ctx_llama);
     if (!mem) {
         print_with_timestamp("[SW] drop_tokens: failed to get llama memory\n");
         return false;
     }
     
-    // 删除指定范围的 tokens
-    // llama_memory_seq_rm(mem, seq_id, p0, p1) 删除 [p0, p1) 范围的 tokens
+    // 1) 删除 [preserve, preserve + length) 区间的 KV
     bool success = llama_memory_seq_rm(mem, 0, preserve, preserve + length);
     
     if (success) {
-        // 更新 n_past
+        // 2) 把后段 [preserve + length, cache_len_before) 的 position
+        //    整体往前平移 length，保证 KV 中 position 连续，下一次 decode 不会触发
+        //    "inconsistent sequence positions" 错误。
+        //    与 kv_cache_slide_window 的处理方式一致。
+        if (cache_len_before > preserve + length) {
+            llama_memory_seq_add(mem, 0, preserve + length, cache_len_before, -length);
+        }
+
         ctx_omni->n_past = cache_len_before - length;
-        
-        // 更新 position_offset（用于后续 RoPE 计算）
+
+        // position_offset 字段已不再用于位置修正，仅保留累计值用于诊断/兼容旧日志
         ctx_omni->position_offset += length;
-        
-        print_with_timestamp("[SW] drop_tokens: SUCCESS, dropped %d tokens from [%d, %d), cache %d -> %d, offset=%d\n",
-                            length, preserve, preserve + length, cache_len_before, ctx_omni->n_past, ctx_omni->position_offset);
+
+        print_with_timestamp("[SW] drop_tokens: SUCCESS, dropped %d tokens from [%d, %d), shifted [%d, %d) by -%d, cache %d -> %d\n",
+                            length, preserve, preserve + length,
+                            preserve + length, cache_len_before, length,
+                            cache_len_before, ctx_omni->n_past);
     } else {
         print_with_timestamp("[SW] drop_tokens: FAILED to drop %d tokens\n", length);
     }
@@ -3302,6 +3389,96 @@ static bool sliding_window_drop_unit(struct omni_context * ctx_omni, int unit_id
                         cache_before, cache_after, ctx_omni->position_offset);
     
     ctx_omni->unit_history.erase(it);
+    return true;
+}
+
+/**
+ * 🔧 [turn 级滑窗] 删除最早的一个已完成 turn（按 turn 粒度一次性丢）
+ *
+ * 行为：
+ *   1. 在 unit_history 里找到第一条非 system unit 的 turn_id（记为 earliest）。
+ *   2. 如果 earliest >= current_turn_id，说明 unit_history 里只剩下当前还没收尾的 turn，
+ *      这种情况下函数返回 false，交给上层退化成按 unit 删。
+ *   3. 否则收集"前缀"中所有非 system 且 turn_id == earliest 的 unit，把它们的 length
+ *      累加起来一次性从 KV cache 中丢掉，并从 unit_history 里擦除对应条目。
+ *
+ * 设计依据：
+ *   - UnitEntry 是按时间顺序 push 进 unit_history 的，turn_id 单调不降，
+ *     所以最小 turn_id 的 unit 一定集中在 unit_history 的前缀段。
+ *   - 用一次 sliding_window_drop_tokens_from_cache(total_len) 来移动 KV，
+ *     比 per-unit 循环调用更省：只做一次 llama_memory_seq_rm + 一次 seq_add。
+ *
+ * @return true 成功丢掉一个完整 turn；false 表示当前没有"已完成且非 system"的 turn 可丢
+ */
+static bool sliding_window_drop_next_turn(struct omni_context * ctx_omni) {
+    if (!ctx_omni || ctx_omni->unit_history.empty()) {
+        return false;
+    }
+
+    // 1) 找到最早一条非 system unit 的 turn_id
+    int earliest_turn = -1;
+    for (const auto & e : ctx_omni->unit_history) {
+        if (e.type == "system") continue;
+        earliest_turn = e.turn_id;
+        break;
+    }
+    if (earliest_turn < 0) {
+        // 只剩 system 条目，没什么可丢的
+        return false;
+    }
+
+    // 2) 判断这个 turn 是否已经完结
+    //    - current_turn_id 指向"正在构建中的 turn"，它 ≥ earliest_turn
+    //    - 只有当 earliest_turn < current_turn_id 时，earliest_turn 才真正已经收尾，
+    //      这时按 turn 一次性丢掉才安全（不会把活跃轮次从中间砍半）
+    //    - 否则（只剩当前 turn）返回 false，让 enforce 退化到按 unit 丢
+    if (earliest_turn >= ctx_omni->current_turn_id) {
+        print_with_timestamp("[SW] drop_next_turn: only current turn (turn_id=%d) left in history, "
+                             "fall back to unit-level drop\n", earliest_turn);
+        return false;
+    }
+
+    // 3) 收集前缀里所有 turn_id == earliest_turn 的非 system unit
+    //    （遇到 turn_id 更大的 unit 就停；system 单独跳过但不打断）
+    int total_len = 0;
+    int n_units   = 0;
+    for (const auto & e : ctx_omni->unit_history) {
+        if (e.type == "system") continue;
+        if (e.turn_id != earliest_turn) break;
+        total_len += e.length;
+        n_units++;
+    }
+
+    if (total_len <= 0 || n_units == 0) {
+        // 理论上不会走到这里（turn 内若全是零长度 unit 也没必要丢），保底
+        print_with_timestamp("[SW] drop_next_turn: turn_id=%d has no droppable length (n_units=%d)\n",
+                             earliest_turn, n_units);
+        return false;
+    }
+
+    int cache_before = get_cache_length(ctx_omni);
+    if (!sliding_window_drop_tokens_from_cache(ctx_omni, total_len)) {
+        print_with_timestamp("[SW] drop_next_turn: drop_tokens_from_cache failed "
+                             "(turn_id=%d, total_len=%d)\n", earliest_turn, total_len);
+        return false;
+    }
+
+    // 4) 从 unit_history 里擦除刚刚丢掉的 n_units 条非 system unit（保留可能混入的 system 条目）
+    int removed = 0;
+    for (auto it = ctx_omni->unit_history.begin();
+         it != ctx_omni->unit_history.end() && removed < n_units; ) {
+        if (it->type == "system") { ++it; continue; }
+        if (it->turn_id != earliest_turn) break;  // 防御性：不该跨 turn
+        it = ctx_omni->unit_history.erase(it);
+        removed++;
+    }
+
+    int cache_after = get_cache_length(ctx_omni);
+    print_with_timestamp("[SW] 🗑️ DROPPED turn_id=%d: %d units, %d tokens | cache %d -> %d, "
+                         "remaining_units=%zu, current_turn_id=%d\n",
+                         earliest_turn, n_units, total_len,
+                         cache_before, cache_after,
+                         ctx_omni->unit_history.size(), ctx_omni->current_turn_id);
     return true;
 }
 
@@ -3351,39 +3528,100 @@ bool sliding_window_enforce(struct omni_context * ctx_omni) {
         return false;  // 未超过高水位线，不触发
     }
     
-    // 超过高水位线，开始滑窗
-    print_with_timestamp("[SW] ⚡ SLIDING TRIGGERED: cache=%d > high_water=%d, target=low_water=%d\n",
-                        cache_len_before, cfg.high_water_tokens, cfg.low_water_tokens);
-    
-    int dropped_count = 0;
+    // 🔧 [增量开发] 只有新增的 "turn" 模式才走 turn-first / unit-fallback 的新路径，
+    //   其它任何已有模式（"basic"/"context"/未来扩展）继续按 unit 粒度丢，保证老行为一字不动。
+    const bool turn_mode = (cfg.mode == "turn");
+
+    if (turn_mode) {
+        print_with_timestamp("[SW] ⚡ SLIDING TRIGGERED: mode=turn cache=%d > high_water=%d, target=low_water=%d, "
+                            "current_turn_id=%d, units=%zu\n",
+                            cache_len_before, cfg.high_water_tokens, cfg.low_water_tokens,
+                            ctx_omni->current_turn_id, ctx_omni->unit_history.size());
+    } else {
+        // 老日志格式保持原样，避免已有分析脚本/对照测试被扰动
+        print_with_timestamp("[SW] ⚡ SLIDING TRIGGERED: cache=%d > high_water=%d, target=low_water=%d\n",
+                            cache_len_before, cfg.high_water_tokens, cfg.low_water_tokens);
+    }
+
+    // 命名约定（与 omni_context 字段对齐，避免 turn / 非 turn 两套含义混淆）：
+    //   dropped_turns      : 本次 enforce 里"整 turn 丢"成功的次数
+    //   dropped_units      : 本次 enforce 里被移除的 UnitEntry 总条目数
+    //                        （turn 模式 = 整 turn 丢带走的 + fallback 丢的；非 turn 模式 = 按 unit 丢的）
+    //   unit_fallbacks     : 仅 turn 模式 —— 整 turn 丢不动退化到按 unit 丢的次数
+    int dropped_turns   = 0;
+    int dropped_units   = 0;
+    int unit_fallbacks  = 0;
     int cache_len = cache_len_before;
-    
+
     while (cache_len > cfg.low_water_tokens) {
-        if (!sliding_window_drop_next_unit(ctx_omni)) {
-            print_with_timestamp("[SW] enforce_window: no more units to drop, stopping\n");
+        bool dropped_one = false;
+
+        if (turn_mode) {
+            // 🔧 [turn 级滑窗 + unit 级兜底]
+            //   - 主策略：整 turn 丢（把"用户输入 + 模型回复"当一块记忆），语义连贯；
+            //   - 兜底：当 unit_history 里只剩下当前还没收尾的 turn（drop_next_turn 返回 false）
+            //     时退化到按 unit 丢，避免"一轮超长、整 turn 又丢不动"把长对话卡死。
+            int units_before = (int)ctx_omni->unit_history.size();
+            if (sliding_window_drop_next_turn(ctx_omni)) {
+                dropped_turns++;
+                dropped_units += units_before - (int)ctx_omni->unit_history.size();
+                dropped_one = true;
+            } else if (sliding_window_drop_next_unit(ctx_omni)) {
+                unit_fallbacks++;   // fallback 计数（turn 模式专属）
+                dropped_units++;    // 同时计入总量
+                dropped_one = true;
+            }
+        } else {
+            // 原有行为：按 unit 丢（basic / context / 其它未列模式）
+            if (sliding_window_drop_next_unit(ctx_omni)) {
+                dropped_units++;
+                dropped_one = true;
+            }
+        }
+
+        if (!dropped_one) {
+            print_with_timestamp("[SW] enforce_window: no more %s to drop, stopping (cache=%d, units=%zu)\n",
+                                turn_mode ? "turns/units" : "units",
+                                cache_len, ctx_omni->unit_history.size());
             break;
         }
-        dropped_count++;
         cache_len = get_cache_length(ctx_omni);
     }
-    
-    if (dropped_count > 0) {
+
+    // 兼容旧返回语义：是否发生过任意"丢"动作
+    int dropped_actions = dropped_turns + (turn_mode ? unit_fallbacks : dropped_units);
+    if (dropped_units > 0 || dropped_turns > 0) {
         // 更新统计
         ctx_omni->sliding_event_count++;
-        ctx_omni->total_dropped_tokens += cache_len_before - cache_len;
-        ctx_omni->total_dropped_units += dropped_count;
-        
+        ctx_omni->total_dropped_tokens    += cache_len_before - cache_len;
+        ctx_omni->total_dropped_units     += dropped_units;     // 两种模式语义统一：被移除的 UnitEntry 总数
+        ctx_omni->total_dropped_turns     += dropped_turns;     // 仅 turn 模式 > 0
+        ctx_omni->total_unit_fallbacks    += unit_fallbacks;    // 仅 turn 模式 > 0
+
         // 一致性检查
         int expected = ctx_omni->system_preserve_length;
         for (const auto& u : ctx_omni->unit_history) {
             expected += u.length;
         }
         bool is_consistent = (expected == cache_len);
-        
-        print_with_timestamp("[SW] ✅ SLIDING DONE: cache %d -> %d, dropped %d units, remaining %zu units | consistency: expected=%d actual=%d %s\n",
-                            cache_len_before, cache_len, dropped_count, ctx_omni->unit_history.size(),
-                            expected, cache_len, is_consistent ? "✓" : "✗ MISMATCH!");
-        
+
+        if (turn_mode) {
+            print_with_timestamp("[SW] ✅ SLIDING DONE: cache %d -> %d, "
+                                "dropped %d turns + %d unit-fallbacks (total %d unit entries removed), "
+                                "remaining %zu units | consistency: expected=%d actual=%d %s\n",
+                                cache_len_before, cache_len,
+                                dropped_turns, unit_fallbacks, dropped_units,
+                                ctx_omni->unit_history.size(),
+                                expected, cache_len, is_consistent ? "✓" : "✗ MISMATCH!");
+        } else {
+            // 保持老日志格式不变，方便已有分析脚本 / 对照测试
+            print_with_timestamp("[SW] ✅ SLIDING DONE: cache %d -> %d, dropped %d units, remaining %zu units | "
+                                "consistency: expected=%d actual=%d %s\n",
+                                cache_len_before, cache_len, dropped_units,
+                                ctx_omni->unit_history.size(),
+                                expected, cache_len, is_consistent ? "✓" : "✗ MISMATCH!");
+        }
+
         if (!is_consistent) {
             print_with_timestamp("[SW] ❌ CONSISTENCY ERROR! preserve=%d + sum(units)=%d != cache=%d, offset=%d\n",
                                 ctx_omni->system_preserve_length,
@@ -3391,8 +3629,8 @@ bool sliding_window_enforce(struct omni_context * ctx_omni) {
                                 cache_len, ctx_omni->position_offset);
         }
     }
-    
-    return dropped_count > 0;
+
+    return dropped_actions > 0;
 }
 
 //
@@ -5641,7 +5879,8 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
             while (!queue.empty()) {
                 LLMOut *llm_out = queue.front();
                 llm_finish |= llm_out->llm_finish;
-                accumulated_is_end_of_turn |= llm_out->is_end_of_turn;
+                bool item_is_eot = llm_out->is_end_of_turn;
+                accumulated_is_end_of_turn |= item_is_eot;
                 
                 if (!ctx_omni->speek_done || ctx_omni->duplex_mode) {
                     llm_text += llm_out->text;
@@ -5660,6 +5899,11 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
                 }
                 delete llm_out;
                 queue.pop();
+                
+                // 遇到 EOT 边界立即停止，下一轮的 item 留给下次迭代处理
+                if (item_is_eot) {
+                    break;
+                }
             }
             lock.unlock();
             ctx_omni->tts_thread_info->cv.notify_all();
@@ -5676,6 +5920,19 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
             
             if (ctx_omni->speek_done && llm_finish) {
                 if (ctx_omni->duplex_mode && !current_chunk_token_ids.empty()) {
+                    // 新一轮 SPEAK：重置 TTS 状态，防止上轮残留污染
+                    if (chunk_idx > 0) {
+                        chunk_idx = 0;
+                        tts_n_past = 0;
+                        audio_tokens.clear();
+                        llama_memory_t mem = llama_get_memory(ctx_omni->ctx_tts_llama);
+                        if (mem) {
+                            llama_memory_seq_rm(mem, 0, 0, -1);
+                        }
+                        ctx_omni->tts_n_past_accumulated = 0;
+                        ctx_omni->tts_all_generated_tokens.clear();
+                        ctx_omni->tts_condition_saved = false;
+                    }
                     ctx_omni->speek_done = false;
                 } else if (ctx_omni->duplex_mode && accumulated_is_end_of_turn) {
                     ctx_omni->speek_done = false;
@@ -7819,7 +8076,7 @@ static bool start_python_t2w_service(struct omni_context * ctx_omni) {
         }
         
         // 执行 Python 脚本 (使用 conda Python)
-        execlp("/Users/tianchi/software/miniconda3/bin/python", "python", script_path.c_str(), (char*)NULL);
+        execlp("python3", "python3", script_path.c_str(), (char*)NULL);
         
         // 如果 execlp 失败
         _exit(1);
@@ -8486,7 +8743,9 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
         if (!ctx_omni->duplex_mode) {
             need_flush = is_final || is_chunk_end;
         } else {
-            need_flush = is_final;  // 完全 flush 只在轮次结束时
+            // 双工：只在 is_final（LISTEN→SPEAK 切换时 LLM 线程设置）时 flush。
+            // chunk_end 保持原语义"累积等下个 chunk"，避免把一轮 turn 切成多段 wav 产生播放 gap。
+            need_flush = is_final;
         }
         
         // Process windows using sliding window
@@ -8494,8 +8753,9 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
         while (token_buffer.size() >= min_process_threshold || (need_flush && !token_buffer.empty())) {
             // Determine how many tokens to process
             size_t process_size = std::min(token_buffer.size(), (size_t)WINDOW_SIZE);
-            // 🔧 is_last_window: 当是 final 或 chunk_end，且 buffer 中的 tokens 不足一个完整 window 时
-            bool is_last_window = need_flush && (token_buffer.size() <= WINDOW_SIZE);
+            // 🔧 is_last_window: 只有 is_final 才算轮次真正的"最后窗口"（触发 token2wav 终结 + buffer 重置）
+            // 双工 chunk_end 不能视为 last_window，否则 token2wav 会被重置、丢失跨 chunk 的状态
+            bool is_last_window = is_final && (token_buffer.size() <= WINDOW_SIZE);
             
             std::vector<int32_t> window(token_buffer.begin(), token_buffer.begin() + process_size);
             
@@ -8790,10 +9050,12 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
             // Python: sys_msgs = {"role": "system", "content": [vc_prompt_prefix, ref_audio, vc_prompt_suffix]}
             // 格式: <|im_start|>system\n{vc_prompt_prefix}\n<|audio_start|>[ref_audio_embed]<|audio_end|>{vc_prompt_suffix}<|im_end|>\n
             
-            // 确定 ref_audio 路径：优先使用配置的路径，否则使用默认路径
-            std::string system_ref_audio = ctx_omni->ref_audio_path.empty() 
-                ? "tools/omni/assets/default_ref_audio/default_ref_audio.wav" 
-                : ctx_omni->ref_audio_path;
+            // 确定 ref_audio 路径：优先使用调用方传入的 aud_fname，其次配置路径，最后默认路径
+            std::string system_ref_audio = !aud_fname.empty()
+                ? aud_fname
+                : (!ctx_omni->ref_audio_path.empty()
+                    ? ctx_omni->ref_audio_path
+                    : "tools/omni/assets/default_ref_audio/default_ref_audio.wav");
             print_with_timestamp("system prompt ref_audio: %s\n", system_ref_audio.c_str());
             
             // Step 1: 评估 prefix (voice_clone_prompt，包含 <|audio_start|>)
@@ -8820,7 +9082,11 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
         //把这步完成再开llm线程以防冲突
         ctx_omni->n_keep = ctx_omni->n_past;
         print_with_timestamp("🔒 n_keep 设置为 %d (system prompt tokens)，这部分永远不会被滑动窗口删除\n", ctx_omni->n_keep);
-        eval_prefix(ctx_omni, ctx_omni->params);
+        // 双工模式：assistant_prompt 不含 <|im_start|>user\n，需要 eval_prefix 补充
+        // 非双工模式：assistant_prompt 末尾已含 <|im_start|>user\n，无需重复添加
+        if (ctx_omni->duplex_mode) {
+            eval_prefix(ctx_omni, ctx_omni->params);
+        }
         
         // 🔧 [说明] index=0 时，aud_fname 通常是 ref_audio（用于 voice cloning）
         // ref_audio 已经在上面的 system prompt 初始化中被正确 prefill 了
@@ -8866,10 +9132,12 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
     }
     else {
         if (!ctx_omni->async) {
-            if (img_fname.length() > 0) {
-                // 🔧 [高清模式] 使用 V2.6 slice schema
-                // 如果指定了 max_slice_nums，临时设置（用于高清+高刷组合模式）
-                if (max_slice_nums >= 1 && ctx_omni->ctx_vision) {
+            if (img_fname.length() > 0 && ctx_omni->ctx_vision == nullptr) {
+                LOG_WRN("%s: image provided but ctx_vision is NULL (media_type=%d), skipping: %s\n",
+                        __func__, ctx_omni->media_type, img_fname.c_str());
+            }
+            if (img_fname.length() > 0 && ctx_omni->ctx_vision != nullptr) {
+                if (max_slice_nums >= 1) {
                     vision_set_max_slice_nums(ctx_omni->ctx_vision, max_slice_nums);
                     LOG_INF("%s: [临时] max_slice_nums=%d for this prefill\n", __func__, max_slice_nums);
                 }
@@ -8927,20 +9195,23 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
             omni_embeds * omni_embeds = new struct omni_embeds();
             //video
             if (img_fname.length() > 0) {
-                LOG_INF("%s: img_fname:%s\n", __func__, img_fname.c_str());
-                // 🔧 [高清模式] 如果指定了 max_slice_nums，临时设置（用于高清+高刷组合模式）
-                if (max_slice_nums >= 1 && ctx_omni->ctx_vision) {
-                    vision_set_max_slice_nums(ctx_omni->ctx_vision, max_slice_nums);
-                    LOG_INF("%s: [临时] max_slice_nums=%d for this prefill\n", __func__, max_slice_nums);
+                if (ctx_omni->ctx_vision == nullptr) {
+                    LOG_WRN("%s: image provided but ctx_vision is NULL (media_type=%d), skipping: %s\n",
+                            __func__, ctx_omni->media_type, img_fname.c_str());
+                } else {
+                    LOG_INF("%s: img_fname:%s\n", __func__, img_fname.c_str());
+                    if (max_slice_nums >= 1) {
+                        vision_set_max_slice_nums(ctx_omni->ctx_vision, max_slice_nums);
+                        LOG_INF("%s: [临时] max_slice_nums=%d for this prefill\n", __func__, max_slice_nums);
+                    }
+                    if (!omni_image_embed_make_chunks_with_filename(ctx_omni->ctx_vision, 
+                            ctx_omni->params->cpuparams.n_threads, img_fname, omni_embeds->vision_embed)) {
+                        LOG_ERR("%s: failed to create vision embeddings for %s\n", __func__, img_fname.c_str());
+                        delete omni_embeds;
+                        return false;
+                    }
+                    LOG_INF("%s: vision_embed has %d chunks\n", __func__, (int)omni_embeds->vision_embed.size());
                 }
-                // 🔧 [高清模式] 使用新的 chunks 接口，支持 V2.6 slice schema
-                if (!omni_image_embed_make_chunks_with_filename(ctx_omni->ctx_vision, 
-                        ctx_omni->params->cpuparams.n_threads, img_fname, omni_embeds->vision_embed)) {
-                    LOG_ERR("%s: failed to create vision embeddings for %s\n", __func__, img_fname.c_str());
-                    delete omni_embeds;
-                    return false;
-                }
-                LOG_INF("%s: vision_embed has %d chunks\n", __func__, (int)omni_embeds->vision_embed.size());
             }
             //audio
             // 只有在音频路径非空时才处理音频
@@ -9015,7 +9286,18 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
     // 🔧 [诊断] 打印 stream_decode 开始时的关键状态
     print_with_timestamp("📍 stream_decode 开始: n_past=%d, n_keep=%d, n_ctx=%d, duplex_mode=%d\n",
                          ctx_omni->n_past, ctx_omni->n_keep, ctx_omni->params->n_ctx, ctx_omni->duplex_mode);
-    
+
+    // 🔧 [unit 记账] decode_start_cache_len 不在这里取值！
+    // 这里的 n_past 还是 prefill 之前的值；stream_decode 内部其实是
+    //     prefill (audio/vision/omni) 写入 KV  →  decode 采样
+    // 顺序，prefill 那段 KV 已经被 sliding_window_register_unit_start/_end
+    // 算成 omni/audio unit 了，如果在这里就把 n_past 锁住，结束时 end - start 会
+    // 把 prefill 那段重复算到 response unit 里（一段 KV 同时被两条 unit 记账，
+    // 后果就是日志里反复出现的 "❌ CONSISTENCY ERROR! sum(units) >> cache" 以及
+    // 滑窗 drop response unit 时多删 KV）。所以 decode_start_cache_len 必须等到
+    // 下面的 "wait prefill done" 之后再取。
+    int decode_start_cache_len = -1;
+
     // 🔧 [双工模式] 重置 ended_with_listen 标志
     // 每次 decode 开始时，假设会以非 listen 结束（需要清理 KV cache）
     // 如果 LLM 线程检测到 <|listen|>，会设置为 true
@@ -9068,6 +9350,16 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
         g_decode_cv.wait(lock, []{ return prefill_done; });
         prefill_done = false;
     }
+
+    // 🔧 [unit 记账] 现在 prefill 已经写完 KV、unit_history 里也已经
+    //   有对应的 omni/audio unit 了；这里取的 n_past 才是"decode 真正
+    //   要写入的起始位置"。后面 register response unit 时用
+    //   (n_past_now - decode_start_cache_len)，正好等于 decode 自身写入的长度
+    //   （包括单工模式下面 eval 的 <|im_end|>...<|tts_bos|> assistant prompt，
+    //    那段也算到 response unit 里一起删，不会重复记账，因为它没经过
+    //    prefill 的 register_unit_start/_end）。
+    decode_start_cache_len = ctx_omni->n_past;
+
     // 只有启用 TTS 时才设置 speek_done 为 false
     if (ctx_omni->use_tts) {
         ctx_omni->speek_done = false;
@@ -9100,6 +9392,32 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
         // stream_prefill 已添加 <unit>[audio_embed]
         // 模型会输出 <|speak|>xxx<|chunk_eos|> 或 <|listen|><|chunk_eos|>
         print_with_timestamp("stream_decode: 双工模式，跳过 assistant prompt\n");
+
+        // [Case 2 抢答] 会话开局前 N 次 stream_decode 强制 LISTEN，
+        // 与 Python duplex_config.force_listen_count=3 对齐。
+        // 防止 browser MediaStreamTrack 开启时的瞬态噪声 + 强 system prompt
+        // 组合导致模型第一个 chunk 直接 SPEAK。
+        // 这里直接发 __IS_LISTEN__ 到 text_queue 走 LISTEN 分支，不启动 LLM 采样。
+        // 用户音频的 KV cache 已经在 stream_prefill 阶段写入，所以不会丢失上下文。
+        if (ctx_omni->force_listen_used < ctx_omni->force_listen_count) {
+            ctx_omni->force_listen_used++;
+            ctx_omni->slide_last_was_listen = true;
+            ctx_omni->ended_with_listen = true;
+            ctx_omni->current_turn_ended = false;
+            if (ctx_omni->use_tts) {
+                ctx_omni->speek_done = true;
+            }
+            print_with_timestamp("LLM Duplex: force_listen %d/%d, skip generation and emit __IS_LISTEN__\n",
+                                 ctx_omni->force_listen_used, ctx_omni->force_listen_count);
+            if (ctx_omni->async) {
+                std::lock_guard<std::mutex> tl(ctx_omni->text_mtx);
+                ctx_omni->text_queue.push_back("__IS_LISTEN__");
+                ctx_omni->text_done_flag = true;
+                ctx_omni->text_streaming = false;
+                ctx_omni->text_cv.notify_all();
+            }
+            return true;
+        }
     } else if (ctx_omni->use_tts) {
         // 🔧 [非双工 TTS 模式] 需要包含 <|tts_bos|>，告诉模型开始生成 TTS 文本
         // stream_prefill 已添加 <|audio_start|>[audio]<|audio_end|>，这里关闭用户消息并添加 assistant prompt
@@ -9269,6 +9587,22 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
                                             "set is_end_of_turn=true (not breaking, wait for chunk_eos)\n",
                                             (int)token_type);
                         // 不 break，不设 llm_finish，继续生成直到 chunk_eos/listen
+                    } else if (token_type == OmniTokenType::LISTEN) {
+                        // 🔧 [修复尾音问题] LISTEN 表示切回听状态：
+                        // - 如果之前在 SPEAK（slide_last_was_listen=false），说明本轮发言刚结束，
+                        //   TTS buffer 里可能有不足 chunk_size(25) 的残留 token，必须 flush 出去，
+                        //   否则残留 token 会被带入下一轮，造成尾音串接到下轮开头。
+                        // - 如果之前已经在 listen（slide_last_was_listen=true，比如会话开局
+                        //   用户还没说话、或模型连续生成 listen），则没有 speak 内容要 flush，
+                        //   不应触发 is_end_of_turn（否则 TTS 会错误地添加 text_eos_embed 并生成杂音）。
+                        // 注意：slide_last_was_listen 由 LISTEN 分支末尾更新（见下方 9386 行附近），
+                        // 此处读到的是"上一个 chunk 结束时的状态"，正好用于判断。
+                        if (!ctx_omni->slide_last_was_listen.load()) {
+                            local_is_end_of_turn = true;
+                            print_with_timestamp("LLM Duplex: LISTEN detected after SPEAK, set is_end_of_turn=true to flush TTS buffer\n");
+                        } else {
+                            print_with_timestamp("LLM Duplex: LISTEN during listen state, skip flush\n");
+                        }
                     }
                 }
                 
@@ -9299,17 +9633,16 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
                     // - 需要通过 text_queue 通知 SSE 客户端
                     // - 设置 ended_with_listen 标志，让 stream_decode 末尾不清理 KV cache
                     if (token_type == OmniTokenType::LISTEN && ctx_omni->duplex_mode) {
-                        
-                        // 🔧 [关键] 标记以 listen 结束，不清理 KV cache
                         ctx_omni->ended_with_listen = true;
+                        ctx_omni->slide_last_was_listen = true;
                         
-                        // 推送一个特殊的 JSON 标记到 text_queue，SSE 会转发给客户端
                         if (ctx_omni->async) {
                             std::lock_guard<std::mutex> tl(ctx_omni->text_mtx);
-                            // 使用特殊前缀标记这是状态消息而非文本
                             ctx_omni->text_queue.push_back("__IS_LISTEN__");
                             ctx_omni->text_cv.notify_all();
                         }
+                    } else if (ctx_omni->duplex_mode) {
+                        ctx_omni->slide_last_was_listen = false;
                     }
                     
                     // Don't add end tokens to response
@@ -9529,6 +9862,8 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
         ctx_omni->round_start_positions.push_back(ctx_omni->n_past);
         print_with_timestamp("📍 轮次 %zu 结束，记录边界于 n_past=%d\n",
                              ctx_omni->round_start_positions.size(), ctx_omni->n_past);
+        // 🔧 [turn 级滑窗] 本 turn 已完结，之后注册的 UnitEntry 归入下一个 turn
+        ctx_omni->current_turn_id++;
         
         // 🔧 [整合] 为下一轮准备 <|im_end|>\n<|im_start|>user\n
         // 第一轮的 <|im_start|>user\n 在 sys prompt 末尾
@@ -9537,14 +9872,90 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
         print_with_timestamp("📍 为下一轮准备: eval <|im_end|>\\n<|im_start|>user\\n, n_past=%d\n", ctx_omni->n_past);
     }
     
-    // 🔧 [双工模式] 在双工模式下永远不清理 KV cache
-    // Python 双工模型的 llm_past_key_values 一直累积，只在 reset_session() 时清空
-    // C++ 已有滑动窗口机制 (kv_cache_slide_window)，会在上下文满时自动滑动
+    // ==================== response unit 注册 ====================
+    // 把这一轮 decode 期间通过采样写入 KV 的所有 token 打包成一个
+    // type = "response" 的 UnitEntry，挂到 unit_history 里。
+    //
+    // 为什么必须做这件事：
+    //   1. unit-based 滑窗（sliding_window_enforce + sliding_window_drop_next_unit）
+    //      只会按 unit_history 里的条目去 drop。如果 response 段从来没被注册，
+    //      它就永远停留在 KV 里，谁也删不掉，长会话下迟早把上下文撑爆。
+    //   2. 一致性检查 expected = preserve + sum(units.length) 也要求每一段
+    //      占用 KV 的 token 都有对应记账，否则会反复打印
+    //      "❌ CONSISTENCY ERROR! preserve=X + sum(units)=Y != cache=Z"。
+    //
+    // 注意点：
+    //   - type 必须不是 "system"，这样 sliding_window_drop_next_unit 才愿意删它
+    //     （那里是 `if (entry.type == "system") continue;`）。
+    //   - 真正释放 KV 的链路是
+    //       sliding_window_drop_next_unit
+    //         -> sliding_window_drop_unit
+    //         -> sliding_window_drop_tokens_from_cache
+    //     而 sliding_window_drop_tokens_from_cache 已经在前面修过：
+    //     llama_memory_seq_rm 之后会跟一次 llama_memory_seq_add(..., -length)，
+    //     把后段 position 向前平移，所以删 response unit 也是安全的、
+    //     不会再触发 "inconsistent sequence positions"。
+    //   - length 用 (n_past - decode_start_cache_len)，这是 decode 期间
+    //     KV 实际增长的字节数，和 prefill 路径上 register_unit_end 的算法
+    //     （current_cache_len - pending_unit_start_cache_len）保持一致。
+    //   - 必须只在 sliding_window_config.mode != "off" 时执行，跟 prefill 路径上
+    //     的 sliding_window_register_unit_start/_end 保持一致。
+    //     原因：mode == "off" 时谁都不会消费 unit_history，如果在这里继续 push，
+    //     会得到一个只增不减的 vector（轻度内存泄漏），而且一旦中途切回 basic，
+    //     里面残留的 response 条目会让一致性检查直接对不上。
+    if (ctx_omni->sliding_window_config.mode != "off") {
+        int decode_end_cache_len = ctx_omni->n_past;
+
+        // decode_start_cache_len 默认值是 -1，正常路径上会在 "wait prefill done"
+        // 之后被赋成"prefill 完成时的 n_past"。如果中途异常退出导致没赋值，
+        // 就跳过本次记账，避免把整段 cache 当 response 误记。
+        if (decode_start_cache_len < 0) {
+            print_with_timestamp(
+                "[SW] register response unit: skipped, decode_start_cache_len 未初始化"
+                " (可能 prefill 没正常完成)，跳过记账\n");
+        } else {
+            int response_len = decode_end_cache_len - decode_start_cache_len;
+            if (response_len > 0) {
+                UnitEntry entry;
+                entry.unit_id = ctx_omni->next_unit_id++;
+                entry.length  = response_len;
+                entry.type    = "response";
+                entry.is_listen = ctx_omni->ended_with_listen.load();
+                // response 段和同轮的 prefill unit 共享 turn_id，
+                // 这样按 turn 丢时会把“用户输入 + 模型回复”作为一个整体一次性丢掉。
+                entry.turn_id = ctx_omni->current_turn_id;
+                // generated_tokens 暂不在这里收集：decode 的 token 流已经通过
+                // text_queue / TTS 通道处理掉了，这里只关心 KV 长度的记账。
+                ctx_omni->unit_history.push_back(entry);
+
+                print_with_timestamp(
+                    "[SW] register response unit: unit_id=%d type=response len=%d "
+                    "is_listen=%d turn_id=%d | cache=%d preserve=%d total_units=%zu\n",
+                    entry.unit_id, entry.length, (int)entry.is_listen, entry.turn_id,
+                    decode_end_cache_len, ctx_omni->system_preserve_length,
+                    ctx_omni->unit_history.size());
+            } else {
+                print_with_timestamp(
+                    "[SW] register response unit: skipped, response_len=%d "
+                    "(start=%d, end=%d) — decode 没有写入新 token，无需记账\n",
+                    response_len, decode_start_cache_len, decode_end_cache_len);
+            }
+        }
+    }
+
+    // 双工模式：只在 LISTEN 结束时记录 round 边界（一个完整的"说+听"轮次结束）
+    // 这样 round 覆盖完整的 [unit+SPEAK...unit+LISTEN] 序列，
+    // 滑窗按 round 截断时不会把连续 SPEAK 或 unit 从中间切开
     if (ctx_omni->duplex_mode) {
-        // 不调用 clean_kvcache 和 eval_prefix，保留当前上下文
-        // 滑动窗口机制会在 prefill_with_emb/eval_tokens 时自动触发
+        if (ctx_omni->ended_with_listen) {
+            ctx_omni->round_start_positions.push_back(ctx_omni->n_past);
+            print_with_timestamp("📍 round boundary at n_past=%d, total rounds=%zu\n",
+                                 ctx_omni->n_past, ctx_omni->round_start_positions.size());
+            // 🔧 [turn 级滑窗] 双工下以 ended_with_listen 作为一个完整 turn 的结束
+            //   （一个 turn 覆盖 [unit+SPEAK...unit+LISTEN] 的完整闭环）
+            ctx_omni->current_turn_id++;
+        }
     } else {
-        // 非双工模式（单工），每轮对话后清理 KV cache
         // clean_kvcache(ctx_omni);
         // eval_prefix(ctx_omni, ctx_omni->params);
     }

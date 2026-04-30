@@ -5643,6 +5643,19 @@ int main(int argc, char ** argv) {
         bool stream = json_value(data, "stream", true);
         int round_idx = json_value(data, "round_idx", -1);  // 🔧 [轮次同步] 从请求中获取 round_idx
 
+        // 🔧 [Length Penalty] 从请求体读取 length_penalty 覆盖 omni context 中的值
+        // length_penalty > 1.0 降低 EOS 概率（生成更长），< 1.0 提高 EOS 概率（更早结束），= 1.0 禁用
+        if (data.contains("length_penalty") && data.at("length_penalty").is_number()) {
+            float lp = data.at("length_penalty").get<float>();
+            {
+                std::lock_guard<std::mutex> lock(ctx_server.octx_mutex);
+                if (ctx_server.octx != nullptr) {
+                    ctx_server.octx->length_penalty = lp;
+                }
+            }
+            SRV_INF("%s: length_penalty set to %.3f\n", __func__, lp);
+        }
+
         if (!stream) {
             bool ok = false;
             {
@@ -5818,6 +5831,20 @@ int main(int argc, char ** argv) {
             }
             ctx_server.octx->async = true;
             ctx_server.octx->duplex_mode = duplex_mode;  // 确保设置
+
+            // 外部传入 system prompt（优先于 C++ 内置默认值）
+            if (data.contains("voice_clone_prompt") && data.at("voice_clone_prompt").is_string()) {
+                const std::string vcp = data.at("voice_clone_prompt").get<std::string>();
+                ctx_server.octx->audio_voice_clone_prompt = vcp;
+                ctx_server.octx->omni_voice_clone_prompt = vcp;
+                SRV_INF("%s: voice_clone_prompt overridden from request\n", __func__);
+            }
+            if (data.contains("assistant_prompt") && data.at("assistant_prompt").is_string()) {
+                const std::string ap = data.at("assistant_prompt").get<std::string>();
+                ctx_server.octx->audio_assistant_prompt = ap;
+                ctx_server.octx->omni_assistant_prompt = ap;
+                SRV_INF("%s: assistant_prompt overridden from request\n", __func__);
+            }
 
             // optional: voice cloning audio during init, index=0
             if (data.contains("voice_audio") && data.at("voice_audio").is_string()) {
@@ -6117,7 +6144,9 @@ int main(int argc, char ** argv) {
             ctx_server.octx->simplex_round_idx = 0;
             ctx_server.octx->wav_turn_base = 0;
             ctx_server.octx->round_start_positions.clear();
-            SRV_INF("%s: simplex_round_idx and wav_turn_base reset to 0\n", __func__);
+            // [Case 2 抢答] 新 session 时重置 force_listen 计数器，重新进入开局强制 LISTEN 期
+            ctx_server.octx->force_listen_used = 0;
+            SRV_INF("%s: simplex_round_idx, wav_turn_base, force_listen_used reset to 0\n", __func__);
             
             // 🔧 [修复卡住问题] 重置 speek_done 为 true
             // 原因：stream_prefill(index=0) 在 warmup_done=true 时会等待 speek_done=true
@@ -6125,7 +6154,21 @@ int main(int argc, char ** argv) {
             ctx_server.octx->speek_done = true;
             SRV_INF("%s: speek_done set to true for session config update\n", __func__);
             
-            // 🔧 [关键] 重置 system_prompt_initialized，让 stream_prefill 重新评估 system prompt
+            // 外部传入 system prompt（优先于 C++ 内置默认值）
+            if (data.contains("voice_clone_prompt") && data.at("voice_clone_prompt").is_string()) {
+                const std::string vcp = data.at("voice_clone_prompt").get<std::string>();
+                ctx_server.octx->audio_voice_clone_prompt = vcp;
+                ctx_server.octx->omni_voice_clone_prompt = vcp;
+                SRV_INF("%s: voice_clone_prompt overridden from request\n", __func__);
+            }
+            if (data.contains("assistant_prompt") && data.at("assistant_prompt").is_string()) {
+                const std::string ap = data.at("assistant_prompt").get<std::string>();
+                ctx_server.octx->audio_assistant_prompt = ap;
+                ctx_server.octx->omni_assistant_prompt = ap;
+                SRV_INF("%s: assistant_prompt overridden from request\n", __func__);
+            }
+
+            // 重置 system_prompt_initialized，让 stream_prefill 重新评估 system prompt
             ctx_server.octx->system_prompt_initialized = false;
             
             // 5. 重新 prefill system prompt（如果提供 voice_audio）
