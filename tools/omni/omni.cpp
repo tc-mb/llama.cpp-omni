@@ -3787,9 +3787,18 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
         
         // 🔧 [模式切换修复] 清理 LLM 的 KV cache，避免位置冲突
         // 当从一个模式切换到另一个模式时，需要清理旧的 KV cache
+        //
+        // NOTE: 这里过去用的是 llama_memory_seq_rm(mem, 0, 0, -1)。
+        // 在新版 llama.cpp (upstream sync 之后) 里, llama_kv_cache::seq_rm 加了
+        //   GGML_ASSERT(seq_id == -1 || (size_t) seq_id < seq_to_stream.size())
+        // 在 ISWA / hybrid 组合里部分内部 kv 的 seq_to_stream 尚未覆盖 seq_id=0 时会 abort，
+        // 导致 llama-server.exe 直接 crash(退出码 3)。
+        // 模式切换语义上我们只是想把 LLM KV cache 全部重置，改用官方
+        // llama_memory_clear 更安全 —— 它按 n_stream 遍历重置 cells/heads，
+        // 不依赖 seq_to_stream 的状态。
         llama_memory_t mem = llama_get_memory(ctx_llama);
         if (mem) {
-            llama_memory_seq_rm(mem, 0, 0, -1);  // 清除 sequence 0 的所有 KV cache
+            llama_memory_clear(mem, /*data=*/false);
             print_with_timestamp("=== omni_init: cleared LLM KV cache for mode switch\n");
         }
     } else {
