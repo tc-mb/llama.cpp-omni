@@ -28,6 +28,17 @@ class Token2WavSession;
 }
 }
 
+// 🔧 [Duplex Pipeline] 仅在 duplex_mode=true 时分配；
+// 定义在 omni.cpp 的 "===== DUPLEX PIPELINE (Stage 1) =====" 区域，
+// omni_context 只持有指针，simplex 路径不受影响。
+struct DuplexPipeline;
+
+// 定义在 omni.cpp 的 "===== DUPLEX SESSION (high-level) =====" 区域。
+// 封装了 prefill_worker / decode_worker 两条调度线程，
+// 让外部只需要 push_frame / wait_next_frame，无需知道 stream_prefill/stream_decode
+// 的"index 语义"和并发约束。
+struct DuplexSession;
+
 //
 // omni ctx
 //
@@ -215,6 +226,21 @@ struct omni_context {
     struct LLMThreadInfo *llm_thread_info = NULL;
     struct TTSThreadInfo *tts_thread_info = NULL;
     struct T2WThreadInfo *t2w_thread_info = NULL;
+
+    // 🔧 [Duplex Pipeline - Stage 1]
+    // 仅在 duplex_mode=true && async=true 时由 omni_init / stream_prefill(index=0) 分配。
+    // 作用：取代 duplex 路径下的老 llm_thread_func，把"VPM+APM 编码"和
+    //      "LLM prefill + autoregressive decode" 拆成两个独立常驻线程，
+    //      并通过自有的细粒度锁解耦，为后续阶段的 encoder 并行、
+    //      batch 融合打基础。
+    // 生命周期：omni_free 中通过 duplex_pipeline_free 销毁。
+    // 非 duplex_mode 下始终为 nullptr。
+    DuplexPipeline * duplex = NULL;
+
+    // 高层 duplex 会话句柄；由 omni_duplex_session_begin 分配，session_end 销毁。
+    // 持有内部 prefill_worker/decode_worker 线程及 frame 队列。
+    // omni_free 时若仍存在，会被强制 session_end 释放。
+    DuplexSession * duplex_session = NULL;
     
     volatile bool need_speek = false;
     volatile bool speek_done = true;
@@ -461,6 +487,81 @@ bool stream_prefill(struct omni_context * ctx_omni,
 bool stream_decode(struct omni_context * ctx_omni,
                         std::string debug_dir,
                         int round_idx = -1);  // round_idx: 由调用方指定的轮次索引，-1 表示使用内部计数
+
+// ============================================================================
+// 高层 Duplex Session API（推荐外部调用方使用）
+//
+// 设计目标：
+//   把"prefill 提前 submit + decode 等待 LLM 完成"的 producer/consumer 调度
+//   完全收纳到 omni 内部。调用方按业务节奏（例如每秒一次）调 push_frame，
+//   通过 wait_next_frame 取本帧的决策与文本。test/server/cli 都可以用同一套接口。
+//
+// 与底层 stream_prefill/stream_decode 的关系：
+//   - omni_duplex_session_begin    内部调一次 stream_prefill(index=0)，初始化
+//                                  system prompt + voice clone + 启动 duplex pipeline。
+//   - omni_duplex_push_frame       通过 prefill_worker 调 stream_prefill(index>0)。
+//   - 内部 decode_worker           每提交一帧 prefill 就触发一次 stream_decode，
+//                                  保持 1:1 顺序（与 duplex_llm_thread_func 配合）。
+//   - omni_duplex_wait_next_frame  按 push 顺序拿出本帧的 LLM 决策与文本。
+//
+// 仅在 duplex_mode=true && async=true 下可用；非 duplex 模式请直接使用 stream_*。
+// ============================================================================
+
+struct OmniDuplexFrame {
+    std::string aud_fname;          // 该帧音频文件路径，空字符串表示无音频
+    std::string img_fname;          // 该帧图片文件路径，空字符串表示无图片
+    int max_slice_nums = -1;        // 与 stream_prefill 同义；-1 表示用全局
+    int64_t user_seq = 0;           // 调用方自定义序号，原样回传到 result
+};
+
+struct OmniDuplexFrameResult {
+    int64_t  user_seq = 0;          // 与 OmniDuplexFrame.user_seq 一致
+    int64_t  frame_id = -1;         // 内部分配的递增 id（1, 2, 3, ...）
+    bool     ok = false;            // false = prefill 或 decode 失败
+    bool     is_speak = false;      // false = LISTEN，true = SPEAK
+    std::string text;               // 该帧 SPEAK 时生成的文本片段（已剔除控制 token）
+    int      n_past_after = 0;      // 帧处理完成时的 ctx_llama n_past（调试用）
+    double   ms_prefill_submit = 0; // push_frame → prefill_worker 完成提交（不等编码）
+    double   ms_decode = 0;         // decode_worker 内部 stream_decode 阻塞时长
+    double   ms_total = 0;          // push_frame → 本帧 result 出队的端到端 wall time
+};
+
+// 启动一次 duplex 会话。
+//   ctx_omni      : 已经 omni_init() + ctx_omni->async = true + duplex_mode = true 的上下文
+//   voice_audio   : 用作 voice clone reference 的音频文件路径，可空
+//   debug_dir     : 每帧 audio chunk 输出目录（沿用 stream_decode 的语义）
+// 失败原因通常是 omni_init 未完成、duplex_mode/async 没开、或 voice_audio prefill 出错。
+bool omni_duplex_session_begin(struct omni_context * ctx_omni,
+                               const std::string & voice_audio,
+                               const std::string & debug_dir = "./");
+
+// 提交一帧到 duplex pipeline。立即返回，不等 LLM 完成。
+// 返回值：>=1 表示分配的 frame_id；<0 表示会话未启动或队列异常。
+// 当内部 pending 队列已满时会阻塞直到有空位（避免无界增长）。
+int64_t omni_duplex_push_frame(struct omni_context * ctx_omni,
+                               const OmniDuplexFrame & frame);
+
+// 阻塞拿下一帧的处理结果（按 push 顺序 FIFO）。
+//   timeout_ms < 0 : 无限等待
+//   timeout_ms = 0 : 非阻塞 try_pop
+//   timeout_ms > 0 : 等待至多 N 毫秒
+// 返回 false 表示超时或会话已结束且队列已空。
+bool omni_duplex_wait_next_frame(struct omni_context * ctx_omni,
+                                 OmniDuplexFrameResult * out,
+                                 int timeout_ms = -1);
+
+// 结束会话：等所有已 push 但未完成的帧 LLM 完成（drain），停止 worker 线程并释放。
+// TTS / token2wav 后台音频生成线程不在此处停止，由 omni_free 负责。
+void omni_duplex_session_end(struct omni_context * ctx_omni);
+
+// 阻塞等待 TTS / token2wav 队列彻底空闲（即所有 speak 帧的 audio 文件已写盘）。
+// 返回前会要求队列连续 idle_ms 毫秒为空，避免误判中间瞬态 idle。
+// 仅在 ctx_omni->async && use_tts 时有意义；其他情况立即返回 true。
+//   max_wait_ms : 总超时上限，超时返回 false
+//   idle_ms     : 连续空闲达到该时长才算 drain 成功（默认 3s）
+bool omni_duplex_drain_tts_audio(struct omni_context * ctx_omni,
+                                 int max_wait_ms = 120000,
+                                 int idle_ms = 3000);
 
 bool stop_speek(struct omni_context * ctx_omni);
 

@@ -2,8 +2,12 @@
 
 find_package(Threads REQUIRED)
 
-# CoreML / ANE support option
-option(ENABLE_COREML "Enable CoreML/ANE support for vision encoder" OFF)
+# CoreML / ANE support option：在 macOS 上默认开，其它平台默认关
+if(APPLE)
+    option(ENABLE_COREML "Enable CoreML/ANE support for vision encoder" ON)
+else()
+    option(ENABLE_COREML "Enable CoreML/ANE support for vision encoder" OFF)
+endif()
 
 add_library(omni
             omni.cpp
