@@ -369,7 +369,7 @@ int main(int argc, char ** argv) {
     std::string tts_bin_dir = get_parent_dir(paths.tts);
 
     common_init();
-    
+
     printf("=== Initializing Duplex Omni Context ===\n");
     printf("  Media type: %d (%s)\n", media_type, media_type == 2 ? "omni: audio+vision" : "audio only");
     printf("  TTS enabled: %s\n", use_tts ? "yes" : "no");
