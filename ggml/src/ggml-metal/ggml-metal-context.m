@@ -99,7 +99,9 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
     // TODO: would it be better to have one queue for the backend and one queue for the device?
     //       the graph encoders and async ops would use the backend queue while the sync ops would use the device queue?
     //res->queue = [device newCommandQueue]; [TAG_QUEUE_PER_BACKEND]
-    res->queue = ggml_metal_device_get_queue(dev);
+    // res->queue = ggml_metal_device_get_queue(dev);
+    // prototype for Metal queue per backend
+    res->queue = [res->device newCommandQueue];
     if (res->queue == nil) {
         GGML_LOG_ERROR("%s: error: failed to create command queue\n", __func__);
         return NULL;
@@ -209,6 +211,7 @@ void ggml_metal_free(ggml_metal_t ctx) {
     Block_release(ctx->encode_async);
 
     //[ctx->queue release]; // [TAG_QUEUE_PER_BACKEND]
+    [ctx->queue release];
 
     dispatch_release(ctx->d_queue);
 
@@ -514,13 +517,9 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
 }
 
 void ggml_metal_graph_optimize(ggml_metal_t ctx, struct ggml_cgraph * gf) {
-    //const int64_t t_start = ggml_time_us();
-
     if (ctx->use_graph_optimize) {
         ggml_graph_optimize(gf);
     }
-
-    //printf("%s: graph optimize took %.3f ms\n", __func__, (ggml_time_us() - t_start) / 1000.0);
 }
 
 void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {

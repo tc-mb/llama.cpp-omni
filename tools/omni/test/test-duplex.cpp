@@ -244,7 +244,7 @@ static void show_usage(const char * prog_name) {
         "  --no-tts            禁用 TTS\n"
         "  --omni              启用 omni 模式 (audio+vision, media_type=2)\n"
         "  --test <prefix> <n> 指定测试数据前缀和 chunk 数量\n"
-        "  -o <dir>            输出目录 (默认: ./tools/omni/output)\n"
+       "  -o <dir>            输出目录 (默认: ./tools/omni/output)\n"
         "  -h, --help          显示帮助\n\n"
         "Example:\n"
         "  %s -m ./models/MiniCPM-o-4_5-gguf/MiniCPM-o-4_5-Q4_K_M.gguf \\\n"
@@ -272,6 +272,10 @@ int main(int argc, char ** argv) {
     bool run_test = false;
     std::string test_prefix;
     int test_count = 0;
+    std::string token2wav_device = "gpu";
+    if (const char * v = std::getenv("OMNI_T2W_DEVICE")) {
+        if (*v) token2wav_device = v;
+    }
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -353,10 +357,19 @@ int main(int argc, char ** argv) {
     params.n_ctx = n_ctx;
     params.n_gpu_layers = n_gpu_layers;
 
+    // 🔧 [bit-exact A/B] 固定 LLM / TTS 采样种子，配合 token2wav 中已有的 mt19937(42)
+    // 让两次独立进程产生完全相同的输出（A/B 对比可用 md5 验证）
+    {
+        const char * seed_env = std::getenv("OMNI_SAMPLER_SEED");
+        uint32_t     seed     = seed_env ? (uint32_t) std::strtoul(seed_env, nullptr, 10) : 42u;
+        params.sampling.seed  = seed;
+        printf("  Sampler seed: %u (env OMNI_SAMPLER_SEED to override)\n", seed);
+    }
+
     std::string tts_bin_dir = get_parent_dir(paths.tts);
 
     common_init();
-
+    
     printf("=== Initializing Duplex Omni Context ===\n");
     printf("  Media type: %d (%s)\n", media_type, media_type == 2 ? "omni: audio+vision" : "audio only");
     printf("  TTS enabled: %s\n", use_tts ? "yes" : "no");
@@ -364,11 +377,12 @@ int main(int argc, char ** argv) {
     printf("  GPU layers: %d\n", n_gpu_layers);
     printf("  Output dir: %s\n", output_dir.c_str());
     printf("  Ref audio: %s\n", ref_audio_path.c_str());
+    printf("  Token2Wav device: %s\n", token2wav_device.c_str());
     printf("  Mode: DUPLEX\n");
 
     // 关键: duplex_mode=true
     auto ctx_omni = omni_init(&params, media_type, use_tts, tts_bin_dir,
-                              /*tts_gpu_layers=*/-1, /*token2wav_device=*/"cpu",
+                              /*tts_gpu_layers=*/-1, /*token2wav_device=*/token2wav_device,
                               /*duplex_mode=*/true,
                               /*existing_model=*/nullptr, /*existing_ctx=*/nullptr,
                               /*base_output_dir=*/output_dir);
