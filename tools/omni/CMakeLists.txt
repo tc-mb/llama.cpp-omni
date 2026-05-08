@@ -33,6 +33,8 @@ if(ENABLE_COREML)
         coreml/omni_coreml.mm
         coreml/coreml_minicpmo45_vit_all_f16.h
         coreml/coreml_minicpmo45_vit_all_f16.m
+        coreml/coreml_t2w_dit.h
+        coreml/coreml_t2w_dit.mm
     )
     # Define compile-time macro for code guards
     target_compile_definitions(omni PRIVATE ENABLE_COREML)
@@ -40,6 +42,7 @@ if(ENABLE_COREML)
     # Enable ARC for Objective-C files
     set_source_files_properties(coreml/omni_coreml.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
     set_source_files_properties(coreml/coreml_minicpmo45_vit_all_f16.m PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+    set_source_files_properties(coreml/coreml_t2w_dit.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 endif()
 
 target_link_libraries     (omni PUBLIC ggml llama llama-common)
@@ -186,4 +189,20 @@ target_include_directories(${TARGET_VOXCPM2_CLI} PRIVATE voxcpm2)
 target_compile_features(${TARGET_VOXCPM2_CLI} PRIVATE cxx_std_17)
 if(LLAMA_TOOLS_INSTALL)
     install(TARGETS ${TARGET_VOXCPM2_CLI} RUNTIME)
+endif()
+
+# Token2Mel-DiT CoreML 单元测试（仅 macOS + CoreML enable 时有效）
+if(ENABLE_COREML)
+    set(TARGET_T2W_DIT_ANE_TEST llama-omni-test-t2w-dit-ane)
+    add_executable         (${TARGET_T2W_DIT_ANE_TEST} test/test_t2w_dit_ane.cpp)
+    set_target_properties  (${TARGET_T2W_DIT_ANE_TEST} PROPERTIES OUTPUT_NAME llama-omni-test-t2w-dit-ane)
+    target_link_libraries  (${TARGET_T2W_DIT_ANE_TEST} PRIVATE common omni Threads::Threads)
+    target_compile_features(${TARGET_T2W_DIT_ANE_TEST} PRIVATE cxx_std_17)
+
+    # CoreML 端到端 test：用真实 prompt + 真实 mu 跑完整 5-step ODE × N chunks
+    set(TARGET_T2W_ANE_E2E llama-omni-test-t2w-ane-end2end)
+    add_executable         (${TARGET_T2W_ANE_E2E} test/test_t2w_ane_end2end.cpp)
+    set_target_properties  (${TARGET_T2W_ANE_E2E} PROPERTIES OUTPUT_NAME llama-omni-test-t2w-ane-end2end)
+    target_link_libraries  (${TARGET_T2W_ANE_E2E} PRIVATE common omni Threads::Threads)
+    target_compile_features(${TARGET_T2W_ANE_E2E} PRIVATE cxx_std_17)
 endif()
