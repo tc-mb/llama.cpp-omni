@@ -244,7 +244,7 @@ static void show_usage(const char * prog_name) {
         "  --no-tts            禁用 TTS\n"
         "  --omni              启用 omni 模式 (audio+vision, media_type=2)\n"
         "  --test <prefix> <n> 指定测试数据前缀和 chunk 数量\n"
-       "  -o <dir>            输出目录 (默认: ./tools/omni/output)\n"
+        "  -o <dir>            输出目录 (默认: ./tools/omni/output)\n"
         "  -h, --help          显示帮助\n\n"
         "Example:\n"
         "  %s -m ./models/MiniCPM-o-4_5-gguf/MiniCPM-o-4_5-Q4_K_M.gguf \\\n"
@@ -369,7 +369,7 @@ int main(int argc, char ** argv) {
     std::string tts_bin_dir = get_parent_dir(paths.tts);
 
     common_init();
-    
+
     printf("=== Initializing Duplex Omni Context ===\n");
     printf("  Media type: %d (%s)\n", media_type, media_type == 2 ? "omni: audio+vision" : "audio only");
     printf("  TTS enabled: %s\n", use_tts ? "yes" : "no");
