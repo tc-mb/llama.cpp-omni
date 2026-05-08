@@ -106,7 +106,7 @@ int main() {
         const char * v = std::getenv(name);
         return (v && *v) ? std::string(v) : def;
     };
-    
+
     std::string model_dir      = env_or("OMNI_T2W_MODEL_DIR", "./tools/omni/convert/gguf/token2wav-gguf");
     std::string encoder_gguf       = model_dir + "/encoder.gguf";
     std::string flow_matching_gguf = model_dir + "/flow_matching.gguf";
