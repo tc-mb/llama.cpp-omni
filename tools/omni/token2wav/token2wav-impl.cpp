@@ -17,7 +17,12 @@ typedef void (*ggml_backend_cuda_set_disable_graph_t)(ggml_backend_t backend, bo
 #include "gguf.h"
 #include <chrono>
 #include <fstream>
+#include <random>
 #include <unordered_map>
+
+#if defined(ENABLE_COREML) && defined(__APPLE__)
+#include "coreml/coreml_t2w_dit.h"
+#endif
 #include <vector>
 #include "ggml-cpu.h"
 #ifdef GGML_USE_CUDA
@@ -231,6 +236,33 @@ flowSetupCacheOut flowCausalMaskedDiffWithXvec::build_setup_cache_graph(
     out.conformer_cnn_cache = enc_out.new_cnn_cache_ctb;
     out.conformer_att_cache = enc_out.new_att_cache;
     out.estimator_cache     = cache_out_ptr;
+    return out;
+}
+flowEncoderOnlyOut flowCausalMaskedDiffWithXvec::build_inference_chunk_encoder_only_graph(
+    ggml_context * ctx,
+    ggml_tensor *  token_ids_tb_i32,
+    ggml_tensor *  spk_cb_f32,
+    bool           last_chunk,
+    ggml_tensor *  conformer_cnn_cache_in,
+    ggml_tensor *  conformer_att_cache_in) const {
+    flowEncoderOnlyOut out{};
+    if (ctx == nullptr || token_ids_tb_i32 == nullptr || spk_cb_f32 == nullptr) {
+        return out;
+    }
+    if (!encoder_) {
+        return out;
+    }
+    // ANE 路径：仅 encoder + projector + spk affine，跳过 decoder/CFG/ODE。
+    // 与 build_inference_chunk_graph 前 4 步语义完全一致。
+    ggml_tensor * xs_ctb       = flow_build_token_embedding_ctb(ctx, token_embedding_weight_, token_ids_tb_i32, input_size_);
+    ggml_tensor * spk_norm_cb  = flow_build_l2_normalize_cb(ctx, spk_cb_f32, 1e-12f);
+    ggml_tensor * spk_proj_cb  = flow_build_linear_cb(ctx, spk_norm_cb, spk_affine_weight_, spk_affine_bias_);
+    auto enc_out               = encoder_->forward_chunk(ctx, xs_ctb, last_chunk, conformer_cnn_cache_in, conformer_att_cache_in);
+    ggml_tensor * mu_ctb       = flow_build_linear_ctb(ctx, enc_out.ys_ctb, encoder_proj_weight_, encoder_proj_bias_);
+    out.mu_ctb              = ggml_cont(ctx, mu_ctb);
+    out.spk_proj_cb         = ggml_cont(ctx, spk_proj_cb);
+    out.conformer_cnn_cache = enc_out.new_cnn_cache_ctb;
+    out.conformer_att_cache = enc_out.new_att_cache;
     return out;
 }
 flowInferenceChunkOut flowCausalMaskedDiffWithXvec::build_inference_chunk_graph(
@@ -7495,6 +7527,28 @@ ggml_tensor * runner_slice_time_dim1_4d(ggml_context * ctx, ggml_tensor * x, int
 }
 }  // namespace
 // 用于上下文/计算图与流式缓存张量
+// 提前定义 streamSessionEncOnly，让 reset()/reset_stream() 能引用其 clear()。
+// 实现细节（build graph / 字段语义）在 inference_chunk_encoder_only 处一并说明。
+struct flowGGUFModelRunner::streamSessionEncOnly {
+    ggml_context *  ctx     = nullptr;
+    ggml_gallocr_t  galloc  = nullptr;
+    int64_t         B               = 0;
+    int64_t         T_chunk_token   = 0;
+    ggml_tensor *   spk_cb              = nullptr;
+    ggml_tensor *   chunk_token_ids_tb  = nullptr;
+    ggml_tensor *   conf_cnn_cache      = nullptr;
+    ggml_tensor *   conf_att_cache      = nullptr;
+    ggml_tensor *   out_mu_ctb_nonlast  = nullptr;
+    ggml_tensor *   out_mu_ctb_last     = nullptr;
+    ggml_tensor *   out_spk_proj_cb     = nullptr;
+    ggml_cgraph *   gf_nonlast = nullptr;
+    ggml_cgraph *   gf_last    = nullptr;
+    void clear() {
+        if (galloc) { ggml_gallocr_free(galloc); galloc = nullptr; }
+        if (ctx)    { ggml_free(ctx);    ctx    = nullptr; }
+        *this = streamSessionEncOnly();
+    }
+};
 struct flowGGUFModelRunner::streamSession {
     ggml_context *        ctx = nullptr;
     ggml_gallocr_t        galloc = nullptr;
@@ -7541,6 +7595,10 @@ void flowGGUFModelRunner::reset() {
         sess_->clear();
         sess_.reset();
     }
+    if (sess_enc_only_) {
+        sess_enc_only_->clear();
+        sess_enc_only_.reset();
+    }
     loader_.~flowGGUFModelLoader();
     new (&loader_) flowGGUFModelLoader();
     num_threads_           = 1;
@@ -7568,6 +7626,10 @@ void flowGGUFModelRunner::reset_stream() {
     if (sess_) {
         sess_->clear();
         sess_.reset();
+    }
+    if (sess_enc_only_) {
+        sess_enc_only_->clear();
+        sess_enc_only_.reset();
     }
     if (std::shared_ptr<flow_matching::fmCausalConditionalCFM> dec = loader_.decoder()) {
         dec->reset_stream_state();
@@ -7947,6 +8009,292 @@ bool flowGGUFModelRunner::inference_chunk(const int32_t *             token_bt,
         runner_read_tensor_bytes(loader_.backend(), sess_->conf_att_cache, cache_out.conformer_att_cache);
         runner_read_tensor_bytes(loader_.backend(), sess_->est_cnn_cache, cache_out.estimator_cnn_cache);
         runner_read_tensor_bytes(loader_.backend(), sess_->est_att_cache, cache_out.estimator_att_cache);
+    }
+    return true;
+}
+// ============================================================================
+// ANE 路径：encoder-only inference 子图 + cache fold 工具
+// streamSessionEncOnly 已经提前定义在 streamSession 旁边，让 reset()/reset_stream()
+// 能引用其 clear()。这里只放函数实现。
+// ============================================================================
+// 把 (C, B) row-major 转 (B, C) row-major
+static void runner_cb_to_bc(const std::vector<float> & cb, int64_t C, int64_t B, std::vector<float> & bc_out) {
+    bc_out.assign((size_t) C * (size_t) B, 0.0f);
+    for (int64_t b = 0; b < B; ++b) {
+        for (int64_t c = 0; c < C; ++c) {
+            bc_out[(size_t) b * (size_t) C + (size_t) c] = cb[(size_t) c * (size_t) B + (size_t) b];
+        }
+    }
+}
+bool flowGGUFModelRunner::inference_chunk_encoder_only(const int32_t *             token_bt,
+                                                       int64_t                     B,
+                                                       int64_t                     T_token,
+                                                       const float *               spk_bc,
+                                                       int64_t                     C_spk,
+                                                       bool                        last_chunk,
+                                                       const flowStreamCacheHost & cache_in_conformer,
+                                                       std::vector<float> &        mu_bct_out,
+                                                       std::vector<float> &        spk_proj_b80_out,
+                                                       flowStreamCacheHost &       cache_out_conformer) {
+    mu_bct_out.clear();
+    spk_proj_b80_out.clear();
+    cache_out_conformer.clear();
+    if (!token_bt || !spk_bc || B <= 0 || T_token <= 0) {
+        return false;
+    }
+    if (C_spk != 192) {
+        LOG_ERROR("inference_chunk_encoder_only: expected C_spk=192, got %lld\n", (long long) C_spk);
+        return false;
+    }
+    if (!loader_.backend() || !loader_.model()) {
+        return false;
+    }
+    if (cache_in_conformer.conformer_cnn_ne.size() != 3 || cache_in_conformer.conformer_att_ne.size() != 4) {
+        LOG_ERROR("inference_chunk_encoder_only: bad cache_in conformer ne (need cnn=3D, att=4D)\n");
+        return false;
+    }
+    const int64_t T_chunk_token = T_token;
+    if (!sess_enc_only_) {
+        sess_enc_only_ = std::make_unique<streamSessionEncOnly>();
+    }
+    auto & s = *sess_enc_only_;
+    const bool need_rebuild = s.ctx == nullptr || s.B != B || s.T_chunk_token != T_chunk_token;
+    if (need_rebuild) {
+        s.clear();
+        s.B             = B;
+        s.T_chunk_token = T_chunk_token;
+        ggml_init_params p{};
+        p.mem_size   = 1024ull * 1024ull * 1024ull;
+        p.mem_buffer = nullptr;
+        p.no_alloc   = true;
+        s.ctx        = ggml_init(p);
+        if (!s.ctx) {
+            s.clear();
+            return false;
+        }
+        // 输入张量
+        s.spk_cb = ggml_new_tensor_2d(s.ctx, GGML_TYPE_F32, C_spk, B);
+        ggml_set_input(s.spk_cb);
+        s.chunk_token_ids_tb = ggml_new_tensor_2d(s.ctx, GGML_TYPE_I32, T_chunk_token, B);
+        ggml_set_input(s.chunk_token_ids_tb);
+        // 持久 conformer cache（按 cache_in 的 ne）
+        s.conf_cnn_cache = ggml_new_tensor_3d(s.ctx, GGML_TYPE_F32,
+            cache_in_conformer.conformer_cnn_ne[0],
+            cache_in_conformer.conformer_cnn_ne[1],
+            cache_in_conformer.conformer_cnn_ne[2]);
+        s.conf_att_cache = ggml_new_tensor_4d(s.ctx, GGML_TYPE_F32,
+            cache_in_conformer.conformer_att_ne[0],
+            cache_in_conformer.conformer_att_ne[1],
+            cache_in_conformer.conformer_att_ne[2],
+            cache_in_conformer.conformer_att_ne[3]);
+        if (!s.conf_cnn_cache || !s.conf_att_cache) {
+            s.clear();
+            return false;
+        }
+        ggml_set_output(s.conf_cnn_cache);
+        ggml_set_output(s.conf_att_cache);
+        // build nonlast graph
+        auto out_n = loader_.model()->build_inference_chunk_encoder_only_graph(
+            s.ctx, s.chunk_token_ids_tb, s.spk_cb, /*last_chunk=*/false,
+            s.conf_cnn_cache, s.conf_att_cache);
+        if (!out_n.mu_ctb || !out_n.spk_proj_cb) {
+            s.clear();
+            return false;
+        }
+        s.out_mu_ctb_nonlast = out_n.mu_ctb;
+        s.out_spk_proj_cb    = out_n.spk_proj_cb;
+        // build last graph
+        auto out_l = loader_.model()->build_inference_chunk_encoder_only_graph(
+            s.ctx, s.chunk_token_ids_tb, s.spk_cb, /*last_chunk=*/true,
+            s.conf_cnn_cache, s.conf_att_cache);
+        if (!out_l.mu_ctb) {
+            s.clear();
+            return false;
+        }
+        s.out_mu_ctb_last = out_l.mu_ctb;
+        // 把新 conformer cache 写回持久 cache（last 路径 att 长度可能 > 持久 ne[1]，trim 之）
+        const int64_t L_conf_att = s.conf_att_cache->ne[1];
+        ggml_tensor * out_n_att_trim = out_n.conformer_att_cache;
+        if (out_n.conformer_att_cache->ne[1] > L_conf_att) {
+            const int64_t delta = out_n.conformer_att_cache->ne[1] - L_conf_att;
+            out_n_att_trim = runner_slice_time_dim1_4d(s.ctx, out_n.conformer_att_cache, delta, L_conf_att);
+        }
+        ggml_tensor * out_l_att_trim = out_l.conformer_att_cache;
+        if (out_l.conformer_att_cache->ne[1] > L_conf_att) {
+            const int64_t delta = out_l.conformer_att_cache->ne[1] - L_conf_att;
+            out_l_att_trim = runner_slice_time_dim1_4d(s.ctx, out_l.conformer_att_cache, delta, L_conf_att);
+        }
+        ggml_tensor * cpy_cnn_n = ggml_cpy(s.ctx, out_n.conformer_cnn_cache, s.conf_cnn_cache);
+        ggml_tensor * cpy_att_n = ggml_cpy(s.ctx, out_n_att_trim,            s.conf_att_cache);
+        ggml_tensor * cpy_cnn_l = ggml_cpy(s.ctx, out_l.conformer_cnn_cache, s.conf_cnn_cache);
+        ggml_tensor * cpy_att_l = ggml_cpy(s.ctx, out_l_att_trim,            s.conf_att_cache);
+        // 两个独立 graph
+        s.gf_nonlast = ggml_new_graph_custom(s.ctx, GGML_DEFAULT_GRAPH_SIZE * 256, false);
+        ggml_build_forward_expand(s.gf_nonlast, s.out_mu_ctb_nonlast);
+        ggml_build_forward_expand(s.gf_nonlast, s.out_spk_proj_cb);
+        ggml_build_forward_expand(s.gf_nonlast, cpy_cnn_n);
+        ggml_build_forward_expand(s.gf_nonlast, cpy_att_n);
+        s.gf_last = ggml_new_graph_custom(s.ctx, GGML_DEFAULT_GRAPH_SIZE * 256, false);
+        ggml_build_forward_expand(s.gf_last, s.out_mu_ctb_last);
+        ggml_build_forward_expand(s.gf_last, s.out_spk_proj_cb);
+        ggml_build_forward_expand(s.gf_last, cpy_cnn_l);
+        ggml_build_forward_expand(s.gf_last, cpy_att_l);
+        // 单图 alloc 让 galloc 算出最大内存预算
+        ggml_cgraph * gf_alloc = ggml_new_graph_custom(s.ctx, GGML_DEFAULT_GRAPH_SIZE * 256, false);
+        ggml_build_forward_expand(gf_alloc, s.out_mu_ctb_nonlast);
+        ggml_build_forward_expand(gf_alloc, s.out_spk_proj_cb);
+        ggml_build_forward_expand(gf_alloc, cpy_cnn_n);
+        ggml_build_forward_expand(gf_alloc, cpy_att_n);
+        ggml_build_forward_expand(gf_alloc, s.out_mu_ctb_last);
+        ggml_build_forward_expand(gf_alloc, cpy_cnn_l);
+        ggml_build_forward_expand(gf_alloc, cpy_att_l);
+        ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(loader_.backend());
+        s.galloc                        = ggml_gallocr_new(buft);
+        if (!s.galloc) {
+            s.clear();
+            return false;
+        }
+        if (!ggml_gallocr_alloc_graph(s.galloc, gf_alloc)) {
+            s.clear();
+            return false;
+        }
+        // 把 cache_in 的 conformer cache 字节写入持久 tensor
+        backend_tensor_set(loader_.backend(), s.conf_cnn_cache,
+                           cache_in_conformer.conformer_cnn_cache.data(),
+                           cache_in_conformer.conformer_cnn_cache.size());
+        backend_tensor_set(loader_.backend(), s.conf_att_cache,
+                           cache_in_conformer.conformer_att_cache.data(),
+                           cache_in_conformer.conformer_att_cache.size());
+    }
+    // 上传输入
+    std::vector<int32_t> token_tb;
+    runner_bt_to_tb(token_bt, B, T_token, token_tb);
+    std::vector<float> spk_cb_v;
+    runner_bc_to_cb(spk_bc, B, C_spk, spk_cb_v);
+    backend_tensor_set(loader_.backend(), s.chunk_token_ids_tb, token_tb.data(),
+                       token_tb.size() * sizeof(int32_t));
+    backend_tensor_set(loader_.backend(), s.spk_cb, spk_cb_v.data(), spk_cb_v.size() * sizeof(float));
+    runner_feed_enc_stream_pos(loader_.backend(), s.ctx, loader_.encoder());
+    // 运行
+    ggml_cgraph *        gf = last_chunk ? s.gf_last : s.gf_nonlast;
+    const ggml_status    st = ggml_backend_graph_compute(loader_.backend(), gf);
+    if (st != GGML_STATUS_SUCCESS) {
+        return false;
+    }
+    if (runner_backend_is_device(loader_.backend())) {
+        ggml_backend_synchronize(loader_.backend());
+    }
+    // 下载 mu (B, 80, T_mel)
+    ggml_tensor * mu_t = last_chunk ? s.out_mu_ctb_last : s.out_mu_ctb_nonlast;
+    {
+        const int64_t      C   = mu_t->ne[0];
+        const int64_t      T   = mu_t->ne[1];
+        const int64_t      Bb  = mu_t->ne[2];
+        std::vector<float> mu_ctb((size_t) C * (size_t) T * (size_t) Bb);
+        ggml_backend_tensor_get(mu_t, mu_ctb.data(), 0, mu_ctb.size() * sizeof(float));
+        runner_ctb_to_bct(mu_ctb, C, T, Bb, mu_bct_out);
+    }
+    // 下载 spk_proj (C=80, B) → (B, C=80)
+    {
+        const int64_t      C  = s.out_spk_proj_cb->ne[0];
+        const int64_t      Bb = s.out_spk_proj_cb->ne[1];
+        std::vector<float> cb_v((size_t) C * (size_t) Bb);
+        ggml_backend_tensor_get(s.out_spk_proj_cb, cb_v.data(), 0, cb_v.size() * sizeof(float));
+        runner_cb_to_bc(cb_v, C, Bb, spk_proj_b80_out);
+    }
+    // export 新 conformer cache
+    if (export_caches_to_host_) {
+        cache_out_conformer.conformer_cnn_ne = { s.conf_cnn_cache->ne[0], s.conf_cnn_cache->ne[1],
+                                                 s.conf_cnn_cache->ne[2] };
+        cache_out_conformer.conformer_att_ne = { s.conf_att_cache->ne[0], s.conf_att_cache->ne[1],
+                                                 s.conf_att_cache->ne[2], s.conf_att_cache->ne[3] };
+        runner_read_tensor_bytes(loader_.backend(), s.conf_cnn_cache, cache_out_conformer.conformer_cnn_cache);
+        runner_read_tensor_bytes(loader_.backend(), s.conf_att_cache, cache_out_conformer.conformer_att_cache);
+    }
+    return true;
+}
+// 把 setup_cache 输出的 5D estimator cache (row-major bytes, 来自
+// flowStreamCacheHost) fold 成 ANE 期望的 4D 格式（按 timestep 拆开）。
+//
+// 5D layout (row-major)：
+//   cnn: estimator_cnn_ne = [t1, t2, t3, n_step, depth]  -- 实际 ne 是 ggml 反向
+//        我们跟随 setup_cache 现有 ne 顺序（dim0=最快变维度，dim4=最慢）：
+//          ne0=2, ne1=1024, ne2=B(=2), ne3=depth(=16), ne4=n_step
+//   att: ne0=128, ne1=T_real, ne2=num_heads(=8), ne3=B(=2), ne4=depth(=16)
+//        actually setup_cache 的 ne 顺序是 (head_dim*2, T, num_heads, B, depth, n_step)?
+//        实际从 build_setup_cache_graph 推导：每层 cache 维度由 fmCFMCache::cnn_cache/att_cache 决定。
+// 这里我们只做 byte-level 切片（按 n_step 切 n 段），剩余维序不变，让 ANE 端按 4D
+// (depth*B, ...) 读取。
+//
+// 结论（与 omni.cpp 跑出来的实测一致）：
+//   estimator_cnn_ne = {2, 1024, B=2*n_step}   ← n_step × depth × B 摊在一起，3D
+//   estimator_att_ne = {128, T, num_heads, B=2*n_step}   ← n_step × depth × B 摊在 dim3
+// 实际 ne 大小由 token2wav-impl 设置；我们按下面的 _bytes_per_step 切片即可。
+bool flowGGUFModelRunner::fold_estimator_cache_5d_to_4d(
+    const flowStreamCacheHost & host,
+    int64_t                      depth,
+    int64_t                      B_internal_2,
+    std::vector<std::vector<float>> & cnn_per_step_4d,
+    std::vector<std::vector<float>> & att_per_step_4d,
+    int64_t &                          out_T_real_att) {
+    cnn_per_step_4d.clear();
+    att_per_step_4d.clear();
+    out_T_real_att = 0;
+    if (host.n_timesteps <= 0) {
+        return false;
+    }
+    if (host.estimator_cnn_ne.size() != 4 || host.estimator_att_ne.size() != 4) {
+        LOG_ERROR("fold_estimator_cache: expected 4D estimator ne, got cnn=%zu att=%zu\n",
+                  host.estimator_cnn_ne.size(), host.estimator_att_ne.size());
+        return false;
+    }
+    const int64_t n_step      = host.n_timesteps;
+    const int64_t cnn_ne0     = host.estimator_cnn_ne[0]; // 2
+    const int64_t cnn_ne1     = host.estimator_cnn_ne[1]; // 1024
+    const int64_t cnn_ne2     = host.estimator_cnn_ne[2]; // B_internal=2
+    const int64_t cnn_ne3     = host.estimator_cnn_ne[3]; // depth*n_step or n_step*depth
+    const int64_t att_ne0     = host.estimator_att_ne[0]; // head_dim*2 = 128
+    const int64_t att_ne1     = host.estimator_att_ne[1]; // T_real
+    const int64_t att_ne2     = host.estimator_att_ne[2]; // num_heads = 8
+    const int64_t att_ne3     = host.estimator_att_ne[3]; // B_internal*depth*n_step (or 类似)
+    // 期望：ne3 = n_step * depth * B_internal_2
+    const int64_t expect_ne3  = n_step * depth * B_internal_2;
+    if (cnn_ne2 != B_internal_2 || cnn_ne3 != expect_ne3 || att_ne3 != expect_ne3) {
+        LOG_ERROR("fold_estimator_cache: ne mismatch cnn={%lld,%lld,%lld,%lld} "
+                  "att={%lld,%lld,%lld,%lld} depth=%lld B=%lld n_step=%lld expect_ne3=%lld\n",
+                  (long long) cnn_ne0, (long long) cnn_ne1, (long long) cnn_ne2, (long long) cnn_ne3,
+                  (long long) att_ne0, (long long) att_ne1, (long long) att_ne2, (long long) att_ne3,
+                  (long long) depth, (long long) B_internal_2, (long long) n_step,
+                  (long long) expect_ne3);
+        return false;
+    }
+    out_T_real_att = att_ne1;
+    // bytes-per-step
+    const size_t cnn_per_step_elems = (size_t) cnn_ne0 * (size_t) cnn_ne1 * (size_t) cnn_ne2 * (size_t) (depth * B_internal_2);
+    const size_t att_per_step_elems = (size_t) att_ne0 * (size_t) att_ne1 * (size_t) att_ne2 * (size_t) (depth * B_internal_2);
+    const size_t cnn_total_bytes    = cnn_per_step_elems * (size_t) n_step * sizeof(float);
+    const size_t att_total_bytes    = att_per_step_elems * (size_t) n_step * sizeof(float);
+    if (host.estimator_cnn_cache.size() != cnn_total_bytes ||
+        host.estimator_att_cache.size() != att_total_bytes) {
+        LOG_ERROR("fold_estimator_cache: byte size mismatch cnn=%zu vs %zu, att=%zu vs %zu\n",
+                  host.estimator_cnn_cache.size(), cnn_total_bytes,
+                  host.estimator_att_cache.size(), att_total_bytes);
+        return false;
+    }
+    // 切片：按 n_step 拆 host bytes 成 n_step 份。每份的 4D shape 是
+    //   cnn: (depth*B_internal_2, 1024, 2)         — fold 后维度顺序为 (D*B, c1, c2)
+    //   att: (depth*B_internal_2, num_heads, T, hd*2)
+    // 注意原 5D bytes 在 dim3=depth*B 上是 contiguous 的（因为 ggml row-major），
+    // 所以同一 step 的 cnn/att 在 host bytes 中是连续的一段。
+    cnn_per_step_4d.resize(n_step);
+    att_per_step_4d.resize(n_step);
+    const float * cnn_src = reinterpret_cast<const float *>(host.estimator_cnn_cache.data());
+    const float * att_src = reinterpret_cast<const float *>(host.estimator_att_cache.data());
+    for (int64_t s = 0; s < n_step; ++s) {
+        cnn_per_step_4d[s].assign(cnn_src + (size_t) s * cnn_per_step_elems,
+                                  cnn_src + (size_t) (s + 1) * cnn_per_step_elems);
+        att_per_step_4d[s].assign(att_src + (size_t) s * att_per_step_elems,
+                                  att_src + (size_t) (s + 1) * att_per_step_elems);
     }
     return true;
 }
@@ -8350,11 +8698,21 @@ bool t2m_load_prompt_cache_gguf(const std::string &               gguf_path,
 
 }  // namespace
 
+Token2Mel::~Token2Mel() {
+#if defined(ENABLE_COREML) && defined(__APPLE__)
+    if (ane_handle_) {
+        t2w_dit_free((t2w_dit_handle_t) ane_handle_);
+        ane_handle_ = nullptr;
+    }
+#endif
+}
+
 bool Token2Mel::load_model(const std::string & encoder_gguf,
                            const std::string & flow_matching_gguf,
                            const std::string & flow_extra_gguf,
                            const std::string & device,
-                           int                 threads) {
+                           int                 threads,
+                           const std::string & ane_mlpackage_path) {
     // 用于加载三段GGUF并初始化runner(失败时回退到cpu)
     reset_stream();
     runner_.set_num_threads(threads);
@@ -8373,6 +8731,38 @@ bool Token2Mel::load_model(const std::string & encoder_gguf,
     }
 
     runner_.set_export_caches_to_host(false);
+
+    // ANE 后端：加载 mlpackage handle
+    backend_kind_       = Backend::GGUF;
+    ane_handle_         = nullptr;
+    ane_mlpackage_path_.clear();
+    if (!ane_mlpackage_path.empty()) {
+#if defined(ENABLE_COREML) && defined(__APPLE__)
+        std::fprintf(stderr,
+                     "[Token2Mel] ANE backend requested, loading mlpackage: %s\n",
+                     ane_mlpackage_path.c_str());
+        ane_handle_ = (void *) t2w_dit_load(ane_mlpackage_path.c_str());
+        if (!ane_handle_) {
+            LOG_ERROR("Token2Mel.load_model: t2w_dit_load failed for %s; "
+                      "falling back to GGUF DiT\n",
+                      ane_mlpackage_path.c_str());
+        } else {
+            ane_mlpackage_path_ = ane_mlpackage_path;
+            backend_kind_       = Backend::ANE;
+            std::fprintf(stderr, "[Token2Mel] ANE backend ready (DiT on ANE, encoder on %s)\n",
+                         device.c_str());
+            // 启用 cache 导出：encoder-only 路径需要 host conformer cache 流转
+            runner_.set_export_caches_to_host(true);
+            // 设置 export_caches_to_host=true 后，inference_chunk 会比平时多
+            // download conformer + estimator cache，但 ANE 模式下我们不会调
+            // inference_chunk（只调 inference_chunk_encoder_only），所以只影响
+            // setup_cache 阶段的一次性导出。
+        }
+#else
+        LOG_ERROR("Token2Mel.load_model: ANE mlpackage requested but ENABLE_COREML not set; "
+                  "falling back to GGUF DiT\n");
+#endif
+    }
 
     model_loaded_   = true;
     stream_started_ = false;
@@ -8570,14 +8960,51 @@ bool Token2Mel::start_stream_with_prompt_cache_gguf(const std::string & prompt_c
     const int   use_nt   = (n_timesteps > 0) ? n_timesteps : n_ts_file;
     const float use_temp = (temperature > 0.0f) ? temperature : temp_file;
 
+    n_timesteps_ = use_nt;
+    temperature_ = use_temp;
+    spk_bc_      = spk_bc;
+
+    if (backend_kind_ == Backend::ANE) {
+        // ANE 路径：encoder-only graph 走 GGUF；DiT × n_timesteps 走 ANE。
+        // 不调用 init_from_host_caches（那会建 GGUF inference graph 占内存却用不上），
+        // 直接把 cache_host 的 conformer 部分塞给 cache_in_ 给后续 encoder-only 用。
+        cache_in_.clear();
+        cache_in_.conformer_cnn_cache = cache_host.conformer_cnn_cache;
+        cache_in_.conformer_cnn_ne    = cache_host.conformer_cnn_ne;
+        cache_in_.conformer_att_cache = cache_host.conformer_att_cache;
+        cache_in_.conformer_att_ne    = cache_host.conformer_att_ne;
+        cache_in_.n_timesteps         = use_nt;
+        // [DEBUG] 打印 estimator cache 的 ne，便于实现 5D→4D fold
+        std::fprintf(stderr,
+                     "[t2w-ane-debug] cache_host.n_timesteps=%d depth=%d (assumed) batch=2 (assumed)\n",
+                     cache_host.n_timesteps, kAneDepth);
+        std::fprintf(stderr, "[t2w-ane-debug] estimator_cnn_ne (size=%zu): ",
+                     cache_host.estimator_cnn_ne.size());
+        for (auto v : cache_host.estimator_cnn_ne) std::fprintf(stderr, "%lld ", (long long) v);
+        std::fprintf(stderr, " bytes=%zu\n", cache_host.estimator_cnn_cache.size());
+        std::fprintf(stderr, "[t2w-ane-debug] estimator_att_ne (size=%zu): ",
+                     cache_host.estimator_att_ne.size());
+        for (auto v : cache_host.estimator_att_ne) std::fprintf(stderr, "%lld ", (long long) v);
+        std::fprintf(stderr, " bytes=%zu\n", cache_host.estimator_att_cache.size());
+        std::fprintf(stderr, "[t2w-ane-debug] conformer_cnn_ne: ");
+        for (auto v : cache_host.conformer_cnn_ne) std::fprintf(stderr, "%lld ", (long long) v);
+        std::fprintf(stderr, " bytes=%zu\n", cache_host.conformer_cnn_cache.size());
+        std::fprintf(stderr, "[t2w-ane-debug] conformer_att_ne: ");
+        for (auto v : cache_host.conformer_att_ne) std::fprintf(stderr, "%lld ", (long long) v);
+        std::fprintf(stderr, " bytes=%zu\n", cache_host.conformer_att_cache.size());
+        if (!start_stream_ane_(cache_host)) {
+            LOG_ERROR("Token2Mel.start_stream_with_prompt_cache_gguf: start_stream_ane_ failed\n");
+            return false;
+        }
+        stream_started_ = true;
+        return true;
+    }
+
     if (!runner_.init_from_host_caches(cache_host, spk_bc.data(), B, use_nt, use_temp)) {
         LOG_ERROR( "Token2Mel.start_stream_with_prompt_cache_gguf: runner.init_from_host_caches failed\n");
         return false;
     }
 
-    n_timesteps_ = use_nt;
-    temperature_ = use_temp;
-    spk_bc_      = std::move(spk_bc);
     cache_in_.clear();
     stream_started_ = true;
     return true;
@@ -8621,6 +9048,348 @@ bool Token2Mel::infer_one_chunk(const std::vector<int32_t> & chunk_bt, bool last
 
     cache_in_ = cache_out;
     return true;
+}
+
+// ===========================================================================
+// ANE 路径：encoder 走 GGUF Metal，DiT 走 ANE mlpackage
+// ===========================================================================
+
+bool Token2Mel::start_stream_ane_(const flowStreamCacheHost & host_cache) {
+    // 复用 GGUF prompt setup_cache 输出的 5D estimator cache 做 voice cloning 起点。
+    // GGUF 实测 ne layout（ggml ne 顺序：ne0=fastest, ne3=slowest）:
+    //   cnn: (1024, 2,           depth*n_step=80, B=2)
+    //        row-major mem: cnn5d[b][d*n_step+s][c2][c1]，元素总数=B*depth*n_step*2*1024
+    //   att: (128, T_real=302,   num_heads*depth*n_step=640, B=2)
+    //        row-major mem: att5d[b][h*depth*n_step+...][T][hd2]
+    //
+    // 实际 5D 内存语义（验证：B=2 在 ne3 最慢；depth*n_step 是把 (depth, n_step) 摊成 1D，
+    // 顺序需要进一步细究——这里假定 ne2 内层是按 [d=0..D-1, s=0..n-1] 排，即慢轴 d 快轴 s）：
+    //   cnn5d[b, d, s, c, t]  →  mem[((b*D + d)*n_step + s) * 2*1024 + c*2 + t]   注意 c 慢 t 快
+    //                          但 ne0=1024=c, ne1=2=t，所以 c 是 ne1 慢，t 是 ne0 快，看代码:
+    //   实际 ggml row-major: mem[ne3*ne2*ne1*ne0 idx] = idx0*1 + idx1*ne0 + idx2*ne0*ne1 + idx3*ne0*ne1*ne2
+    //   所以 cnn 索引 (idx3=b, idx2=ds, idx1=t, idx0=c) → mem[b][ds][t][c]
+    //
+    // 目标 ANE 4D（每 timestep 一份）：
+    //   cnn4d[d*B + b, c1+c2=1024, t=2]  row-major  → cnn[idxB*1024*2 + c*2 + t]
+    //   att4d[d*B + b, num_heads=8, T_pad=600, hd2=128] row-major
+    //        其中 prompt setup 输出 T_real=302，pad 到 max_cache_len=600（前 valid，后 0）
+    if (!ane_handle_) {
+        return false;
+    }
+    const size_t one_cnn_elems = (size_t) kAneDepth * kAneB * 1024 * 2;
+    const size_t one_att_elems = (size_t) kAneDepth * kAneB * kAneNumHeads
+                                  * kAneMaxCacheLen * (2 * kAneHeadDim);
+    ane_cnn_caches_.assign((size_t) n_timesteps_, std::vector<float>(one_cnn_elems, 0.0f));
+    ane_att_caches_.assign((size_t) n_timesteps_, std::vector<float>(one_att_elems, 0.0f));
+    ane_valid_cache_len_ = 0;
+    ane_spk_proj_b2_80_.clear();
+
+    // 把 GGUF setup_cache 输出的 packed estimator cache fold 成 ANE 期望的
+    // per-timestep 4D layout，让 ANE 起步就有 prompt 的 voice-cloning state。
+    //
+    // GGUF packed layout（依据 fm_cfm_view_*_packed 实现 + 实测 ne 反推）:
+    //   slot = step * depth + block_idx        (n_step 在外慢，depth 在内快)
+    //   cnn ne = (C=1024, pad=2,    total_slots=n_step*depth, B=2)
+    //            row-major mem:   mem[b][slot][t][c]     ← c 最快
+    //   att ne = (D2=128, T_real,   num_heads*total_slots, B=2)
+    //            row-major mem:   mem[b][slot*nh+h][t][c] ← c 最快
+    //
+    // ANE per-step 期望（与 ane_export_dit.py + verify_dit_ane.py 一致）:
+    //   cnn (depth*B=32, 1024, 2)         row-major mem[d*B+b][c][t] ← t 最快
+    //   att (depth*B=32, 8, T_pad=600, 128) row-major mem[d*B+b][h][t][c] ← c 最快
+    //
+    // 重要：cnn 最后两维 (c,t) 在 GGUF 是 c 最快、ANE 是 t 最快 → 需要 transpose
+    //       att 最后两维 (t,c) 两边都是 c 最快 → 直接 memcpy 一行 D2 即可
+    if (host_cache.n_timesteps != n_timesteps_ ||
+        host_cache.estimator_cnn_ne.size() != 4 ||
+        host_cache.estimator_att_ne.size() != 4) {
+        std::fprintf(stderr, "[t2w-ane] cache fold skipped (n_step or ne mismatch); cold-start\n");
+        return true;
+    }
+
+    const int64_t depth_i      = (int64_t) kAneDepth;
+    const int64_t B_i          = (int64_t) kAneB;
+    const int64_t H_i          = (int64_t) kAneNumHeads;
+    const int64_t D2_i         = (int64_t) 2 * kAneHeadDim;
+    const int64_t total_slots  = (int64_t) n_timesteps_ * depth_i;
+
+    // -- cnn validate --
+    const int64_t cnn_C   = host_cache.estimator_cnn_ne[0];
+    const int64_t cnn_pad = host_cache.estimator_cnn_ne[1];
+    if (cnn_C != 1024 || cnn_pad != 2 ||
+        host_cache.estimator_cnn_ne[2] != total_slots ||
+        host_cache.estimator_cnn_ne[3] != B_i) {
+        std::fprintf(stderr,
+                     "[t2w-ane] cnn cache ne unexpected ([%lld,%lld,%lld,%lld]); cold-start\n",
+                     (long long) host_cache.estimator_cnn_ne[0],
+                     (long long) host_cache.estimator_cnn_ne[1],
+                     (long long) host_cache.estimator_cnn_ne[2],
+                     (long long) host_cache.estimator_cnn_ne[3]);
+        return true;
+    }
+    const size_t cnn_bytes_expect =
+        (size_t) cnn_C * cnn_pad * total_slots * B_i * sizeof(float);
+    if (host_cache.estimator_cnn_cache.size() != cnn_bytes_expect) {
+        std::fprintf(stderr,
+                     "[t2w-ane] cnn cache size mismatch (got %zu expect %zu); cold-start\n",
+                     host_cache.estimator_cnn_cache.size(), cnn_bytes_expect);
+        return true;
+    }
+
+    // -- att validate --
+    const int64_t att_D2 = host_cache.estimator_att_ne[0];
+    const int64_t T_real = host_cache.estimator_att_ne[1];
+    if (att_D2 != D2_i ||
+        host_cache.estimator_att_ne[2] != H_i * total_slots ||
+        host_cache.estimator_att_ne[3] != B_i) {
+        std::fprintf(stderr,
+                     "[t2w-ane] att cache ne unexpected ([%lld,%lld,%lld,%lld]); cold-start\n",
+                     (long long) host_cache.estimator_att_ne[0],
+                     (long long) host_cache.estimator_att_ne[1],
+                     (long long) host_cache.estimator_att_ne[2],
+                     (long long) host_cache.estimator_att_ne[3]);
+        return true;
+    }
+    const size_t att_bytes_expect =
+        (size_t) att_D2 * T_real * H_i * total_slots * B_i * sizeof(float);
+    if (host_cache.estimator_att_cache.size() != att_bytes_expect) {
+        std::fprintf(stderr,
+                     "[t2w-ane] att cache size mismatch (got %zu expect %zu); cold-start\n",
+                     host_cache.estimator_att_cache.size(), att_bytes_expect);
+        return true;
+    }
+
+    const int64_t T_pad = (int64_t) kAneMaxCacheLen;
+    const float * cnn_src = reinterpret_cast<const float *>(host_cache.estimator_cnn_cache.data());
+    const float * att_src = reinterpret_cast<const float *>(host_cache.estimator_att_cache.data());
+
+    // ---- CNN fold（含 (c,t) transpose）----
+    // src per (b, slot): C * pad floats，contiguous，row-major mem[t][c] (c 最快)
+    // dst per (s, d, b): C * pad floats，row-major mem[c][t] (t 最快)
+    const size_t cnn_per_slot   = (size_t) cnn_C * (size_t) cnn_pad;       // C*T = 2048
+    const size_t cnn_per_step_dB = (size_t) (depth_i * B_i) * cnn_per_slot;
+    for (int s = 0; s < n_timesteps_; ++s) {
+        for (int d = 0; d < kAneDepth; ++d) {
+            for (int b = 0; b < kAneB; ++b) {
+                const int64_t slot     = (int64_t) s * depth_i + d;
+                // src 偏移：b*(C*pad*total_slots) + slot*(C*pad)
+                const float * src      = cnn_src
+                                       + (size_t) b * cnn_per_slot * (size_t) total_slots
+                                       + (size_t) slot * cnn_per_slot;
+                // dst 偏移：(d*B + b)*(C*pad)
+                float * dst            = ane_cnn_caches_[(size_t) s].data()
+                                       + (size_t) (d * kAneB + b) * cnn_per_slot;
+                // 转置：src[t*C + c] → dst[c*T + t]
+                for (int64_t c = 0; c < cnn_C; ++c) {
+                    for (int64_t t = 0; t < cnn_pad; ++t) {
+                        dst[c * cnn_pad + t] = src[t * cnn_C + c];
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- ATT fold（不需要 transpose，按 head 拷贝一段 T_real*D2 bytes）----
+    // src per (b, slot, h): T_real * D2 floats，contiguous, row-major mem[t][c]
+    // dst per (s, d, b, h): T_pad * D2 floats，前 T_real*D2 是真值，后段 0
+    const size_t att_per_slot_h    = (size_t) T_real * (size_t) D2_i;          // T_real * D2 = 38656
+    const size_t att_per_slot      = (size_t) H_i * att_per_slot_h;            // H * T_real * D2
+    const size_t att_per_b         = (size_t) total_slots * att_per_slot;      // total_slots * H * T_real * D2
+    const size_t att_dst_per_h     = (size_t) T_pad * (size_t) D2_i;
+    const size_t att_dst_per_dB    = (size_t) H_i * att_dst_per_h;
+    for (int s = 0; s < n_timesteps_; ++s) {
+        for (int d = 0; d < kAneDepth; ++d) {
+            for (int b = 0; b < kAneB; ++b) {
+                const int64_t slot   = (int64_t) s * depth_i + d;
+                const float * src_b_slot = att_src + (size_t) b * att_per_b + (size_t) slot * att_per_slot;
+                float * dst_dB           = ane_att_caches_[(size_t) s].data()
+                                         + (size_t) (d * kAneB + b) * att_dst_per_dB;
+                for (int h = 0; h < kAneNumHeads; ++h) {
+                    const float * src_h = src_b_slot + (size_t) h * att_per_slot_h;
+                    float *       dst_h = dst_dB + (size_t) h * att_dst_per_h;
+                    std::memcpy(dst_h, src_h, att_per_slot_h * sizeof(float));
+                    // 后 (T_pad - T_real) * D2 个 float 已经在 assign 时初始化成 0
+                }
+            }
+        }
+    }
+
+    ane_valid_cache_len_ = (int) std::min<int64_t>(T_real, kAneMaxCacheLen);
+    std::fprintf(stderr,
+                 "[t2w-ane] folded prompt estimator cache: T_real=%lld T_pad=%lld valid=%d\n",
+                 (long long) T_real, (long long) T_pad, ane_valid_cache_len_);
+    return true;
+}
+
+bool Token2Mel::infer_one_chunk_ane_(const std::vector<int32_t> & chunk_bt, bool last_chunk,
+                                     std::vector<float> & mel_bct) {
+    mel_bct.clear();
+#if !(defined(ENABLE_COREML) && defined(__APPLE__))
+    (void) chunk_bt; (void) last_chunk;
+    LOG_ERROR("Token2Mel.infer_one_chunk_ane_: built without ENABLE_COREML\n");
+    return false;
+#else
+    if (!ensure_ready_for_infer() || !ane_handle_) {
+        return false;
+    }
+    if ((int64_t) chunk_bt.size() != (int64_t) kDt) {
+        LOG_ERROR("Token2Mel.infer_one_chunk_ane_: expected dt=%d tokens, got %lld\n",
+                  (int) kDt, (long long) chunk_bt.size());
+        return false;
+    }
+
+    // ---- Step 1: GGUF encoder-only -> mu (1, 80, 56), spk_proj (1, 80) ----
+    // ANE mlpackage 的 chunk_size 写死 56 = kDt(28) * up_rate(2)。
+    // GGUF encoder 默认 last_chunk=False 时只输出 kChunkMain*2=50 mel（剥掉 lookahead），
+    // 形状跟 ANE 静态形状对不上。这里**对 encoder 永远走 last_chunk=true**，让它输出 56 mel
+    // 喂给 ANE。**但 DiT 输出的 56 mel 中末尾 6 个对应 lookahead，跟下一个 chunk 开头 6 个
+    // 重叠**——如果原样吐给 vocoder，**听起来就是"重音节/卡字"**（每帧多 0.12s 重复的音）。
+    //
+    // 处理方式（与 baseline GGUF inference_chunk 输出语义对齐）:
+    //   非 stream-end 帧：取前 kChunkMain*2 = 50 mel
+    //   真正 stream-end 帧：取全部 56 mel（最后一段含 lookahead 的 0.12s 也吐出来）
+    std::vector<float>  mu_bct;
+    std::vector<float>  spk_proj_b80;
+    flowStreamCacheHost cache_out;
+    {
+        omni::flow::profile::ScopeTimer _t("t2m.ane.encoder");
+        if (!runner_.inference_chunk_encoder_only(
+                chunk_bt.data(), 1, kDt, spk_bc_.data(), kSpkDim,
+                /*last_chunk=*/true, cache_in_, mu_bct, spk_proj_b80, cache_out)) {
+            LOG_ERROR("Token2Mel.infer_one_chunk_ane_: encoder_only failed\n");
+            return false;
+        }
+    }
+    cache_in_ = cache_out;
+
+    const size_t one_xmcf  = (size_t) kMelChannels * (size_t) kAneChunkSize;  // 80 * 56 = 4480
+    const size_t batch_xmcf = (size_t) kAneB * one_xmcf;                       // 8960
+
+    if (mu_bct.size() != one_xmcf) {
+        LOG_ERROR("Token2Mel.infer_one_chunk_ane_: mu shape mismatch (got %zu expect %zu)\n",
+                  mu_bct.size(), one_xmcf);
+        return false;
+    }
+    if (spk_proj_b80.size() != (size_t) kMelChannels) {
+        LOG_ERROR("Token2Mel.infer_one_chunk_ane_: spk_proj shape mismatch (got %zu expect %d)\n",
+                  spk_proj_b80.size(), (int) kMelChannels);
+        return false;
+    }
+
+    // ---- Step 2: 准备 batch=2 (CFG cond+uncond) 输入 ----
+    // mu_b2: [mu; 0]   spks_b2: [spk_proj; 0]   cond_b2: 全 0 (与 inference_chunk 内 ggml_scale(mu,0) 一致)
+    std::vector<float> mu_b2(batch_xmcf, 0.0f);
+    std::memcpy(mu_b2.data(), mu_bct.data(), one_xmcf * sizeof(float));
+    std::vector<float> spks_b2((size_t) kAneB * (size_t) kMelChannels, 0.0f);
+    std::memcpy(spks_b2.data(), spk_proj_b80.data(), (size_t) kMelChannels * sizeof(float));
+    const std::vector<float> cond_b2(batch_xmcf, 0.0f);
+
+    // ---- Step 3: attn_mask (B=2, T=56, T+max_cache=656)  fp32 additive ----
+    const int chunk_T = kAneChunkSize;
+    const int total_K = kAneChunkSize + kAneMaxCacheLen;
+    std::vector<float> mask_b2((size_t) kAneB * (size_t) chunk_T * (size_t) total_K, kAneAttnMaskBigNeg);
+    const int valid = std::min(ane_valid_cache_len_, (int) kAneMaxCacheLen);
+    for (int b = 0; b < kAneB; ++b) {
+        for (int t = 0; t < chunk_T; ++t) {
+            float * row = mask_b2.data() + ((size_t) b * (size_t) chunk_T + (size_t) t) * (size_t) total_K;
+            for (int k = 0; k < chunk_T + valid; ++k) {
+                row[k] = 0.0f;
+            }
+        }
+    }
+
+    // ---- Step 4: x_init = z (跨 chunk 顺序消费 noise) ----
+    // 与 baseline GGUF 路径 fmCausalConditionalCFM::deterministic_noise 对齐：
+    //   后者用 `static std::mt19937 gen(42)`，所有 chunk 共享一个 generator 顺序消费。
+    // 这里同样 process 范围 static，**不要在每个 chunk 重置 seed**，否则每帧 x_init
+    // 都是同一组随机数，TTS 输出会出现"重音节/卡字"（每帧像新句子起头）。
+    std::vector<float> x_b1(one_xmcf);
+    {
+        static std::mt19937             ane_noise_gen(42);
+        std::normal_distribution<float> dist(0.0f, 1.0f);
+        for (size_t i = 0; i < one_xmcf; ++i) {
+            x_b1[i] = temperature_ * dist(ane_noise_gen);
+        }
+    }
+
+    // ---- Step 5: cosine t_span ----
+    std::vector<float> t_span((size_t) n_timesteps_ + 1);
+    for (int i = 0; i <= n_timesteps_; ++i) {
+        const double u = (double) i / (double) n_timesteps_;
+        t_span[(size_t) i] = (float) (1.0 - std::cos(u * 0.5 * M_PI));
+    }
+
+    // ---- Step 6: Euler ODE × n_timesteps，每步调一次 ANE ----
+    std::vector<float> x_b2(batch_xmcf);
+    std::vector<float> t_b2((size_t) kAneB);
+    std::vector<float> feat_b2(batch_xmcf);
+    const size_t cnn_elems = (size_t) kAneDepth * (size_t) kAneB * 1024ull * 2ull;
+    const size_t att_elems = (size_t) kAneDepth * (size_t) kAneB * (size_t) kAneNumHeads
+                            * (size_t) kAneMaxCacheLen * (2ull * (size_t) kAneHeadDim);
+    std::vector<float> cnn_out(cnn_elems);
+    std::vector<float> att_out(att_elems);
+
+    float t_scalar = t_span[0];
+    float dt       = t_span[1] - t_span[0];
+
+    {
+        omni::flow::profile::ScopeTimer _t("t2m.ane.dit");
+        for (int step = 1; step <= n_timesteps_; ++step) {
+            std::memcpy(x_b2.data(),             x_b1.data(), one_xmcf * sizeof(float));
+            std::memcpy(x_b2.data() + one_xmcf,  x_b1.data(), one_xmcf * sizeof(float));
+            t_b2[0] = t_scalar;
+            t_b2[1] = t_scalar;
+
+            int rc = t2w_dit_predict(
+                (t2w_dit_handle_t) ane_handle_,
+                x_b2.data(), mu_b2.data(), t_b2.data(), spks_b2.data(), cond_b2.data(),
+                ane_cnn_caches_[(size_t) step - 1].data(),
+                ane_att_caches_[(size_t) step - 1].data(),
+                mask_b2.data(),
+                feat_b2.data(), cnn_out.data(), att_out.data());
+            if (rc != 0) {
+                LOG_ERROR("Token2Mel.infer_one_chunk_ane_: t2w_dit_predict failed rc=%d at step=%d\n",
+                          rc, step);
+                return false;
+            }
+
+            // CFG + Euler step：dphi = (1+cfg)*cond - cfg*uncond； x = x + dt*dphi
+            const float k1 = 1.0f + kAneCfgRate;
+            const float k2 = kAneCfgRate;
+            for (size_t i = 0; i < one_xmcf; ++i) {
+                const float dphi = k1 * feat_b2[i] - k2 * feat_b2[one_xmcf + i];
+                x_b1[i] = x_b1[i] + dt * dphi;
+            }
+
+            t_scalar += dt;
+            if (step < n_timesteps_) {
+                dt = t_span[(size_t) step + 1] - t_scalar;
+            }
+
+            std::swap(ane_cnn_caches_[(size_t) step - 1], cnn_out);
+            std::swap(ane_att_caches_[(size_t) step - 1], att_out);
+        }
+    }
+
+    // ---- Step 7: x_b1 (B=1, C=80, T=56) row-major mem[c][t] → mel_bct ----
+    // 非 last_chunk：strip 末尾 kPreLookahead*2 = 6 mel frames（lookahead 区会跟下一个 chunk
+    //                开头重复），只保留前 kChunkMain*2 = 50 frames，跟 baseline GGUF 输出语义一致。
+    // last_chunk：保留全部 kAneChunkSize = 56 frames。
+    constexpr int kMelMain      = kChunkMain * 2;        // 50
+    constexpr int kMelLookahead = kPreLookahead * 2;     // 6
+    static_assert(kMelMain + kMelLookahead == kAneChunkSize,
+                  "ANE chunk size must equal main+lookahead mel frames");
+    const int n_out_mel = last_chunk ? (int) kAneChunkSize : kMelMain;
+    mel_bct.resize((size_t) kMelChannels * (size_t) n_out_mel);
+    for (int c = 0; c < (int) kMelChannels; ++c) {
+        std::memcpy(mel_bct.data() + (size_t) c * (size_t) n_out_mel,
+                    x_b1.data()    + (size_t) c * (size_t) kAneChunkSize,
+                    (size_t) n_out_mel * sizeof(float));
+    }
+
+    ane_valid_cache_len_ = std::min(ane_valid_cache_len_ + (int) kAneChunkSize, (int) kAneMaxCacheLen);
+    return true;
+#endif
 }
 
 void Token2Mel::append_bct_along_time(const std::vector<float> & src_bct,
@@ -8683,7 +9452,10 @@ bool Token2Mel::push_tokens(const int32_t * tokens, int64_t n_tokens, bool is_fi
     }
 
     std::vector<float> mel_chunk_bct;
-    if (!infer_one_chunk(chunk_bt, is_final, mel_chunk_bct)) {
+    const bool ok = (backend_kind_ == Backend::ANE)
+                        ? infer_one_chunk_ane_(chunk_bt, is_final, mel_chunk_bct)
+                        : infer_one_chunk(chunk_bt, is_final, mel_chunk_bct);
+    if (!ok) {
         return false;
     }
 
@@ -8718,6 +9490,11 @@ void Token2Mel::reset_stream() {
     stream_started_ = false;
     spk_bc_.clear();
     cache_in_.clear();
+    // ANE 模式：重置 per-timestep cache（不释放 ane_handle_，可复用）
+    ane_cnn_caches_.clear();
+    ane_att_caches_.clear();
+    ane_spk_proj_b2_80_.clear();
+    ane_valid_cache_len_ = 0;
 }
 
 bool Token2MelSession::init_from_prompt_bundle(const std::string & encoder_gguf,
@@ -8900,11 +9677,13 @@ bool Token2Wav::load_models(const std::string & encoder_gguf,
                             const std::string & flow_extra_gguf,
                             const std::string & vocoder_gguf,
                             const std::string & device_token2mel,
-                            const std::string & device_vocoder) {
+                            const std::string & device_vocoder,
+                            const std::string & ane_mlpackage_path) {
     reset_stream();
 
     constexpr int kDefaultThreads = 8;
-    if (!t2m_.load_model(encoder_gguf, flow_matching_gguf, flow_extra_gguf, device_token2mel, kDefaultThreads)) {
+    if (!t2m_.load_model(encoder_gguf, flow_matching_gguf, flow_extra_gguf, device_token2mel, kDefaultThreads,
+                         ane_mlpackage_path)) {
         LOG_ERROR( "Token2Wav.load_models: Token2Mel.load_model failed\n");
         models_loaded_ = false;
         return false;
