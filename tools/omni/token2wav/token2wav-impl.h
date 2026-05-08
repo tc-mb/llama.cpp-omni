@@ -61,6 +61,13 @@ struct flowInferenceChunkOut {
     ggml_tensor * conformer_att_cache = nullptr;
     flow_matching::fmCFMCache * estimator_cache = nullptr;
 };
+// ANE 路径：encoder + projector 输出到 mu，跳过 decoder（DiT 走 ANE mlpackage）。
+struct flowEncoderOnlyOut {
+    ggml_tensor * mu_ctb              = nullptr;  // (C=80, T_mel, B)，row-major contiguous
+    ggml_tensor * spk_proj_cb         = nullptr;  // (C=80, B)，已 normalize+affine
+    ggml_tensor * conformer_cnn_cache = nullptr;
+    ggml_tensor * conformer_att_cache = nullptr;
+};
 class flowCausalMaskedDiffWithXvec {
   public:
     flowCausalMaskedDiffWithXvec(int32_t                                                            input_size,
@@ -95,6 +102,15 @@ class flowCausalMaskedDiffWithXvec {
                                                       int                               n_timesteps,
                                                       float                             temperature,
                                                       flow_matching::fmCFMCache *       estimator_cache_out) const;
+    // ANE 路径用：只 build encoder + projector + spk affine，输出 mu / spk_proj / 新 conformer cache。
+    // 与 build_inference_chunk_graph 前半段语义完全一致，仅去掉 decoder/CFG/ODE 部分。
+    flowEncoderOnlyOut build_inference_chunk_encoder_only_graph(
+        ggml_context * ctx,
+        ggml_tensor *  token_ids_tb_i32,
+        ggml_tensor *  spk_cb_f32,
+        bool           last_chunk,
+        ggml_tensor *  conformer_cnn_cache_in,
+        ggml_tensor *  conformer_att_cache_in) const;
   private:
     int32_t input_size_    = 0;
     int32_t output_size_   = 0;
@@ -1673,12 +1689,48 @@ class flowGGUFModelRunner {
                                int64_t                     B,
                                int                         n_timesteps,
                                float                       temperature);
+
+    // ============== ANE 路径专用：encoder-only inference ==============
+    // 与 inference_chunk 共享 conformer cache（cache_in/out 中只用 conformer 部分），
+    // 但只跑 encoder + projector + spk affine 子图，输出 mu (B,80,T_mel) 和
+    // spk_proj (B,80)。estimator cache 不在此 backend 上维护——由调用方（Token2MelANE）
+    // 在 ANE C ABI 这边维护 4D fold 后的 cache。
+    //
+    // 注意：本函数维护**独立**的 encoder-only streamSession（sess_enc_only_），
+    // 不影响 setup_cache / inference_chunk 用的 sess_。
+    bool inference_chunk_encoder_only(const int32_t *             token_bt,
+                                      int64_t                     B,
+                                      int64_t                     T_token,
+                                      const float *               spk_bc,
+                                      int64_t                     C_spk,
+                                      bool                        last_chunk,
+                                      const flowStreamCacheHost & cache_in_conformer,
+                                      std::vector<float> &        mu_bct_out,
+                                      std::vector<float> &        spk_proj_b80_out,
+                                      flowStreamCacheHost &       cache_out_conformer);
+
+    // 用 setup_cache 的 estimator cache (5D row-major bytes) 把 fold 成 ANE 期望的
+    // 4D 格式（depth*B, ...），按 timestep 拆成 n_timesteps 份。
+    // 输出 layout：
+    //   cnn_per_step_4d: 每份 (depth*B, 1024, 2)，row-major fp32
+    //   att_per_step_4d: 每份 (depth*B, num_heads, T_real, head_dim*2)，row-major fp32
+    //                    （T_real = setup 时输入 prompt mel 的长度，可能 < max_cache_len）
+    // 调用方负责把 att 后续 pad 到 max_cache_len。
+    static bool fold_estimator_cache_5d_to_4d(const flowStreamCacheHost & host,
+                                              int64_t                      depth,
+                                              int64_t                      B_internal_2,
+                                              std::vector<std::vector<float>> & cnn_per_step_4d,
+                                              std::vector<std::vector<float>> & att_per_step_4d,
+                                              int64_t &                          out_T_real_att);
+
   private:
     struct streamSession;
+    struct streamSessionEncOnly;
     int  num_threads_           = 1;
     bool export_caches_to_host_ = true;
     flowGGUFModelLoader            loader_;
-    std::unique_ptr<streamSession> sess_;
+    std::unique_ptr<streamSession>        sess_;
+    std::unique_ptr<streamSessionEncOnly> sess_enc_only_;
 };
 }  // namespace flow
 }  // namespace omni
@@ -1989,17 +2041,20 @@ class Token2Mel {
         int64_t T_prompt_mel   = 0;
     };
 
-    Token2Mel()  = default;
-    ~Token2Mel() = default;
+    Token2Mel() = default;
+    ~Token2Mel();
 
     Token2Mel(const Token2Mel &)             = delete;
     Token2Mel & operator=(const Token2Mel &) = delete;
 
+    // ane_mlpackage_path 非空时启用 ANE 后端：encoder/projector 仍走 GGUF/Metal，
+    // 但 DiT estimator 走 ANE mlpackage（绕过 GPU command queue contention）。
     bool load_model(const std::string & encoder_gguf,
                     const std::string & flow_matching_gguf,
                     const std::string & flow_extra_gguf,
-                    const std::string & device  = "gpu",
-                    int                 threads = 8);
+                    const std::string & device              = "gpu",
+                    int                 threads             = 8,
+                    const std::string & ane_mlpackage_path  = "");
 
     static bool load_prompt_bundle_dir(const std::string & dir, PromptBundle & out);
 
@@ -2017,12 +2072,23 @@ class Token2Mel {
 
     void reset_stream();
 
+    bool is_ane_mode() const { return backend_kind_ == Backend::ANE; }
+
     static constexpr int32_t kMelChannels  = 80;
     static constexpr int32_t kSpkDim       = 192;
     static constexpr int32_t kPadToken     = 4218;
     static constexpr int32_t kPreLookahead = 3;
     static constexpr int32_t kChunkMain    = 25;
     static constexpr int32_t kDt           = kChunkMain + kPreLookahead;
+    // ANE 后端专用常量（与 ane_export_dit.py 写死的 mlpackage 形状一致）
+    static constexpr int32_t kAneChunkSize    = 56;   // mel frames per call (kDt × 2)
+    static constexpr int32_t kAneMaxCacheLen  = 600;
+    static constexpr int32_t kAneDepth        = 16;
+    static constexpr int32_t kAneNumHeads     = 8;
+    static constexpr int32_t kAneHeadDim      = 64;
+    static constexpr int32_t kAneB            = 2;    // CFG cond+uncond batched
+    static constexpr float   kAneCfgRate      = 0.7f;
+    static constexpr float   kAneAttnMaskBigNeg = -1e4f;
 
     static void append_bct_along_time(const std::vector<float> & src_bct,
                                       int64_t                    B,
@@ -2030,9 +2096,17 @@ class Token2Mel {
                                       std::vector<float> &       dst_bct_inout);
 
   private:
+    enum class Backend { GGUF, ANE };
+
     bool ensure_ready_for_infer() const;
     bool infer_one_chunk(const std::vector<int32_t> & chunk_bt, bool last_chunk, std::vector<float> & mel_bct);
 
+    // ANE 路径：encoder via GGUF runner 输出 mu，DiT × n_timesteps 走 ANE mlpackage。
+    bool start_stream_ane_(const flowStreamCacheHost & host_cache);
+    bool infer_one_chunk_ane_(const std::vector<int32_t> & chunk_bt, bool last_chunk,
+                              std::vector<float> & mel_bct);
+
+    Backend             backend_kind_   = Backend::GGUF;
     flowGGUFModelRunner runner_;
     bool                model_loaded_   = false;
     bool                stream_started_ = false;
@@ -2043,6 +2117,17 @@ class Token2Mel {
     std::vector<float> spk_bc_;
 
     flowStreamCacheHost cache_in_;
+
+    // ANE 模式专用 state（仅当 backend_kind_ == ANE 时有效）
+    void *                          ane_handle_ = nullptr;  // t2w_dit_handle_t (opaque)
+    std::string                     ane_mlpackage_path_;
+    std::vector<std::vector<float>> ane_cnn_caches_;        // n_timesteps × (depth*B*1024*2)
+    std::vector<std::vector<float>> ane_att_caches_;        // n_timesteps × (depth*B*nh*max_cache_len*head_dim*2)
+    std::vector<float>              ane_spk_proj_b2_80_;    // (B=2, 80)，[spk; zeros] for CFG
+    int                             ane_valid_cache_len_ = 0;
+    // Noise generator：跟 baseline GGUF 路径（fmCausalConditionalCFM::deterministic_noise 内
+    // 的 static std::mt19937 gen(42)）对齐——跨 chunk 顺序消费，**绝不能每个 chunk 重置 seed**，
+    // 否则每帧 x_init 都从同一组随机数开始，导致音色帧间不连续（听起来像"卡字"/重音节）。
 };
 
 struct Token2MelSession {
@@ -2117,8 +2202,9 @@ class Token2Wav {
                      const std::string & flow_matching_gguf,
                      const std::string & flow_extra_gguf,
                      const std::string & vocoder_gguf,
-                     const std::string & device_token2mel = "gpu",
-                     const std::string & device_vocoder   = "gpu");
+                     const std::string & device_token2mel    = "gpu",
+                     const std::string & device_vocoder      = "gpu",
+                     const std::string & ane_mlpackage_path  = "");
 
     bool start_stream_with_prompt_cache_gguf(const std::string & prompt_cache_gguf_path,
                                              int                 n_timesteps = -1,
@@ -2172,20 +2258,22 @@ struct Token2WavSession {
                                      const std::string & flow_extra_gguf,
                                      const std::string & prompt_cache_gguf_path,
                                      const std::string & vocoder_gguf,
-                                     const std::string & device_token2mel = "gpu",
-                                     const std::string & device_vocoder   = "gpu",
-                                     int                 n_timesteps      = 10,
-                                     float               temperature      = 1.0f);
+                                     const std::string & device_token2mel    = "gpu",
+                                     const std::string & device_vocoder      = "gpu",
+                                     int                 n_timesteps         = 10,
+                                     float               temperature         = 1.0f,
+                                     const std::string & ane_mlpackage_path  = "");
 
     bool init_from_prompt_bundle(const std::string & encoder_gguf,
                                  const std::string & flow_matching_gguf,
                                  const std::string & flow_extra_gguf,
                                  const std::string & prompt_bundle_dir,
                                  const std::string & vocoder_gguf,
-                                 const std::string & device_token2mel = "gpu",
-                                 const std::string & device_vocoder   = "gpu",
-                                 int                 n_timesteps      = 10,
-                                 float               temperature      = 1.0f);
+                                 const std::string & device_token2mel    = "gpu",
+                                 const std::string & device_vocoder      = "gpu",
+                                 int                 n_timesteps         = 10,
+                                 float               temperature         = 1.0f,
+                                 const std::string & ane_mlpackage_path  = "");
 
     bool feed_tokens(const int32_t * tokens, int64_t n_tokens, bool is_final, std::vector<float> & wave_bt_out);
 
