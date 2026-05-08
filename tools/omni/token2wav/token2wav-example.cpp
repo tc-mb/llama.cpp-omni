@@ -98,7 +98,8 @@ int main() {
 
     // 默认路径，根据5个gguf和两个输出位置改动；可用环境变量覆盖，便于做纯 T2W profile。
     //   OMNI_T2W_MODEL_DIR  : token2wav-gguf 目录（内含 encoder/flow_*/hifigan2/prompt_cache）
-    //   OMNI_T2W_DEVICE     : "cpu" / "gpu" / "gpu:<idx>"（对 token2mel 和 vocoder 同时生效）
+    //   OMNI_T2W_DEVICE     : "cpu" / "gpu" / "gpu:<idx>"（token2mel 设备）
+    //   OMNI_VOC_DEVICE : 可选，覆盖 vocoder 设备；macOS 默认走 CPU，避免 Metal vocoder 慢路径
     //   OMNI_T2W_OUT_WAV    : 合并输出 WAV 路径
     //   OMNI_T2W_OUT_CHUNK_DIR : 每个 callback chunk 的输出目录（空串 = 不落盘）
     auto env_or = [](const char * name, const std::string & def) {
@@ -117,7 +118,11 @@ int main() {
     std::string out_chunk_wav_dir  = env_or("OMNI_T2W_OUT_CHUNK_DIR", "/tmp/token2wav_example_chunks");
 
     std::string device_token2mel   = env_or("OMNI_T2W_DEVICE", "gpu");
-    std::string device_vocoder     = env_or("OMNI_T2W_DEVICE", "gpu");
+#if defined(__APPLE__)
+    std::string device_vocoder     = env_or("OMNI_VOC_DEVICE", "cpu");
+#else
+    std::string device_vocoder     = env_or("OMNI_VOC_DEVICE", device_token2mel);
+#endif
 
     int       n_timesteps = std::atoi(env_or("OMNI_T2W_N_TIMESTEPS", "5").c_str());
     float     temperature = 1.0f;

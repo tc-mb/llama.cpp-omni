@@ -1032,8 +1032,8 @@ ggml_tensor * fmCausalConv1d::build_forward_graph(ggml_context * ctx, ggml_tenso
     if (ctx == nullptr || x == nullptr) {
         return nullptr;
     }
-    const int64_t Cin = x->ne[0];
-    const int64_t B   = x->ne[2];
+    const int64_t T     = x->ne[1];
+    const int64_t B     = x->ne[2];
     const int64_t K     = weight_->ne[0];
     const int64_t Cin_w = weight_->ne[1];
     const int64_t Cout  = weight_->ne[2];
@@ -1041,20 +1041,11 @@ ggml_tensor * fmCausalConv1d::build_forward_graph(ggml_context * ctx, ggml_tenso
     x_tcb               = ggml_cont(ctx, x_tcb);
     const int     pad_left = static_cast<int>(K - 1);
     ggml_tensor * x_pad    = ggml_pad_ext(ctx, x_tcb, pad_left, 0, 0, 0, 0, 0, 0, 0);
-    ggml_tensor * y_tcb = nullptr;
-    for (int64_t b_idx = 0; b_idx < B; ++b_idx) {
-        const size_t  offset = x_pad->nb[2] * static_cast<size_t>(b_idx);
-        ggml_tensor * x_pad_b =
-            ggml_view_3d(ctx, x_pad, x_pad->ne[0], x_pad->ne[1], 1, x_pad->nb[1], x_pad->nb[2], offset);
-        ggml_tensor * y_tcb_b = fm_causal_conv1d_im2col_f32_n1(ctx, weight_, x_pad_b, 1, 0, 1);
-        if (y_tcb == nullptr) {
-            y_tcb = y_tcb_b;
-        } else {
-            y_tcb = ggml_concat(ctx, y_tcb, y_tcb_b, 2);
-        }
-    }
-    ggml_tensor * y = ggml_permute(ctx, y_tcb, 1, 0, 2, 3);
-    y               = ggml_cont(ctx, y);
+    ggml_tensor * col = ggml_im2col(ctx, weight_, x_pad, 1, 0, 0, 0, 1, 0, false, GGML_TYPE_F32);
+    ggml_tensor * col_2d = ggml_reshape_2d(ctx, col, K * Cin_w, T * B);
+    ggml_tensor * w_2d = ggml_reshape_2d(ctx, weight_, K * Cin_w, Cout);
+    ggml_tensor * mm = ggml_mul_mat(ctx, w_2d, col_2d);
+    ggml_tensor * y = ggml_reshape_3d(ctx, mm, Cout, T, B);
     if (bias_ != nullptr) {
         ggml_tensor * bias_broadcast = ggml_reshape_3d(ctx, bias_, Cout, 1, 1);
         y                            = ggml_add(ctx, y, bias_broadcast);
@@ -1069,13 +1060,13 @@ ggml_tensor * fmCausalConv1d::build_forward_chunk_graph(ggml_context * ctx,
     if (ctx == nullptr || x == nullptr) {
         return nullptr;
     }
-    const int64_t Cin = x->ne[0];
-    const int64_t dt  = x->ne[1];
-    const int64_t B   = x->ne[2];
+    const int64_t Cin   = x->ne[0];
+    const int64_t dt    = x->ne[1];
+    const int64_t B     = x->ne[2];
     const int64_t K     = weight_->ne[0];
     const int64_t Cin_w = weight_->ne[1];
     const int64_t Cout  = weight_->ne[2];
-    const int64_t pad = kernel_size_ - 1;
+    const int64_t pad   = kernel_size_ - 1;
     ggml_tensor * cache_in = cnn_cache;
     if (cache_in == nullptr) {
         ggml_tensor * zero_x = ggml_scale(ctx, x, 0.0f);
@@ -1093,21 +1084,11 @@ ggml_tensor * fmCausalConv1d::build_forward_chunk_graph(ggml_context * ctx,
     ggml_tensor * x_tcb = ggml_permute(ctx, x, 1, 0, 2, 3);
     x_tcb               = ggml_cont(ctx, x_tcb);
     ggml_tensor * x_cat_tcb = ggml_concat(ctx, cache_tcb, x_tcb, 0);
-    x_cat_tcb               = ggml_cont(ctx, x_cat_tcb);
-    ggml_tensor * y_tcb = nullptr;
-    for (int64_t b_idx = 0; b_idx < B; ++b_idx) {
-        const size_t  offset  = x_cat_tcb->nb[2] * static_cast<size_t>(b_idx);
-        ggml_tensor * x_cat_b = ggml_view_3d(ctx, x_cat_tcb, x_cat_tcb->ne[0], x_cat_tcb->ne[1], 1, x_cat_tcb->nb[1],
-                                             x_cat_tcb->nb[2], offset);
-        ggml_tensor * y_tcb_b = fm_causal_conv1d_im2col_f32_n1(ctx, weight_, x_cat_b, 1, 0, 1);
-        if (y_tcb == nullptr) {
-            y_tcb = y_tcb_b;
-        } else {
-            y_tcb = ggml_concat(ctx, y_tcb, y_tcb_b, 2);
-        }
-    }
-    ggml_tensor * y = ggml_permute(ctx, y_tcb, 1, 0, 2, 3);
-    y               = ggml_cont(ctx, y);
+    ggml_tensor * col = ggml_im2col(ctx, weight_, x_cat_tcb, 1, 0, 0, 0, 1, 0, false, GGML_TYPE_F32);
+    ggml_tensor * col_2d = ggml_reshape_2d(ctx, col, K * Cin_w, dt * B);
+    ggml_tensor * w_2d = ggml_reshape_2d(ctx, weight_, K * Cin_w, Cout);
+    ggml_tensor * mm = ggml_mul_mat(ctx, w_2d, col_2d);
+    ggml_tensor * y = ggml_reshape_3d(ctx, mm, Cout, dt, B);
     if (bias_ != nullptr) {
         ggml_tensor * bias_broadcast = ggml_reshape_3d(ctx, bias_, Cout, 1, 1);
         y                            = ggml_add(ctx, y, bias_broadcast);
