@@ -943,6 +943,37 @@ struct ggml_cuda_graph {
     bool disable_due_to_too_many_updates = false;
     bool disable_due_to_failed_graph_capture = false;
     int number_consecutive_updates = 0;
+
+    // Per-backend-instance opt-in: skip the "ADD with src[1]->ne[1]>1 disables CUDA graph"
+    // guard. Only safe when the caller guarantees that every graph invocation on this
+    // backend has identical shapes (e.g. token2wav's fixed-shape CFM / vocoder graphs).
+    // Enable via the extension API `ggml_backend_cuda_set_allow_batched_add`, reached
+    // through `ggml_backend_reg_get_proc_address("ggml_backend_cuda_set_allow_batched_add")`.
+    bool allow_batched_add = false;
+
+    // Per-backend-instance opt-out: when true, the next ggml_backend_graph_compute call
+    // on this backend bypasses the CUDA graph capture/update machinery ENTIRELY — i.e.
+    // `use_cuda_graph` is forced false from the very top, BEFORE `is_cuda_graph_update_required`
+    // runs, so the cached `ggml_graph_properties` and `instance` are NOT touched.
+    //
+    // Motivation: some callers (e.g. token2wav) alternate between two structurally
+    // different graphs (gf_nonlast vs gf_last). If the "odd one out" graph (gf_last)
+    // is allowed through the normal path, `is_cuda_graph_update_required` overwrites
+    // the properties cache with gf_last's shape — which then forces the NEXT gf_nonlast
+    // invocation to be update_required=true and re-instantiate its CUDA graph, erasing
+    // the hot-path savings. Setting `disable_graph=true` around the gf_last compute
+    // keeps the gf_nonlast instance hot across the whole stream.
+    //
+    // Typical use at the call site:
+    //   auto fn = (void(*)(ggml_backend_t, bool))
+    //       ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_set_disable_graph");
+    //   if (fn) fn(backend, true);
+    //   ggml_backend_graph_compute(backend, gf_last);
+    //   if (fn) fn(backend, false);
+    //
+    // No-op when ggml-cuda was built without USE_CUDA_GRAPH.
+    bool disable_graph = false;
+
     std::vector<ggml_graph_node_properties> ggml_graph_properties;
     bool use_cpy_indirection = false;
     std::vector<char *> cpy_dest_ptrs;

@@ -72,6 +72,7 @@ struct T2WOut {
     bool is_final = false;  // Whether this is the final chunk (turn end)
     bool is_chunk_end = false;  // Whether this is the end of a TTS chunk (flush buffer, but not final)
     int round_idx = -1;  // 🔧 [修复目录同步] 轮次索引，由 TTS 线程设置，T2W 线程使用此值确定输出目录
+    std::chrono::steady_clock::time_point enqueue_time = std::chrono::steady_clock::now();
 };
 
 struct T2WThreadInfo {

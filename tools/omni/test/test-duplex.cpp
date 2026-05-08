@@ -223,6 +223,10 @@ int main(int argc, char ** argv) {
     int  stream_interval_ms = 0;  // 0 = 背靠背（压测）；真实流式建议 1000
     std::string test_prefix;
     int test_count = 0;
+    std::string token2wav_device = "gpu";
+    if (const char * v = std::getenv("OMNI_T2W_DEVICE")) {
+        if (*v) token2wav_device = v;
+    }
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -321,12 +325,21 @@ int main(int argc, char ** argv) {
         params.vision_coreml_model_path = paths.vision_coreml;
     }
 
+    // 🔧 [bit-exact A/B] 固定 LLM / TTS 采样种子，配合 token2wav 中已有的 mt19937(42)
+    // 让两次独立进程产生完全相同的输出（A/B 对比可用 md5 验证）
+    {
+        const char * seed_env = std::getenv("OMNI_SAMPLER_SEED");
+        uint32_t     seed     = seed_env ? (uint32_t) std::strtoul(seed_env, nullptr, 10) : 42u;
+        params.sampling.seed  = seed;
+        printf("  Sampler seed: %u (env OMNI_SAMPLER_SEED to override)\n", seed);
+    }
+
     std::string tts_bin_dir = get_parent_dir(paths.tts);
 
     common_init();
 
     auto ctx_omni = omni_init(&params, media_type, use_tts, tts_bin_dir,
-                              /*tts_gpu_layers=*/-1, /*token2wav_device=*/"cpu",
+                              /*tts_gpu_layers=*/-1, /*token2wav_device=*/token2wav_device,
                               /*duplex_mode=*/true,
                               /*existing_model=*/nullptr, /*existing_ctx=*/nullptr,
                               /*base_output_dir=*/output_dir);

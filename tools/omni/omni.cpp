@@ -8756,6 +8756,7 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
         
         // Wait for queue to have data or thread to stop
         cv.wait(lock, [&] { return !queue.empty() || !t2w_thread_running || ctx_omni->break_event.load(); });
+        auto dequeue_time = std::chrono::steady_clock::now();
         
         if (!t2w_thread_running && queue.empty()) {
             break;
@@ -8773,9 +8774,15 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
         bool is_chunk_end = false;  // 标记 TTS chunk 结束
         int received_round_idx = -1;  // 🔧 保存传入的 round_idx
         
+        std::chrono::steady_clock::time_point oldest_enqueue_time = dequeue_time;
+        bool have_enqueue_time = false;
         while (!queue.empty()) {
             T2WOut *t2w_out = queue.front();
             queue.pop();
+            if (!have_enqueue_time || t2w_out->enqueue_time < oldest_enqueue_time) {
+                oldest_enqueue_time = t2w_out->enqueue_time;
+                have_enqueue_time = true;
+            }
             
             new_tokens.insert(new_tokens.end(), t2w_out->audio_tokens.begin(), t2w_out->audio_tokens.end());
             is_final = is_final || t2w_out->is_final;  // 任何一个是 final 就是 final
@@ -8824,6 +8831,9 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
         // Add new tokens to buffer
         size_t buffer_before = token_buffer.size();
         token_buffer.insert(token_buffer.end(), new_tokens.begin(), new_tokens.end());
+        const double queue_wait_ms = have_enqueue_time
+            ? std::chrono::duration<double, std::milli>(dequeue_time - oldest_enqueue_time).count()
+            : 0.0;
         
         // 🔧 [DEBUG] 打印收到的 token IDs (只打印前10个和后3个)
         if (new_tokens.size() > 0) {
@@ -8927,8 +8937,8 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
                         if (wav_idx == 0) {
                             print_with_timestamp("🎉 首响时间 (First Audio Response): %lldms\n", (long long)elapsed_ms);
                         }
-                        print_with_timestamp("T2W线程: wav_%d.wav | %.2fs audio | %.1fms inference | RTF=%.2f | t=%lldms\n",
-                                            ctx_omni->wav_turn_base + wav_idx, audio_duration, t2w_ms, rtf, (long long)elapsed_ms);
+                        print_with_timestamp("T2W线程: wav_%d.wav | %.2fs audio | %.1fms inference | RTF=%.2f | t=%lldms | queue_wait=%.1fms\n",
+                                            ctx_omni->wav_turn_base + wav_idx, audio_duration, t2w_ms, rtf, (long long)elapsed_ms, queue_wait_ms);
                         wav_idx++;
                     }
                 }
