@@ -45,6 +45,10 @@
 #include <cstdarg>
 #include <signal.h>
 
+#ifdef __APPLE__
+#include <os/signpost.h>
+#endif
+
 #ifdef _WIN32
     #include <windows.h>
     #include <direct.h>
@@ -133,6 +137,74 @@ static bool init_python_t2w_model(struct omni_context * ctx_omni, const std::str
 static bool set_python_t2w_ref_audio(struct omni_context * ctx_omni, const std::string& ref_audio_path);
 static bool process_python_t2w_tokens(struct omni_context * ctx_omni, const std::vector<int32_t>& tokens, bool last_chunk, const std::string& output_path, double& inference_time_ms, double& audio_duration);
 static bool reset_python_t2w_cache(struct omni_context * ctx_omni);
+
+static int omni_env_int(const char * name, int fallback) {
+    const char * value = std::getenv(name);
+    if (!value || !*value) {
+        return fallback;
+    }
+    char * end = nullptr;
+    long parsed = std::strtol(value, &end, 10);
+    if (end == value) {
+        return fallback;
+    }
+    return (int) parsed;
+}
+
+static bool omni_env_enabled(const char * name, bool fallback = false) {
+    const char * value = std::getenv(name);
+    if (!value || !*value) {
+        return fallback;
+    }
+    return std::strcmp(value, "0") != 0 && std::strcmp(value, "false") != 0 && std::strcmp(value, "FALSE") != 0;
+}
+
+#ifdef __APPLE__
+static os_log_t omni_signpost_log() {
+    static os_log_t log = os_log_create("com.llama.omni", "duplex");
+    return log;
+}
+#endif
+
+struct OmniSignpostScope {
+    explicit OmniSignpostScope(const char * name) :
+        name_(name) {
+#ifdef __APPLE__
+        sid_ = os_signpost_id_generate(omni_signpost_log());
+        os_signpost_interval_begin(omni_signpost_log(), sid_, "omni_stage", "%{public}s", name_);
+#endif
+    }
+    ~OmniSignpostScope() {
+#ifdef __APPLE__
+        os_signpost_interval_end(omni_signpost_log(), sid_, "omni_stage", "%{public}s", name_);
+#endif
+    }
+
+    const char * name_;
+#ifdef __APPLE__
+    os_signpost_id_t sid_ = OS_SIGNPOST_ID_INVALID;
+#endif
+};
+
+static void maybe_yield_for_t2w_critical(struct omni_context * ctx_omni, const char * stage) {
+    if (!ctx_omni || !ctx_omni->duplex_mode || !ctx_omni->t2w_gpu_critical.load(std::memory_order_acquire)) {
+        return;
+    }
+    if (!omni_env_enabled("OMNI_T2W_GPU_GATE", false)) {
+        return;
+    }
+
+    const int quantum_us = std::max(100, omni_env_int("OMNI_T2W_GPU_GATE_QUANTUM_US", 1000));
+    const int max_us     = std::max(0, omni_env_int("OMNI_T2W_GPU_GATE_MAX_US", 4000));
+    int waited_us = 0;
+    while (waited_us < max_us && ctx_omni->t2w_gpu_critical.load(std::memory_order_acquire)) {
+        std::this_thread::sleep_for(std::chrono::microseconds(quantum_us));
+        waited_us += quantum_us;
+    }
+    if (waited_us > 0 && omni_env_enabled("OMNI_T2W_GPU_GATE_LOG", false)) {
+        std::fprintf(stderr, "GPU gate: %s yielded %dus while T2W critical\n", stage, waited_us);
+    }
+}
 
 
 //
@@ -332,7 +404,8 @@ bool prefill_with_emb(struct omni_context * ctx_omni, common_params * params, fl
             pos_vec[j] = *n_past + j;
         }
         batch.pos = pos_vec.data();
-        
+
+        OmniSignpostScope sp("LLM_prefill");
         if (llama_decode(ctx_omni->ctx_llama, batch)) {
             LOG_ERR("%s : failed to eval\n", __func__);
             return false;
@@ -381,6 +454,7 @@ bool prefill_emb_with_hidden(struct omni_context * ctx_omni, common_params * par
         // 启用 embeddings 输出
         llama_set_embeddings(ctx_omni->ctx_llama, true);
 
+        OmniSignpostScope sp("LLM_prefill");
         if (llama_decode(ctx_omni->ctx_llama, batch)) {
             LOG_ERR("%s : failed to eval\n", __func__);
             llama_set_embeddings(ctx_omni->ctx_llama, false);
@@ -905,7 +979,8 @@ static bool eval_tokens(struct omni_context* ctx_omni, common_params* params, st
         for (int j = 0; j < n_eval; j++) {
             batch.pos[j] = *n_past + j;  // 从当前 n_past 位置开始
         }
-        
+
+        OmniSignpostScope sp("LLM_decode");
         if (llama_decode(ctx_omni->ctx_llama, batch)) {
             LOG_ERR("%s : failed to eval. token %d/%d (batch size %d, n_past %d)\n", __func__, i, N, n_batch, *n_past);
             return false;
@@ -961,6 +1036,7 @@ static bool eval_tokens_with_hidden(struct omni_context* ctx_omni, common_params
             batch.pos[j] = *n_past + j;  // 从当前 n_past 位置开始
         }
 
+        OmniSignpostScope sp("LLM_decode");
         if (llama_decode(ctx_omni->ctx_llama, batch)) {
             LOG_ERR("%s : failed to eval. token %d/%d (batch size %d, n_past %d)\n", __func__, i, N, n_batch, *n_past);
             llama_set_embeddings(ctx_omni->ctx_llama, false);
@@ -2130,6 +2206,8 @@ static bool eval_tokens_tts(struct omni_context* ctx_omni, common_params* params
         // Enable embeddings output for TTS model (needed for head_code logits calculation)
         llama_set_embeddings(ctx_omni->ctx_tts_llama, true);
         fflush(stdout);
+        maybe_yield_for_t2w_critical(ctx_omni, "TTS_decode");
+        OmniSignpostScope sp("TTS_decode");
         int decode_ret = llama_decode(ctx_omni->ctx_tts_llama, batch);
         
         // Keep embeddings enabled for sample_tts_token to use
@@ -2218,7 +2296,9 @@ bool prefill_with_emb_tts(struct omni_context* ctx_omni, common_params* params, 
         
         // Enable embeddings output for TTS model (needed for head_code logits calculation)
         llama_set_embeddings(ctx_omni->ctx_tts_llama, true);
-        
+
+        maybe_yield_for_t2w_critical(ctx_omni, "TTS_decode");
+        OmniSignpostScope sp("TTS_decode");
         if (llama_decode(ctx_omni->ctx_tts_llama, batch)) {
             LOG_ERR("%s : failed to eval TTS embeddings. pos %d/%d (batch size %d, n_past %d)\n", 
                     __func__, i, n_pos, n_batch, *n_past_tts);
@@ -4139,16 +4219,18 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
             }
             
             bool init_ok = false;
+            const int t2w_n_timesteps = std::max(1, omni_env_int("OMNI_T2W_N_TIMESTEPS", 5));
+            print_with_timestamp("Token2Wav: n_timesteps=%d (OMNI_T2W_N_TIMESTEPS)\n", t2w_n_timesteps);
             // 优先级: prompt_cache.gguf > prompt_bundle (实时计算 fallback)
             print_with_timestamp("Token2Wav: using prompt_cache from %s\n", prompt_cache_gguf.c_str());
             init_ok = ctx_omni->token2wav_session->init_from_prompt_cache_gguf(
                     encoder_gguf, flow_matching_gguf, flow_extra_gguf, prompt_cache_gguf,
-                    vocoder_gguf, device_token2mel, device_vocoder, 5, 1.0f);
+                    vocoder_gguf, device_token2mel, device_vocoder, t2w_n_timesteps, 1.0f);
             if (!init_ok && use_prompt_bundle) {
                 print_with_timestamp("Token2Wav: prompt_cache failed, fallback to prompt_bundle from %s\n", prompt_bundle_dir.c_str());
                 init_ok = ctx_omni->token2wav_session->init_from_prompt_bundle(
                         encoder_gguf, flow_matching_gguf, flow_extra_gguf, prompt_bundle_dir,
-                        vocoder_gguf, device_token2mel, device_vocoder, 5, 1.0f);
+                        vocoder_gguf, device_token2mel, device_vocoder, t2w_n_timesteps, 1.0f);
             }
             // Fallback to CPU
             if (!init_ok) {
@@ -4157,7 +4239,7 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
                 ctx_omni->token2wav_session = std::make_unique<omni::flow::Token2WavSession>();
                 init_ok = ctx_omni->token2wav_session->init_from_prompt_cache_gguf(
                         encoder_gguf, flow_matching_gguf, flow_extra_gguf, prompt_cache_gguf,
-                        vocoder_gguf, "cpu", "cpu", 5, 1.0f);
+                        vocoder_gguf, "cpu", "cpu", t2w_n_timesteps, 1.0f);
             }
             
             if (init_ok) {
@@ -8332,9 +8414,10 @@ static bool init_python_t2w_model(struct omni_context * ctx_omni, const std::str
     // 发送 init 命令
     // 🔧 使用 float16 以节省显存（已在 token2wav_service.py 中修复 dtype bug）
     char cmd[1024];
+    const int t2w_n_timesteps = std::max(1, omni_env_int("OMNI_T2W_N_TIMESTEPS", 5));
     snprintf(cmd, sizeof(cmd), 
-             "{\"cmd\":\"init\",\"model_dir\":\"%s\",\"device\":\"%s\",\"float16\":true,\"n_timesteps\":5}",
-             ctx_omni->python_t2w_model_dir.c_str(), python_device.c_str());
+             "{\"cmd\":\"init\",\"model_dir\":\"%s\",\"device\":\"%s\",\"float16\":true,\"n_timesteps\":%d}",
+             ctx_omni->python_t2w_model_dir.c_str(), python_device.c_str(), t2w_n_timesteps);
     
     std::string response;
     if (!send_python_t2w_command(ctx_omni, cmd, response)) {
@@ -8879,6 +8962,28 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
             // chunk_end 保持原语义"累积等下个 chunk"，避免把一轮 turn 切成多段 wav 产生播放 gap。
             need_flush = is_final;
         }
+
+        const int coalesce_ms = omni_env_int("OMNI_T2W_COALESCE_MS", 0);
+        const int coalesce_windows = std::max(1, omni_env_int("OMNI_T2W_COALESCE_WINDOWS", 1));
+        if (ctx_omni->duplex_mode && coalesce_ms > 0 && coalesce_windows > 1 && !need_flush) {
+            const size_t coalesce_threshold = (size_t) PRE_LOOKAHEAD + (size_t) CHUNK_SIZE * (size_t) coalesce_windows;
+            const double token_age_ms = have_enqueue_time
+                ? std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - oldest_enqueue_time).count()
+                : 0.0;
+            if (token_buffer.size() < coalesce_threshold && token_age_ms < (double) coalesce_ms) {
+                std::unique_lock<std::mutex> relock(mtx);
+                const int wait_ms = std::max(1, coalesce_ms - (int) token_age_ms);
+                const bool woke_for_more = cv.wait_for(relock, std::chrono::milliseconds(wait_ms), [&] {
+                    return !queue.empty() || !t2w_thread_running || ctx_omni->break_event.load();
+                });
+                if (!t2w_thread_running || ctx_omni->break_event.load()) {
+                    continue;
+                }
+                if (woke_for_more && !queue.empty()) {
+                    continue;
+                }
+            }
+        }
         
         // Process windows using sliding window
         int process_count = 0;
@@ -8895,7 +9000,14 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
             auto t2w_start = std::chrono::high_resolution_clock::now();
             
             std::vector<float> chunk_wav;
-            if (ctx_omni->token2wav_session->feed_window(window, is_last_window, chunk_wav)) {
+            ctx_omni->t2w_gpu_critical.store(true, std::memory_order_release);
+            bool feed_ok = false;
+            {
+                OmniSignpostScope sp("T2W_feed_window");
+                feed_ok = ctx_omni->token2wav_session->feed_window(window, is_last_window, chunk_wav);
+            }
+            ctx_omni->t2w_gpu_critical.store(false, std::memory_order_release);
+            if (feed_ok) {
                 auto t2w_end = std::chrono::high_resolution_clock::now();
                 double t2w_ms = std::chrono::duration<double, std::milli>(t2w_end - t2w_start).count();
                 
@@ -10698,8 +10810,10 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
 
                 llama_token sampled_token = 0;
                 {
+                    maybe_yield_for_t2w_critical(ctx_omni, "LLM_decode");
                     std::lock_guard<std::mutex> llama_lock(ctx_omni->llama_mtx);
                     // 使用新函数获取token文本、hidden state和token ID
+                    OmniSignpostScope sp("LLM_decode");
                     tmp = llama_loop_with_hidden_and_token(ctx_omni, ctx_omni->params, ctx_omni->ctx_sampler, ctx_omni->n_past, hidden_states, sampled_token);
                 }
                 

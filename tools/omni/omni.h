@@ -231,6 +231,7 @@ struct omni_context {
     struct LLMThreadInfo *llm_thread_info = NULL;
     struct TTSThreadInfo *tts_thread_info = NULL;
     struct T2WThreadInfo *t2w_thread_info = NULL;
+    std::atomic<bool> t2w_gpu_critical{false};
 
     // 🔧 [Duplex Pipeline - Stage 1]
     // 仅在 duplex_mode=true && async=true 时由 omni_init / stream_prefill(index=0) 分配。
