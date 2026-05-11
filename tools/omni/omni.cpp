@@ -4223,9 +4223,28 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
             print_with_timestamp("Token2Wav: n_timesteps=%d (OMNI_T2W_N_TIMESTEPS)\n", t2w_n_timesteps);
             // 优先级: prompt_cache.gguf > prompt_bundle (实时计算 fallback)
             print_with_timestamp("Token2Wav: using prompt_cache from %s\n", prompt_cache_gguf.c_str());
+
+            // ANE 后端选择：环境变量 OMNI_T2W_ANE_MLPACKAGE 指向 ane_t2w_dit_*.mlpackage 时启用。
+            // 默认会去 <gguf_dir>/../ane_t2w/ane_t2w_dit_f16_chunk56_cache600.mlpackage 找
+            // （即把 mlpackage 放在 model bundle 旁边）。两条路径都不存在则走纯 GGUF。
+            std::string ane_mlpackage_path;
+            if (const char * v = ::getenv("OMNI_T2W_ANE_MLPACKAGE"); v && *v) {
+                ane_mlpackage_path = v;
+            } else {
+                std::string default_ane_dir = ctx_omni->token2wav_model_dir + "/../ane_t2w";
+                std::string default_ane_pkg = default_ane_dir + "/ane_t2w_dit_f16_chunk56_cache600.mlpackage";
+                std::ifstream probe(default_ane_pkg + "/Manifest.json");
+                if (probe.good()) {
+                    ane_mlpackage_path = default_ane_pkg;
+                }
+            }
+            if (!ane_mlpackage_path.empty()) {
+                print_with_timestamp("Token2Wav: ANE mlpackage = %s\n", ane_mlpackage_path.c_str());
+            }
+
             init_ok = ctx_omni->token2wav_session->init_from_prompt_cache_gguf(
                     encoder_gguf, flow_matching_gguf, flow_extra_gguf, prompt_cache_gguf,
-                    vocoder_gguf, device_token2mel, device_vocoder, t2w_n_timesteps, 1.0f);
+                    vocoder_gguf, device_token2mel, device_vocoder, t2w_n_timesteps, 1.0f, ane_mlpackage_path);
             if (!init_ok && use_prompt_bundle) {
                 print_with_timestamp("Token2Wav: prompt_cache failed, fallback to prompt_bundle from %s\n", prompt_bundle_dir.c_str());
                 init_ok = ctx_omni->token2wav_session->init_from_prompt_bundle(
