@@ -950,7 +950,6 @@ static bool eval_tokens_with_hidden(struct omni_context* ctx_omni, common_params
 
         // 启用 embeddings 输出
         llama_set_embeddings(ctx_omni->ctx_llama, true);
-        // llama_batch_get_one 返回的 batch.pos 可能是 nullptr，需要手动设置
         llama_batch batch = llama_batch_get_one(&tokens[i], n_eval);
         std::vector<llama_pos> pos_vec;
         if (batch.pos == nullptr) {
@@ -958,7 +957,7 @@ static bool eval_tokens_with_hidden(struct omni_context* ctx_omni, common_params
             batch.pos = pos_vec.data();
         }
         for (int j = 0; j < n_eval; j++) {
-            batch.pos[j] = *n_past + j;  // 从当前 n_past 位置开始
+            batch.pos[j] = *n_past + j;
         }
 
         if (llama_decode(ctx_omni->ctx_llama, batch)) {
@@ -971,8 +970,8 @@ static bool eval_tokens_with_hidden(struct omni_context* ctx_omni, common_params
 
         // 获取当前 batch 的 embeddings 并复制到 hidden_states
         float * emb = llama_get_embeddings(ctx_omni->ctx_llama);
+
         if (emb != nullptr) {
-            // 将当前 batch 的 embeddings 复制到 hidden_states 的对应位置
             memcpy(hidden_states + tokens_processed * n_embd, emb, n_eval * n_embd * sizeof(float));
         }
 
@@ -3691,6 +3690,9 @@ struct DuplexTokenEmbCache {
 struct DuplexPipeline {
     // ---------- control ----------
     std::atomic<bool> running{false};
+
+    // ---------- frame-skip ----------
+    std::string last_img_fname;   // previous frame's image path for skip detection
 
     // ---------- encoder ----------
     std::thread encoder_thread;
@@ -9671,6 +9673,9 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
         if (ctx_omni->use_tts) {
             ctx_omni->speek_done = true;
         }
+        // Sync GPU to prevent prefill work from accumulating across force_listen rounds.
+        // Without this, the first real decode chunk pays the cost of all accumulated prefills.
+        llama_synchronize(ctx_omni->ctx_llama);
         print_with_timestamp("Duplex decode: force_listen %d/%d, emit __IS_LISTEN__\n",
                              ctx_omni->force_listen_used, ctx_omni->force_listen_count);
         {
@@ -10026,9 +10031,21 @@ static bool duplex_prefill(omni_context * ctx_omni,
 
     DuplexEncodeReq * req = new DuplexEncodeReq();
     req->aud_fname      = aud_fname;
-    req->img_fname      = img_fname;
     req->index          = index;
     req->max_slice_nums = max_slice_nums;
+
+    // Frame-skip: if the image is the same as the previous frame, skip VPM entirely.
+    // This reduces prefill from ~77 tokens (vision+audio) to ~11 tokens (audio only),
+    // saving ~400ms of GPU prefill time per chunk.
+    if (!img_fname.empty() && img_fname == dup->last_img_fname) {
+        req->img_fname = "";  // skip VPM
+        print_with_timestamp("[frame-skip] index=%d same image as prev, skipping VPM\n", index);
+    } else {
+        req->img_fname = img_fname;
+        if (!img_fname.empty()) {
+            dup->last_img_fname = img_fname;
+        }
+    }
 
     {
         std::unique_lock<std::mutex> lk(dup->encoder_mtx);

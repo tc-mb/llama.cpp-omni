@@ -101,16 +101,25 @@ static void duplex_test_case(struct omni_context * ctx_omni,
 
     // 准备 N 个 chunk 的 (audio, image) 文件路径
     std::vector<OmniDuplexFrame> frames(cnt);
+    std::string first_img;
+    const char * repeat_img_env = std::getenv("OMNI_REPEAT_IMAGE");
+    bool repeat_image = (repeat_img_env && std::string(repeat_img_env) == "1");
     for (int il = 0; il < cnt; ++il) {
         char idx[16]; snprintf(idx, sizeof(idx), "%04d", il);
         frames[il].aud_fname = data_path_prefix + idx + ".wav";
         std::string img = data_path_prefix + idx + ".jpg";
-        if (file_exists(img)) frames[il].img_fname = img;
+        if (file_exists(img)) {
+            if (first_img.empty()) first_img = img;
+            frames[il].img_fname = repeat_image ? first_img : img;
+        }
         frames[il].user_seq = il + 1;
         if (!file_exists(frames[il].aud_fname)) {
             fprintf(stderr, "[错误] 音频不存在: %s\n", frames[il].aud_fname.c_str());
             return;
         }
+    }
+    if (repeat_image) {
+        printf("  [repeat-image] all frames use: %s\n", first_img.c_str());
     }
 
     if (!omni_duplex_session_begin(ctx_omni, /*voice_audio=*/"", /*debug_dir=*/"./")) {
@@ -137,7 +146,7 @@ static void duplex_test_case(struct omni_context * ctx_omni,
     });
 
     int speak = 0, listen = 0, completed = 0;
-    double sum_decode = 0, sum_e2e = 0;
+    double sum_prefill = 0, sum_decode = 0, sum_e2e = 0;
 
     for (int il = 0; il < cnt && !g_is_interrupted; ++il) {
         OmniDuplexFrameResult r;
@@ -146,12 +155,13 @@ static void duplex_test_case(struct omni_context * ctx_omni,
             break;
         }
         (r.is_speak ? speak : listen)++;
-        sum_decode += r.ms_decode;
-        sum_e2e    += r.ms_total;
+        sum_prefill += r.ms_prefill_submit;
+        sum_decode  += r.ms_decode;
+        sum_e2e     += r.ms_total;
         completed++;
 
-        printf("--- Chunk %lld/%d --- decode %.1fms | e2e %.1fms | n_past %d | %s\n",
-               (long long)r.user_seq, cnt, r.ms_decode, r.ms_total, r.n_past_after,
+        printf("--- Chunk %lld/%d --- prefill %.1fms | decode %.1fms | e2e %.1fms | n_past %d | %s\n",
+               (long long)r.user_seq, cnt, r.ms_prefill_submit, r.ms_decode, r.ms_total, r.n_past_after,
                r.is_speak ? ("<|speak|> \"" + (r.text.size() > 60 ? r.text.substr(0,60)+"..." : r.text) + "\"").c_str()
                           : "<|listen|>");
     }
@@ -161,8 +171,9 @@ static void duplex_test_case(struct omni_context * ctx_omni,
 
     double total_s = std::chrono::duration<double>(
         std::chrono::high_resolution_clock::now() - total_t0).count();
-    printf("\n=== Summary: %d/%d chunks, %.3fs | avg decode %.1fms | avg e2e %.1fms | speak %d listen %d ===\n",
+    printf("\n=== Summary: %d/%d chunks, %.3fs | avg prefill %.1fms | avg decode %.1fms | avg e2e %.1fms | speak %d listen %d ===\n",
            completed, cnt, total_s,
+           completed ? sum_prefill / completed : 0,
            completed ? sum_decode / completed : 0,
            completed ? sum_e2e    / completed : 0,
            speak, listen);
