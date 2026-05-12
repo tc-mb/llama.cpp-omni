@@ -1,5 +1,6 @@
 #include "ggml.h"
 #include "llama.h"
+#include "tts-condition-graph.h"
 
 #include <thread>
 #include <memory>
@@ -366,6 +367,7 @@ struct omni_context {
     
     // New ggml-based projector model (精度验证版本)
     struct projector_model projector;
+    struct tts_condition_graph_model tts_condition_graph;
     
     // head_code: Linear layer (hidden_size=768 -> num_audio_tokens=6562)
     // Note: num_vq=1, so we only need one head_code layer
