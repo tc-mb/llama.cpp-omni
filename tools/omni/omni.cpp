@@ -4448,6 +4448,10 @@ void omni_free(struct omni_context * ctx_omni) {
         llama_free(ctx_omni->ctx_tts_llama);
         llama_free_model(ctx_omni->model_tts);
         common_sampler_free(ctx_omni->ctx_tts_sampler);
+
+        if (ctx_omni->tts_condition_graph.initialized) {
+            tts_condition_graph_free(ctx_omni);
+        }
         
         // Free TTS weights
         if (ctx_omni->emb_code_weight) {
@@ -6967,194 +6971,32 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
             // 这样 TTS 会 flush 剩余的 tts_token_buffer，并正确处理 text_eos_embed
             bool is_final_text_chunk = llm_finish;
             
-            // Try to compute merged embeddings if weights are available
-            if (ctx_omni->emb_text_weight && ctx_omni->projector_semantic_linear1_weight) {
-                // Step 1: Convert token IDs to embeddings using emb_text (using filtered tokens)
-                std::vector<float> llm_embeds(n_tokens_filtered * tts_n_embd, 0.0f);
-                bool emb_text_success = true;
-                
-                for (int i = 0; i < n_tokens_filtered; i++) {
-                    llama_token token_id = filtered_token_ids[i];
-                    float * emb = llm_embeds.data() + i * tts_n_embd;
-                    if (!tts_emb_text(ctx_omni, token_id, emb, tts_n_embd)) {
-                        emb_text_success = false;
-                        break;
-                    }
+            if (ctx_omni->emb_text_weight && ctx_omni->projector.initialized) {
+                if (!ctx_omni->tts_condition_graph.initialized) {
+                    tts_condition_graph_init(ctx_omni);
                 }
-                
-                if (emb_text_success) {
-                    // Debug: Save llm_embeds for comparison
-                    {
-                        std::string chunk_dir = llm_debug_output_dir + "/chunk_" + std::to_string(current_chunk_idx);
-                        create_dir(chunk_dir);
-                        std::string llm_embeds_file = chunk_dir + "/llm_embeds_cpp.txt";
-                        FILE *f_llm_embeds = fopen(llm_embeds_file.c_str(), "w");
-                        if (f_llm_embeds) {
-                            fprintf(f_llm_embeds, "LLM Embeddings from emb_text (C++ computed, shape: [%d, %d]):\n", n_tokens_filtered, tts_n_embd);
-                            for (int i = 0; i < n_tokens_filtered; ++i) {
-                                fprintf(f_llm_embeds, "Token %d: ", i);
-                                for (int j = 0; j < tts_n_embd; ++j) {
-                                    fprintf(f_llm_embeds, "%.6f", llm_embeds[i * tts_n_embd + j]);
-                                    if (j < tts_n_embd - 1) fprintf(f_llm_embeds, " ");
-                                }
-                                fprintf(f_llm_embeds, "\n");
-                            }
-                            fclose(f_llm_embeds);
-                        }
-                    }
-                    
-                    // Step 2: Project hidden states using projector_semantic (using filtered hidden states)
-                    std::vector<float> projected_hidden(n_tokens_filtered * tts_n_embd, 0.0f);
-                    bool projector_success = tts_projector_semantic(ctx_omni,
-                                                                     filtered_hidden_states.data(),
-                                                                     n_tokens_filtered,
-                                                                     current_chunk_n_embd,
-                                                                     projected_hidden.data(),
-                                                                     tts_n_embd);
-                    
-                    if (projector_success) {
-                        // Debug: Save projected_hidden before normalization for comparison
-                        {
-                            std::string chunk_dir = llm_debug_output_dir + "/chunk_" + std::to_string(current_chunk_idx);
-                            create_dir(chunk_dir);
-                            std::string projected_file = chunk_dir + "/projected_hidden_before_norm_cpp.txt";
-                            FILE *f_projected = fopen(projected_file.c_str(), "w");
-                            if (f_projected) {
-                                fprintf(f_projected, "Projected Hidden States BEFORE normalization (C++ computed, shape: [%d, %d]):\n", n_tokens_filtered, tts_n_embd);
-                                for (int i = 0; i < n_tokens_filtered; ++i) {
-                                    fprintf(f_projected, "Token %d: ", i);
-                                    for (int j = 0; j < tts_n_embd; ++j) {
-                                        fprintf(f_projected, "%.6f", projected_hidden[i * tts_n_embd + j]);
-                                        if (j < tts_n_embd - 1) fprintf(f_projected, " ");
-                                    }
-                                    fprintf(f_projected, "\n");
-                                }
-                                fclose(f_projected);
-                            }
-                        }
-                        
-                        // Step 3: Normalize projected hidden states (CRITICAL: must normalize before merging)
-                        // Check L2 norm before normalization for debugging
-                        if (n_tokens_filtered > 0) {
-                            // Check all tokens, not just first one
-                            float avg_norm_before = 0.0f;
-                            float min_norm_before = 1e10f;
-                            float max_norm_before = 0.0f;
-                            for (int t = 0; t < n_tokens_filtered; t++) {
-                                float * vec = projected_hidden.data() + t * tts_n_embd;
-                                float norm_sq = 0.0f;
-                                for (int i = 0; i < tts_n_embd; i++) {
-                                    norm_sq += vec[i] * vec[i];
-                                }
-                                float norm = std::sqrt(norm_sq);
-                                avg_norm_before += norm;
-                                if (norm < min_norm_before) min_norm_before = norm;
-                                if (norm > max_norm_before) max_norm_before = norm;
-                            }
-                            avg_norm_before /= n_tokens_filtered;
-                        }
-                        
-                        // CRITICAL: Normalize projected_hidden before merging
-                        normalize_l2_per_token(projected_hidden.data(), n_tokens_filtered, tts_n_embd);
-                        
-                        // Debug: Save projected_hidden after normalization for comparison
-                        {
-                            std::string chunk_dir = llm_debug_output_dir + "/chunk_" + std::to_string(current_chunk_idx);
-                            create_dir(chunk_dir);
-                            std::string projected_file = chunk_dir + "/projected_hidden_after_norm_cpp.txt";
-                            FILE *f_projected = fopen(projected_file.c_str(), "w");
-                            if (f_projected) {
-                                fprintf(f_projected, "Projected Hidden States AFTER normalization (C++ computed, shape: [%d, %d]):\n", n_tokens_filtered, tts_n_embd);
-                                for (int i = 0; i < n_tokens_filtered; ++i) {
-                                    fprintf(f_projected, "Token %d: ", i);
-                                    for (int j = 0; j < tts_n_embd; ++j) {
-                                        fprintf(f_projected, "%.6f", projected_hidden[i * tts_n_embd + j]);
-                                        if (j < tts_n_embd - 1) fprintf(f_projected, " ");
-                                    }
-                                    fprintf(f_projected, "\n");
-                                }
-                                fclose(f_projected);
-                            }
-                        }
-                        
-                        // Verify normalization after normalization (check all tokens)
-                        if (n_tokens_filtered > 0) {
-                            float avg_norm_after = 0.0f;
-                            float min_norm_after = 1e10f;
-                            float max_norm_after = 0.0f;
-                            int norm_error_count = 0;
-                            for (int t = 0; t < n_tokens_filtered; t++) {
-                                float * vec = projected_hidden.data() + t * tts_n_embd;
-                                float norm_sq = 0.0f;
-                                for (int i = 0; i < tts_n_embd; i++) {
-                                    norm_sq += vec[i] * vec[i];
-                                }
-                                float norm = std::sqrt(norm_sq);
-                                avg_norm_after += norm;
-                                if (norm < min_norm_after) min_norm_after = norm;
-                                if (norm > max_norm_after) max_norm_after = norm;
-                                if (std::abs(norm - 1.0f) > 0.01f) {
-                                    norm_error_count++;
-                                    LOG_ERR("TTS: ERROR - token %d normalization failed: norm=%.6f (expected ~1.0)\n", t, norm);
-                                }
-                            }
-                            avg_norm_after /= n_tokens_filtered;
-                            if (norm_error_count > 0) {
-                                LOG_ERR("TTS: ERROR - normalization failed for %d/%d tokens! Expected all norms to be ~1.0\n", 
-                                        norm_error_count, n_tokens_filtered);
-                            } else {
-                            }
-                        }
-                        
-                        // Step 4: Merge: merged_embeds = llm_embeds + projected_hidden
-                        // CRITICAL: Use normalized projected_hidden for merging
-                        // Verify projected_hidden is normalized before merging
-                        if (n_tokens_filtered > 0) {
-                            float verify_norm_check = 0.0f;
-                            float * vec_check = projected_hidden.data() + 0 * tts_n_embd;
-                            for (int i = 0; i < tts_n_embd; i++) {
-                                verify_norm_check += vec_check[i] * vec_check[i];
-                            }
-                            float verify_norm_val = std::sqrt(verify_norm_check);
-                            if (std::abs(verify_norm_val - 1.0f) > 0.01f) {
-                                LOG_ERR("TTS: CRITICAL ERROR - projected_hidden is NOT normalized before merge! norm=%.6f\n", verify_norm_val);
-                            }
-                        }
-                        
-                        // 🔧 [安全检查] 防止创建过大的 vector 导致崩溃
-                        size_t merge_size = (size_t)n_tokens_filtered * tts_n_embd;
-                        if (n_tokens_filtered <= 0 || n_tokens_filtered > 10000 || 
-                            tts_n_embd <= 0 || tts_n_embd > 10000 ||
-                            merge_size > 100000000) {  // 100M elements max
-                            LOG_ERR("TTS: invalid merge size: n_tokens_filtered=%d, tts_n_embd=%d, merge_size=%zu\n",
-                                    n_tokens_filtered, tts_n_embd, merge_size);
-                            break;  // 跳过这个 chunk，避免崩溃
-                        }
-                        
-                        merged_embeddings.resize(merge_size);
-                        for (size_t i = 0; i < merge_size; i++) {
-                            merged_embeddings[i] = llm_embeds[i] + projected_hidden[i];
-                        }
-                        
-                        // 🔧 [修复] 不在 merge embed 阶段添加 audio_bos
-                        // Python 中 audio_bos 是在 TTS 类内部（prefill 前）添加的
-                        // 由 tts_thread_func 在 prefill 之前动态添加 audio_bos
-                        // 这样可以确保 audio_bos 使用正确的 embedding 权重和位置
-                        
+
+                int graph_tts_n_embd = 0;
+                if (ctx_omni->tts_condition_graph.initialized &&
+                    tts_condition_graph_forward(ctx_omni,
+                                                filtered_token_ids.data(),
+                                                filtered_hidden_states.data(),
+                                                n_tokens_filtered,
+                                                current_chunk_n_embd,
+                                                merged_embeddings,
+                                                graph_tts_n_embd)) {
+                    if (graph_tts_n_embd == tts_n_embd) {
                         merged_success = true;
-                        
-                        // Debug: Verify merged_embeddings calculation
-                        if (n_tokens_filtered > 0) {
-                            float * llm_emb_check = llm_embeds.data() + 0 * tts_n_embd;
-                            float * proj_hidden_check = projected_hidden.data() + 0 * tts_n_embd;
-                            float * merged_check = merged_embeddings.data() + 0 * tts_n_embd;
-                        }
                     } else {
-                        print_with_timestamp("TTS: WARNING - projector_semantic failed, skipping merged embedding save\n");
+                        LOG_ERR("TTS: condition graph tts_n_embd mismatch: got %d, expected %d\n",
+                                graph_tts_n_embd, tts_n_embd);
+                        merged_embeddings.clear();
                     }
+                } else {
+                    print_with_timestamp("TTS: WARNING - condition graph failed, skipping merged embedding computation\n");
                 }
             } else {
-                print_with_timestamp("TTS: WARNING - TTS weights not loaded, skipping merged embedding computation\n");
+                print_with_timestamp("TTS: WARNING - TTS condition graph weights not loaded, skipping merged embedding computation\n");
             }
             
             // Save LLM debug data: text, token_ids, hidden_states, and merged embeddings
