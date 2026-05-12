@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ggml.h"
+#include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "llama.h"
 
@@ -18,14 +19,18 @@ struct tts_condition_graph_model {
 
     // Non-owning backend borrowed from ctx_omni->projector.
     ggml_backend_t backend = nullptr;
-    ggml_backend_buffer_type_t buf_type = nullptr;
 
     struct ggml_context * ctx_w = nullptr;
     ggml_backend_buffer_t buf_w = nullptr;
 
+    // Reused across forward calls so we don't alloc/free a compute buffer per chunk.
+    ggml_gallocr_t galloc = nullptr;
+
     struct ggml_tensor * emb_text_weight = nullptr; // [tts_hidden_dim, text_vocab_size]
 
     bool initialized = false;
+    // Latched after a failed init so we don't retry (and re-spam errors) every chunk.
+    bool init_failed = false;
 };
 
 bool tts_condition_graph_init(struct omni_context * ctx_omni);

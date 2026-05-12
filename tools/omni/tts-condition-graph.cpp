@@ -20,11 +20,12 @@ static struct ggml_tensor * tts_condition_graph_build_l2_normalize(
 }
 
 static struct ggml_cgraph * tts_condition_graph_build(
-        struct omni_context * ctx_omni,
-        struct ggml_context * ctx,
-        struct ggml_tensor  * token_ids,
-        struct ggml_tensor  * llm_hidden,
-        struct ggml_tensor  * eps) {
+        struct omni_context *  ctx_omni,
+        struct ggml_context *  ctx,
+        struct ggml_tensor  *  token_ids,
+        struct ggml_tensor  *  llm_hidden,
+        struct ggml_tensor  *  eps,
+        struct ggml_tensor  ** out_merged) {
     struct ggml_cgraph * gf = ggml_new_graph(ctx);
 
     struct ggml_tensor * llm_embeds = ggml_get_rows(
@@ -45,8 +46,12 @@ static struct ggml_cgraph * tts_condition_graph_build(
     struct ggml_tensor * merged = ggml_add(ctx, llm_embeds, normalized);
     merged = ggml_cont(ctx, merged);
     ggml_set_name(merged, "tts_condition_merged");
+    ggml_set_output(merged);
 
     ggml_build_forward_expand(gf, merged);
+    if (out_merged) {
+        *out_merged = merged;
+    }
     return gf;
 }
 
@@ -54,29 +59,38 @@ bool tts_condition_graph_init(struct omni_context * ctx_omni) {
     if (!ctx_omni) {
         return false;
     }
-    if (ctx_omni->tts_condition_graph.initialized) {
+    tts_condition_graph_model & model = ctx_omni->tts_condition_graph;
+    if (model.initialized) {
         return true;
     }
+    if (model.init_failed) {
+        // Already failed once; don't retry on every chunk.
+        return false;
+    }
+
+    auto fail = [&](const char * msg) {
+        LOG_ERR("TTS condition graph: %s\n", msg);
+        model.init_failed = true;
+    };
+
     if (!ctx_omni->projector.initialized || !ctx_omni->projector.backend) {
-        LOG_ERR("TTS condition graph: projector graph is not initialized\n");
+        fail("projector graph is not initialized");
         return false;
     }
     if (!ctx_omni->emb_text_weight || ctx_omni->emb_text_vocab_size <= 0 || ctx_omni->emb_text_hidden_size <= 0) {
-        LOG_ERR("TTS condition graph: emb_text weights are not loaded\n");
+        fail("emb_text weights are not loaded");
         return false;
     }
     if (!ctx_omni->projector.layer.linear1_weight || !ctx_omni->projector.layer.linear1_bias ||
         !ctx_omni->projector.layer.linear2_weight || !ctx_omni->projector.layer.linear2_bias) {
-        LOG_ERR("TTS condition graph: projector tensors are incomplete\n");
+        fail("projector tensors are incomplete");
         return false;
     }
 
-    tts_condition_graph_model & model = ctx_omni->tts_condition_graph;
-    model.llm_hidden_dim = ctx_omni->projector.hparams.in_dim;
-    model.tts_hidden_dim = ctx_omni->emb_text_hidden_size;
+    model.llm_hidden_dim  = ctx_omni->projector.hparams.in_dim;
+    model.tts_hidden_dim  = ctx_omni->emb_text_hidden_size;
     model.text_vocab_size = ctx_omni->emb_text_vocab_size;
-    model.backend = ctx_omni->projector.backend;
-    model.buf_type = ggml_backend_get_default_buffer_type(model.backend);
+    model.backend         = ctx_omni->projector.backend;
 
     const size_t ctx_size = ggml_tensor_overhead() * 1;
     struct ggml_init_params ctx_params = {
@@ -87,7 +101,7 @@ bool tts_condition_graph_init(struct omni_context * ctx_omni) {
 
     model.ctx_w = ggml_init(ctx_params);
     if (!model.ctx_w) {
-        LOG_ERR("TTS condition graph: failed to create weight context\n");
+        fail("failed to create weight context");
         return false;
     }
 
@@ -100,7 +114,7 @@ bool tts_condition_graph_init(struct omni_context * ctx_omni) {
 
     model.buf_w = ggml_backend_alloc_ctx_tensors(model.ctx_w, model.backend);
     if (!model.buf_w) {
-        LOG_ERR("TTS condition graph: failed to allocate emb_text backend buffer\n");
+        fail("failed to allocate emb_text backend buffer");
         ggml_free(model.ctx_w);
         model.ctx_w = nullptr;
         model.emb_text_weight = nullptr;
@@ -110,6 +124,17 @@ bool tts_condition_graph_init(struct omni_context * ctx_omni) {
     const size_t emb_text_bytes =
         (size_t) model.text_vocab_size * (size_t) model.tts_hidden_dim * sizeof(float);
     ggml_backend_tensor_set(model.emb_text_weight, ctx_omni->emb_text_weight, 0, emb_text_bytes);
+
+    model.galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
+    if (!model.galloc) {
+        fail("failed to create ggml_gallocr");
+        ggml_backend_buffer_free(model.buf_w);
+        ggml_free(model.ctx_w);
+        model.buf_w = nullptr;
+        model.ctx_w = nullptr;
+        model.emb_text_weight = nullptr;
+        return false;
+    }
 
     model.initialized = true;
     LOG_INF("TTS condition graph: initialized (vocab=%d, hidden=%d)\n",
@@ -122,7 +147,13 @@ void tts_condition_graph_free(struct omni_context * ctx_omni) {
         return;
     }
 
+    // NOTE: this borrows the backend and the linear1/linear2 tensors from
+    // ctx_omni->projector, so it must be freed BEFORE the projector itself
+    // (omni_free currently does this).
     tts_condition_graph_model & model = ctx_omni->tts_condition_graph;
+    if (model.galloc) {
+        ggml_gallocr_free(model.galloc);
+    }
     if (model.buf_w) {
         ggml_backend_buffer_free(model.buf_w);
     }
@@ -130,12 +161,13 @@ void tts_condition_graph_free(struct omni_context * ctx_omni) {
         ggml_free(model.ctx_w);
     }
 
-    model.ctx_w = nullptr;
-    model.buf_w = nullptr;
+    model.ctx_w           = nullptr;
+    model.buf_w           = nullptr;
+    model.galloc          = nullptr;
     model.emb_text_weight = nullptr;
-    model.backend = nullptr;
-    model.buf_type = nullptr;
-    model.initialized = false;
+    model.backend         = nullptr;
+    model.initialized     = false;
+    model.init_failed     = false;
 }
 
 bool tts_condition_graph_forward(
@@ -208,16 +240,24 @@ bool tts_condition_graph_forward(
     ggml_set_name(eps_tensor, "tts_condition_norm_eps");
     ggml_set_input(eps_tensor);
 
+    struct ggml_tensor * output = nullptr;
     struct ggml_cgraph * gf = tts_condition_graph_build(
         ctx_omni,
         ctx,
         token_ids_tensor,
         hidden_tensor,
-        eps_tensor);
+        eps_tensor,
+        &output);
+    if (!output) {
+        LOG_ERR("TTS condition graph: build did not return an output tensor\n");
+        ggml_free(ctx);
+        return false;
+    }
 
-    ggml_backend_buffer_t buf_compute = ggml_backend_alloc_ctx_tensors(ctx, model.backend);
-    if (!buf_compute) {
-        LOG_ERR("TTS condition graph: failed to allocate compute buffer\n");
+    // Reuse the backend buffer across forward calls; gallocr will resize as
+    // needed when n_tokens grows.
+    if (!ggml_gallocr_alloc_graph(model.galloc, gf)) {
+        LOG_ERR("TTS condition graph: ggml_gallocr_alloc_graph failed\n");
         ggml_free(ctx);
         return false;
     }
@@ -235,17 +275,14 @@ bool tts_condition_graph_forward(
     enum ggml_status status = ggml_backend_graph_compute(model.backend, gf);
     if (status != GGML_STATUS_SUCCESS) {
         LOG_ERR("TTS condition graph: graph compute failed with status %d\n", (int) status);
-        ggml_backend_buffer_free(buf_compute);
         ggml_free(ctx);
         return false;
     }
 
-    struct ggml_tensor * output = ggml_graph_node(gf, ggml_graph_n_nodes(gf) - 1);
     merged_embeddings.resize(output_size);
     ggml_backend_tensor_get(output, merged_embeddings.data(), 0, output_size * sizeof(float));
     tts_n_embd = out_dim;
 
-    ggml_backend_buffer_free(buf_compute);
     ggml_free(ctx);
     return true;
 }
