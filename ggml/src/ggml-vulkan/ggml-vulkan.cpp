@@ -9221,8 +9221,6 @@ static void ggml_vk_arange(ggml_backend_vk_context * ctx, vk_context& subctx, gg
         return;
     }
 
-    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
-
     ggml_backend_vk_buffer_context * dst_buf_ctx = (ggml_backend_vk_buffer_context *)dst->buffer->context;
     vk_buffer d_D = dst_buf_ctx->dev_buffer;
     size_t dst_offset = vk_tensor_offset(dst) + dst->view_offs;
