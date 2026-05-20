@@ -82,6 +82,7 @@ struct vision_hparams {
     int minicpmv_version = 0;
     int32_t minicpmv_query_num = 0;         // MiniCPM-V query number
     int minicpmv_max_slice_nums = 0;
+    int32_t insert_layer_id = 0;            // MiniCPM-o 4.6 ViT merger insertion layer
 };
 
 struct vision_layer {
@@ -139,6 +140,12 @@ struct vision_model {
     ggml_tensor * projection; // TODO: rename it to fc (fully connected layer)
     ggml_tensor * mm_fc_w;
     ggml_tensor * mm_fc_b;
+    ggml_tensor * mm_ffn_up_w = nullptr;
+    ggml_tensor * mm_ffn_up_b = nullptr;
+    ggml_tensor * mm_ffn_down_w = nullptr;
+    ggml_tensor * mm_ffn_down_b = nullptr;
+    ggml_tensor * mm_input_norm_w = nullptr;
+    ggml_tensor * mm_input_norm_b = nullptr;
 
     // MINICPMV projection
     ggml_tensor * mm_model_pos_embed_k = nullptr;
@@ -159,6 +166,24 @@ struct vision_model {
     ggml_tensor * mm_model_ln_kv_b = nullptr;
     ggml_tensor * mm_model_ln_post_w = nullptr;
     ggml_tensor * mm_model_ln_post_b = nullptr;
+
+    // MiniCPM-o 4.6 ViT merger (ported from MiniCPM-V 4.6 vision tower)
+    ggml_tensor * vit_merger_ln1_w     = nullptr;
+    ggml_tensor * vit_merger_ln1_b     = nullptr;
+    ggml_tensor * vit_merger_attn_q_w  = nullptr;
+    ggml_tensor * vit_merger_attn_q_b  = nullptr;
+    ggml_tensor * vit_merger_attn_k_w  = nullptr;
+    ggml_tensor * vit_merger_attn_k_b  = nullptr;
+    ggml_tensor * vit_merger_attn_v_w  = nullptr;
+    ggml_tensor * vit_merger_attn_v_b  = nullptr;
+    ggml_tensor * vit_merger_attn_o_w  = nullptr;
+    ggml_tensor * vit_merger_attn_o_b  = nullptr;
+    ggml_tensor * vit_merger_ds_ln_w   = nullptr;
+    ggml_tensor * vit_merger_ds_ln_b   = nullptr;
+    ggml_tensor * vit_merger_ds_up_w   = nullptr;
+    ggml_tensor * vit_merger_ds_up_b   = nullptr;
+    ggml_tensor * vit_merger_ds_down_w = nullptr;
+    ggml_tensor * vit_merger_ds_down_b = nullptr;
 
 };
 
@@ -240,6 +265,10 @@ struct vision_ctx {
         return model.model_type;
     }
 };
+
+static bool is_minicpm_o_4_6(const vision_model & model) {
+    return model.model_type == MiniCPM_o_4_6;
+}
 
 struct vision_graph {
     vision_ctx * ctx;
@@ -369,6 +398,304 @@ struct vision_graph {
         // build the graph
         ggml_build_forward_expand(gf, embeddings);
 
+        return gf;
+    }
+
+    // ViT graph for MiniCPM-o 4.6: SigLIP-style ViT with an inserted window-attention
+    // merger (2x2 spatial downsample) at hparams.insert_layer_id, followed by the
+    // remaining ViT layers on the downsampled tokens and a final 2x2 downsample
+    // merger that projects into the LLM embedding space.
+    // Structure originally introduced in MiniCPM-V 4.6 (PROJECTOR_TYPE_MINICPMV4_6
+    // in upstream llama.cpp / tools/mtmd); reused here for MiniCPM-o 4.6.
+    ggml_cgraph * build_minicpm_o_4_6() {
+        GGML_ASSERT(n_patches_x % 4 == 0 && n_patches_y % 4 == 0);
+        const int insert_lid = hparams.insert_layer_id;
+        GGML_ASSERT(insert_lid >= 0 && insert_lid < n_layer);
+        const int n_pos      = n_patches;
+        const int half_h     = n_patches_y / 2;
+        const int half_w     = n_patches_x / 2;
+        const int n_ds       = half_h * half_w;
+        const int qh         = half_h / 2;
+        const int qw         = half_w / 2;
+        const int n_ds2      = qh * qw;
+
+        auto add_i32_input = [&](const char * name, int n) {
+            ggml_tensor * t = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n);
+            ggml_set_name(t, name);
+            ggml_set_input(t);
+            return t;
+        };
+
+        // position indices for ViT learned positional embeddings
+        ggml_tensor * positions = add_i32_input("positions", n_pos);
+        ggml_tensor * learned_pos_embd = ggml_get_rows(ctx0, model.position_embeddings, positions);
+
+        // ViT merger window reorder indices + block-diagonal mask
+        // (mask layout follows qwen2vl: -inf except for 4x4 blocks on the diagonal,
+        // so each window-major group of 4 tokens only attends to itself)
+        // TODO: when vision graph gains flash-attn support, cast mask to F16 here
+        //       (see llama.cpp tools/mtmd/models/minicpmv.cpp::clip_graph_minicpmv4_6::build)
+        ggml_tensor * vit_merger_window_idx     = add_i32_input("vit_merger_window_idx", n_pos);
+        ggml_tensor * vit_merger_inv_window_idx = add_i32_input("vit_merger_inv_window_idx", n_pos);
+        ggml_tensor * vit_merger_window_mask    = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_pos, n_pos);
+        ggml_set_name(vit_merger_window_mask, "vit_merger_window_mask");
+        ggml_set_input(vit_merger_window_mask);
+
+        // ViT merger 2x2 downsample gather indices
+        ggml_tensor * vit_merger_ds_idx_0 = add_i32_input("vit_merger_ds_idx_0", n_ds);
+        ggml_tensor * vit_merger_ds_idx_1 = add_i32_input("vit_merger_ds_idx_1", n_ds);
+        ggml_tensor * vit_merger_ds_idx_2 = add_i32_input("vit_merger_ds_idx_2", n_ds);
+        ggml_tensor * vit_merger_ds_idx_3 = add_i32_input("vit_merger_ds_idx_3", n_ds);
+
+        // final merger 2x2 downsample gather indices
+        ggml_tensor * merger_ds_idx_0 = add_i32_input("merger_ds_idx_0", n_ds2);
+        ggml_tensor * merger_ds_idx_1 = add_i32_input("merger_ds_idx_1", n_ds2);
+        ggml_tensor * merger_ds_idx_2 = add_i32_input("merger_ds_idx_2", n_ds2);
+        ggml_tensor * merger_ds_idx_3 = add_i32_input("merger_ds_idx_3", n_ds2);
+
+        // patch embedding + positional embedding
+        ggml_tensor * inp = build_inp();
+        inp = ggml_add(ctx0, inp, learned_pos_embd);
+        cb(inp, "pos_embed", -1);
+
+        ggml_tensor * inpL = inp;
+        if (model.pre_ln_w) {
+            inpL = build_norm(inpL, model.pre_ln_w, model.pre_ln_b, NORM_TYPE_NORMAL, eps, -1);
+            cb(inpL, "pre_ln", -1);
+        }
+
+        // ViT layers 0..insert_layer_id (inclusive)
+        // Mirrors the separate-qkv path of build_vit() so the two manually
+        // unrolled segments around the ViT merger read like build_vit() expansions.
+        for (int il = 0; il <= insert_lid; il++) {
+            auto & layer = model.layers[il];
+            ggml_tensor * cur = inpL;
+
+            cur = build_norm(cur, layer.ln_1_w, layer.ln_1_b, NORM_TYPE_NORMAL, eps, il);
+            cb(cur, "layer_inp_normed", il);
+
+            {
+                ggml_tensor * Qcur = ggml_mul_mat(ctx0, layer.q_w, cur);
+                if (layer.q_b) {
+                    Qcur = ggml_add(ctx0, Qcur, layer.q_b);
+                }
+                ggml_tensor * Kcur = ggml_mul_mat(ctx0, layer.k_w, cur);
+                if (layer.k_b) {
+                    Kcur = ggml_add(ctx0, Kcur, layer.k_b);
+                }
+                ggml_tensor * Vcur = ggml_mul_mat(ctx0, layer.v_w, cur);
+                if (layer.v_b) {
+                    Vcur = ggml_add(ctx0, Vcur, layer.v_b);
+                }
+
+                Qcur = ggml_reshape_3d(ctx0, Qcur, d_head, n_head, n_pos);
+                Kcur = ggml_reshape_3d(ctx0, Kcur, d_head, n_head, n_pos);
+                Vcur = ggml_reshape_3d(ctx0, Vcur, d_head, n_head, n_pos);
+                cb(Qcur, "Qcur", il);
+                cb(Kcur, "Kcur", il);
+                cb(Vcur, "Vcur", il);
+
+                cur = build_attn(layer.o_w, layer.o_b, Qcur, Kcur, Vcur, nullptr, kq_scale, il);
+                cb(cur, "attn_out", il);
+            }
+
+            if (layer.ls_1_w) {
+                cur = ggml_mul(ctx0, cur, layer.ls_1_w);
+                cb(cur, "attn_out_scaled", il);
+            }
+            cur = ggml_add(ctx0, cur, inpL);
+            inpL = cur;
+            cb(cur, "ffn_inp", il);
+
+            cur = build_norm(cur, layer.ln_2_w, layer.ln_2_b, NORM_TYPE_NORMAL, eps, il);
+            cb(cur, "ffn_inp_normed", il);
+
+            cur = build_ffn(cur, layer.ff_up_w, layer.ff_up_b, layer.ff_gate_w, layer.ff_gate_b,
+                            layer.ff_down_w, layer.ff_down_b, hparams.ffn_op, il);
+            cb(cur, "ffn_out", il);
+
+            if (layer.ls_2_w) {
+                cur = ggml_mul(ctx0, cur, layer.ls_2_w);
+                cb(cur, "ffn_out_scaled", il);
+            }
+            cur = ggml_add(ctx0, inpL, cur);
+            cb(cur, "layer_out", il);
+
+            inpL = cur;
+        }
+
+        // ViT merger: window self-attention
+        // Tokens are reordered to window-major (4 tokens per window are contiguous),
+        // and a block-diagonal mask restricts attention to within each window. This
+        // mirrors the qwen2vl windowed-attention pattern so build_attn() can pick the
+        // flash-attention path when available.
+        {
+            ggml_tensor * residual = inpL;
+            ggml_tensor * cur = build_norm(inpL,
+                model.vit_merger_ln1_w, model.vit_merger_ln1_b,
+                NORM_TYPE_NORMAL, eps, -1);
+            cb(cur, "vit_merger_attn_inp_normed", -1);
+
+            cur = ggml_get_rows(ctx0, cur, vit_merger_window_idx);
+            cb(cur, "vit_merger_window_reorder", -1);
+
+            ggml_tensor * Qcur = ggml_mul_mat(ctx0, model.vit_merger_attn_q_w, cur);
+            if (model.vit_merger_attn_q_b) {
+                Qcur = ggml_add(ctx0, Qcur, model.vit_merger_attn_q_b);
+            }
+            ggml_tensor * Kcur = ggml_mul_mat(ctx0, model.vit_merger_attn_k_w, cur);
+            if (model.vit_merger_attn_k_b) {
+                Kcur = ggml_add(ctx0, Kcur, model.vit_merger_attn_k_b);
+            }
+            ggml_tensor * Vcur = ggml_mul_mat(ctx0, model.vit_merger_attn_v_w, cur);
+            if (model.vit_merger_attn_v_b) {
+                Vcur = ggml_add(ctx0, Vcur, model.vit_merger_attn_v_b);
+            }
+
+            Qcur = ggml_reshape_3d(ctx0, Qcur, d_head, n_head, n_pos);
+            Kcur = ggml_reshape_3d(ctx0, Kcur, d_head, n_head, n_pos);
+            Vcur = ggml_reshape_3d(ctx0, Vcur, d_head, n_head, n_pos);
+            cb(Qcur, "vit_merger_Qcur", -1);
+            cb(Kcur, "vit_merger_Kcur", -1);
+            cb(Vcur, "vit_merger_Vcur", -1);
+
+            cur = build_attn(model.vit_merger_attn_o_w, model.vit_merger_attn_o_b,
+                             Qcur, Kcur, Vcur, vit_merger_window_mask, kq_scale, -1);
+            cb(cur, "vit_merger_attn_out", -1);
+
+            cur = ggml_get_rows(ctx0, cur, vit_merger_inv_window_idx);
+            inpL = ggml_add(ctx0, cur, residual);
+            cb(inpL, "vit_merger_attn_residual", -1);
+        }
+
+        // ViT merger: 2x2 spatial downsample + MLP (4 tokens -> 1)
+        {
+            ggml_tensor * p0 = ggml_get_rows(ctx0, inpL, vit_merger_ds_idx_0);
+            ggml_tensor * p1 = ggml_get_rows(ctx0, inpL, vit_merger_ds_idx_1);
+            ggml_tensor * p2 = ggml_get_rows(ctx0, inpL, vit_merger_ds_idx_2);
+            ggml_tensor * p3 = ggml_get_rows(ctx0, inpL, vit_merger_ds_idx_3);
+
+            ggml_tensor * mean_res = ggml_add(ctx0, p0, p1);
+            mean_res = ggml_add(ctx0, mean_res, p2);
+            mean_res = ggml_add(ctx0, mean_res, p3);
+            mean_res = ggml_scale(ctx0, mean_res, 0.25f);
+            cb(mean_res, "vit_merger_ds_mean_res", -1);
+
+            ggml_tensor * cat = ggml_concat(ctx0, p0, p1, 0);
+            cat = ggml_concat(ctx0, cat, p2, 0);
+            cat = ggml_concat(ctx0, cat, p3, 0);
+
+            ggml_tensor * cur = build_norm(cat,
+                model.vit_merger_ds_ln_w, model.vit_merger_ds_ln_b,
+                NORM_TYPE_NORMAL, eps, -1);
+            cb(cur, "vit_merger_ds_normed", -1);
+
+            // MiniCPMV4_6ViTWindowAttentionMerger downsample MLP uses gelu_pytorch_tanh (FFN_GELU)
+            cur = build_ffn(cur,
+                model.vit_merger_ds_up_w,   model.vit_merger_ds_up_b,
+                nullptr, nullptr,
+                model.vit_merger_ds_down_w, model.vit_merger_ds_down_b,
+                FFN_GELU, -1);
+            cb(cur, "vit_merger_ds_mlp_out", -1);
+
+            inpL = ggml_add(ctx0, cur, mean_res);
+            cb(inpL, "vit_merger_ds_out", -1);
+        }
+
+        // ViT layers (insert_layer_id+1)..n_layer-1, operating on the downsampled tokens
+        {
+            const int64_t n_pos_ds = n_ds;
+            for (int il = insert_lid + 1; il < n_layer; il++) {
+                auto & layer = model.layers[il];
+                ggml_tensor * cur = inpL;
+
+                cur = build_norm(cur, layer.ln_1_w, layer.ln_1_b, NORM_TYPE_NORMAL, eps, il);
+                cb(cur, "layer_inp_normed", il);
+
+                {
+                    ggml_tensor * Qcur = ggml_mul_mat(ctx0, layer.q_w, cur);
+                    if (layer.q_b) {
+                        Qcur = ggml_add(ctx0, Qcur, layer.q_b);
+                    }
+                    ggml_tensor * Kcur = ggml_mul_mat(ctx0, layer.k_w, cur);
+                    if (layer.k_b) {
+                        Kcur = ggml_add(ctx0, Kcur, layer.k_b);
+                    }
+                    ggml_tensor * Vcur = ggml_mul_mat(ctx0, layer.v_w, cur);
+                    if (layer.v_b) {
+                        Vcur = ggml_add(ctx0, Vcur, layer.v_b);
+                    }
+
+                    Qcur = ggml_reshape_3d(ctx0, Qcur, d_head, n_head, n_pos_ds);
+                    Kcur = ggml_reshape_3d(ctx0, Kcur, d_head, n_head, n_pos_ds);
+                    Vcur = ggml_reshape_3d(ctx0, Vcur, d_head, n_head, n_pos_ds);
+                    cb(Qcur, "Qcur", il);
+                    cb(Kcur, "Kcur", il);
+                    cb(Vcur, "Vcur", il);
+
+                    cur = build_attn(layer.o_w, layer.o_b, Qcur, Kcur, Vcur, nullptr, kq_scale, il);
+                    cb(cur, "attn_out", il);
+                }
+
+                if (layer.ls_1_w) {
+                    cur = ggml_mul(ctx0, cur, layer.ls_1_w);
+                    cb(cur, "attn_out_scaled", il);
+                }
+                cur = ggml_add(ctx0, cur, inpL);
+                inpL = cur;
+                cb(cur, "ffn_inp", il);
+
+                cur = build_norm(cur, layer.ln_2_w, layer.ln_2_b, NORM_TYPE_NORMAL, eps, il);
+                cb(cur, "ffn_inp_normed", il);
+
+                cur = build_ffn(cur, layer.ff_up_w, layer.ff_up_b, layer.ff_gate_w, layer.ff_gate_b,
+                                layer.ff_down_w, layer.ff_down_b, hparams.ffn_op, il);
+                cb(cur, "ffn_out", il);
+
+                if (layer.ls_2_w) {
+                    cur = ggml_mul(ctx0, cur, layer.ls_2_w);
+                    cb(cur, "ffn_out_scaled", il);
+                }
+                cur = ggml_add(ctx0, inpL, cur);
+                cb(cur, "layer_out", il);
+
+                inpL = cur;
+            }
+        }
+
+        if (model.post_ln_w) {
+            inpL = build_norm(inpL, model.post_ln_w, model.post_ln_b, NORM_TYPE_NORMAL, eps, -1);
+            cb(inpL, "post_ln", -1);
+        }
+
+        // Final Merger (DownsampleMLP): another 2x2 spatial merge -> projector embedding
+        {
+            ggml_tensor * p0 = ggml_get_rows(ctx0, inpL, merger_ds_idx_0);
+            ggml_tensor * p1 = ggml_get_rows(ctx0, inpL, merger_ds_idx_1);
+            ggml_tensor * p2 = ggml_get_rows(ctx0, inpL, merger_ds_idx_2);
+            ggml_tensor * p3 = ggml_get_rows(ctx0, inpL, merger_ds_idx_3);
+
+            ggml_tensor * cat = ggml_concat(ctx0, p0, p1, 0);
+            cat = ggml_concat(ctx0, cat, p2, 0);
+            cat = ggml_concat(ctx0, cat, p3, 0);
+
+            ggml_tensor * cur = build_norm(cat,
+                model.mm_input_norm_w, model.mm_input_norm_b,
+                NORM_TYPE_NORMAL, eps, -1);
+            cb(cur, "merger_normed", -1);
+
+            // MiniCPMV4_6DownsampleMLP uses nn.GELU() (erf-based, FFN_GELU_ERF)
+            cur = build_ffn(cur,
+                model.mm_ffn_up_w,   model.mm_ffn_up_b,
+                nullptr, nullptr,
+                model.mm_ffn_down_w, model.mm_ffn_down_b,
+                FFN_GELU_ERF, -1);
+            cb(cur, "merger_out", -1);
+
+            inpL = cur;
+        }
+
+        ggml_build_forward_expand(gf, inpL);
         return gf;
     }
 
@@ -715,6 +1042,10 @@ static ggml_cgraph * vision_image_build_graph(vision_ctx * ctx, const vision_ima
             {
                 res = graph.build_minicpmv();
             } break;
+        case MiniCPM_o_4_6:
+            {
+                res = graph.build_minicpm_o_4_6();
+            } break;
         default:
             {
                 res = graph.build_minicpmv();
@@ -796,6 +1127,15 @@ struct vision_model_loader {
             // }
             // TODO: tc
             model.model_type = MiniCPM_o;
+
+            std::string proj_type;
+            get_string(KEY_PROJ_TYPE, proj_type, false);
+            // MiniCPM-o 4.6 currently reuses the MiniCPM-V 4.6 vision tower verbatim,
+            // so we recognize V4_6 GGUF identifiers here. Add the o-4.6 model_type
+            // string(s) once the MiniCPM-o 4.6 checkpoints are published.
+            if (proj_type == "minicpmv4_6" || model_type == "MiniCPM-V-4_6" || model_type == "minicpmv4_6") {
+                model.model_type = MiniCPM_o_4_6;
+            }
         }
 
         // other hparams
@@ -901,6 +1241,19 @@ struct vision_model_loader {
                             hparams.minicpmv_version = 25; // default to 20 if not set
                         }
                     } break;
+                case MiniCPM_o_4_6:
+                    {
+                        hparams.minicpmv_version = 100046;
+                        hparams.proj_scale_factor = 4;
+                        hparams.minicpmv_max_slice_nums = 9;
+                        get_u32(KEY_PROJ_SCALE_FACTOR, hparams.proj_scale_factor, false);
+
+                        std::vector<int> wa_layer_indexes;
+                        get_arr_int(KEY_WIN_ATTN_LAYER_INDEXES, wa_layer_indexes, false);
+                        if (!wa_layer_indexes.empty()) {
+                            hparams.insert_layer_id = wa_layer_indexes[0];
+                        }
+                    } break;
                 default:
                     break;
             }
@@ -919,6 +1272,7 @@ struct vision_model_loader {
             LOG_INF("%s: minicpmv_version:   %d\n", __func__, hparams.minicpmv_version);
             LOG_INF("%s: proj_scale_factor:  %d\n", __func__, hparams.proj_scale_factor);
             LOG_INF("%s: n_wa_pattern:       %d\n", __func__, hparams.n_wa_pattern);
+            LOG_INF("%s: insert_layer_id:     %d\n", __func__, hparams.insert_layer_id);
             
             LOG_INF("\n");
             LOG_INF("%s: model size:         %.2f MiB\n", __func__, model_size / 1024.0 / 1024.0);
@@ -1011,7 +1365,7 @@ struct vision_model_loader {
             // note: Qwen model converted from the old surgery script has n_ff = 0, so we cannot use n_ff to check!
             bool is_ffn_swapped = (
                     // only old models need this fix
-                    model.model_type == MiniCPM_o
+                    model.model_type == MiniCPM_o || model.model_type == MiniCPM_o_4_6
                 ) && layer.ff_up_w && layer.ff_down_w && layer.ff_down_w->ne[0] == hparams.n_embd;
             if (is_ffn_swapped) {
                 // swap up and down weights
@@ -1050,6 +1404,33 @@ struct vision_model_loader {
                     model.mm_model_ln_kv_b = get_tensor(string_format(TN_MINICPMV_LN, "kv", "bias"));
                     model.mm_model_ln_post_w = get_tensor(string_format(TN_MINICPMV_LN, "post", "weight"));
                     model.mm_model_ln_post_b = get_tensor(string_format(TN_MINICPMV_LN, "post", "bias"));
+                } break;
+            case MiniCPM_o_4_6:
+                {
+                    model.vit_merger_ln1_w     = get_tensor(string_format(TN_VIT_MERGER_LN1, "weight"));
+                    model.vit_merger_ln1_b     = get_tensor(string_format(TN_VIT_MERGER_LN1, "bias"));
+                    model.vit_merger_attn_q_w  = get_tensor(string_format(TN_VIT_MERGER_ATTN_Q, "weight"));
+                    model.vit_merger_attn_q_b  = get_tensor(string_format(TN_VIT_MERGER_ATTN_Q, "bias"), false);
+                    model.vit_merger_attn_k_w  = get_tensor(string_format(TN_VIT_MERGER_ATTN_K, "weight"));
+                    model.vit_merger_attn_k_b  = get_tensor(string_format(TN_VIT_MERGER_ATTN_K, "bias"), false);
+                    model.vit_merger_attn_v_w  = get_tensor(string_format(TN_VIT_MERGER_ATTN_V, "weight"));
+                    model.vit_merger_attn_v_b  = get_tensor(string_format(TN_VIT_MERGER_ATTN_V, "bias"), false);
+                    model.vit_merger_attn_o_w  = get_tensor(string_format(TN_VIT_MERGER_ATTN_O, "weight"));
+                    model.vit_merger_attn_o_b  = get_tensor(string_format(TN_VIT_MERGER_ATTN_O, "bias"), false);
+
+                    model.vit_merger_ds_ln_w   = get_tensor(string_format(TN_VIT_MERGER_DS_LN, "weight"));
+                    model.vit_merger_ds_ln_b   = get_tensor(string_format(TN_VIT_MERGER_DS_LN, "bias"));
+                    model.vit_merger_ds_up_w   = get_tensor(string_format(TN_VIT_MERGER_DS_UP, "weight"));
+                    model.vit_merger_ds_up_b   = get_tensor(string_format(TN_VIT_MERGER_DS_UP, "bias"), false);
+                    model.vit_merger_ds_down_w = get_tensor(string_format(TN_VIT_MERGER_DS_DOWN, "weight"));
+                    model.vit_merger_ds_down_b = get_tensor(string_format(TN_VIT_MERGER_DS_DOWN, "bias"), false);
+
+                    model.mm_input_norm_w = get_tensor(TN_MM_INP_NORM);
+                    model.mm_input_norm_b = get_tensor(TN_MM_INP_NORM_B, false);
+                    model.mm_ffn_up_w     = get_tensor(string_format(TN_MM_UP,   "weight"));
+                    model.mm_ffn_up_b     = get_tensor(string_format(TN_MM_UP,   "bias"), false);
+                    model.mm_ffn_down_w   = get_tensor(string_format(TN_MM_DOWN, "weight"));
+                    model.mm_ffn_down_b   = get_tensor(string_format(TN_MM_DOWN, "bias"), false);
                 } break;
             default:
                 GGML_ASSERT(false && "unknown model type");
@@ -1466,7 +1847,8 @@ struct llava_uhd {
 
     static slice_instructions get_slice_instructions(struct vision_ctx * ctx, const vision_image_size & original_size) {
         slice_instructions res;
-        const int patch_size      = ctx->model.hparams.patch_size;
+        const int merge_factor    = is_minicpm_o_4_6(ctx->model) ? 4 : 1;
+        const int patch_size      = ctx->model.hparams.patch_size * merge_factor;
         const int slice_size      = ctx->model.hparams.image_size;
         const int original_width  = original_size.width;
         const int original_height = original_size.height;
@@ -1691,7 +2073,11 @@ bool vision_image_preprocess(struct vision_ctx * ctx, const vision_image_u8 * im
     auto & params = ctx->model.hparams;
 
     switch (ctx->model.model_type) {
-        case MiniCPM_o: {
+        case MiniCPM_o:
+        case MiniCPM_o_4_6: {
+            // TODO(o4.6): preprocess should follow mtmd llava-uhd (bilinear, (src-1)/(dst-1))
+            //             see llama.cpp tools/mtmd/mtmd.cpp::PROJECTOR_TYPE_MINICPMV4_6
+            //             (PR currently shares MiniCPM-o's bicubic path for the o-4.6 vit)
             auto const inst = llava_uhd::get_slice_instructions(ctx, original_size);
             std::vector<vision_image_u8_ptr> imgs = llava_uhd::slice_image(img, inst);
 
@@ -1801,7 +2187,7 @@ static std::vector<std::vector<float>> get_2d_sincos_pos_embed(int embed_dim, co
 //
 // vision query
 //
-int vision_n_output_tokens(const struct vision_ctx * ctx) {
+static int vision_n_output_tokens_for_image(const struct vision_ctx * ctx, const vision_image_f32 * img) {
     const auto & params = ctx->model.hparams;
     int n_patches = 64;
     omni_model_type proj = ctx->model.model_type;
@@ -1834,6 +2220,13 @@ int vision_n_output_tokens(const struct vision_ctx * ctx) {
                     }
                 }
             } break;
+        case MiniCPM_o_4_6:
+            {
+                // ViT merger 4x + final merger 4x = 16x total spatial downsample
+                const int image_width  = img ? img->nx : params.image_size;
+                const int image_height = img ? img->ny : params.image_size;
+                n_patches = (image_width / params.patch_size) * (image_height / params.patch_size) / 16;
+            } break;
         default:
             GGML_ABORT("unsupported model type");
     }
@@ -1841,10 +2234,16 @@ int vision_n_output_tokens(const struct vision_ctx * ctx) {
     return n_patches;
 }
 
+int vision_n_output_tokens(const struct vision_ctx * ctx) {
+    return vision_n_output_tokens_for_image(ctx, nullptr);
+}
+
 int vision_n_mmproj_embd(const struct vision_ctx * ctx) {
     switch (ctx->model.model_type) {
         case MiniCPM_o:
             return ctx->model.mm_model_proj->ne[0];
+        case MiniCPM_o_4_6:
+            return ctx->model.mm_ffn_down_w->ne[1];
         default:
             GGML_ABORT("Unknown model type");
     }
@@ -1988,6 +2387,86 @@ bool vision_image_batch_encode(vision_ctx * ctx, const int n_threads, const visi
 
                 set_input_f32("pos_embed", pos_embed);
             } break;
+        case MiniCPM_o_4_6:
+            {
+                std::vector<int32_t> positions(pos_h * pos_w);
+                int bucket_coords_h[1024];
+                int bucket_coords_w[1024];
+                for (int i = 0; i < pos_h; i++){
+                    bucket_coords_h[i] = std::floor(70.0*i/pos_h);
+                }
+                for (int i = 0; i < pos_w; i++){
+                    bucket_coords_w[i] = std::floor(70.0*i/pos_w);
+                }
+                for (int i = 0, id = 0; i < pos_h; i++){
+                    for (int j = 0; j < pos_w; j++){
+                        positions[id++] = bucket_coords_h[i]*70 + bucket_coords_w[j];
+                    }
+                }
+                set_input_i32("positions", positions);
+
+                const int half_h = pos_h / 2;
+                const int half_w = pos_w / 2;
+
+                std::vector<int32_t> window_idx(n_pos);
+                std::vector<int32_t> inv_window_idx(n_pos);
+                {
+                    int k = 0;
+                    for (int wi = 0; wi < half_h; wi++) {
+                        for (int wj = 0; wj < half_w; wj++) {
+                            window_idx[k++] = (2*wi    ) * pos_w + (2*wj    );
+                            window_idx[k++] = (2*wi    ) * pos_w + (2*wj + 1);
+                            window_idx[k++] = (2*wi + 1) * pos_w + (2*wj    );
+                            window_idx[k++] = (2*wi + 1) * pos_w + (2*wj + 1);
+                        }
+                    }
+                    for (int i = 0; i < n_pos; i++) {
+                        inv_window_idx[window_idx[i]] = i;
+                    }
+                }
+                set_input_i32("vit_merger_window_idx",     window_idx);
+                set_input_i32("vit_merger_inv_window_idx", inv_window_idx);
+
+                std::vector<float> window_mask_data(n_pos * n_pos, std::numeric_limits<float>::lowest());
+                for (int wi = 0; wi < n_pos / 4; wi++) {
+                    for (int i = 0; i < 4; i++) {
+                        for (int j = 0; j < 4; j++) {
+                            window_mask_data[(wi*4 + i) * n_pos + (wi*4 + j)] = 0.0f;
+                        }
+                    }
+                }
+                set_input_f32("vit_merger_window_mask", window_mask_data);
+
+                auto make_ds_idx = [](int off_r, int off_c, int ds_h, int ds_w, int stride_w) {
+                    std::vector<int32_t> idx(ds_h * ds_w);
+                    for (int i = 0; i < ds_h; i++) {
+                        for (int j = 0; j < ds_w; j++) {
+                            idx[i * ds_w + j] = (2*i + off_r) * stride_w + (2*j + off_c);
+                        }
+                    }
+                    return idx;
+                };
+
+                auto vit_merger_ds_0 = make_ds_idx(0, 0, half_h, half_w, pos_w);
+                auto vit_merger_ds_1 = make_ds_idx(0, 1, half_h, half_w, pos_w);
+                auto vit_merger_ds_2 = make_ds_idx(1, 0, half_h, half_w, pos_w);
+                auto vit_merger_ds_3 = make_ds_idx(1, 1, half_h, half_w, pos_w);
+                set_input_i32("vit_merger_ds_idx_0", vit_merger_ds_0);
+                set_input_i32("vit_merger_ds_idx_1", vit_merger_ds_1);
+                set_input_i32("vit_merger_ds_idx_2", vit_merger_ds_2);
+                set_input_i32("vit_merger_ds_idx_3", vit_merger_ds_3);
+
+                const int qh = half_h / 2;
+                const int qw = half_w / 2;
+                auto merger_ds_0 = make_ds_idx(0, 0, qh, qw, half_w);
+                auto merger_ds_1 = make_ds_idx(0, 1, qh, qw, half_w);
+                auto merger_ds_2 = make_ds_idx(1, 0, qh, qw, half_w);
+                auto merger_ds_3 = make_ds_idx(1, 1, qh, qw, half_w);
+                set_input_i32("merger_ds_idx_0", merger_ds_0);
+                set_input_i32("merger_ds_idx_1", merger_ds_1);
+                set_input_i32("merger_ds_idx_2", merger_ds_2);
+                set_input_i32("merger_ds_idx_3", merger_ds_3);
+            } break;
         default:
             GGML_ABORT("Unknown projector type");
     }
@@ -2025,7 +2504,7 @@ bool vision_image_batch_encode(vision_ctx * ctx, const int n_threads, const visi
 
     // sanity check (only support batch size of 1 for now)
     const int n_tokens_out = embeddings->ne[1];
-    const int expected_n_tokens_out = vision_n_output_tokens(ctx);
+    const int expected_n_tokens_out = vision_n_output_tokens_for_image(ctx, imgs.entries[0].get());
     if (n_tokens_out != expected_n_tokens_out) {
         LOG_ERR("%s: expected output %d tokens, got %d\n", __func__, expected_n_tokens_out, n_tokens_out);
         GGML_ABORT("Invalid number of output tokens");
