@@ -102,7 +102,7 @@
 #define TN_MINICPMV_ATTN       "resampler.attn.%s.%s"
 #define TN_MINICPMV_LN         "resampler.ln_%s.%s"
 
-// MiniCPM-V 4.6 ViT merger
+// MiniCPM-o 4.6 ViT merger (ported from MiniCPM-V 4.6 vision tower)
 #define TN_VIT_MERGER_LN1      "v.vit_merger.ln1.%s"
 #define TN_VIT_MERGER_ATTN_Q   "v.vit_merger.attn_q.%s"
 #define TN_VIT_MERGER_ATTN_K   "v.vit_merger.attn_k.%s"
@@ -124,13 +124,13 @@
 
 enum omni_model_type {
     MiniCPM_o,
-    MiniCPM_v_4_6,
+    MiniCPM_o_4_6,
     OMNI_MODEL_TYPE_UNKNOWN,
 };
 
 static std::map<omni_model_type, std::string> OMNI_MODEL_TYPE_NAMES = {
-    { MiniCPM_o, "MiniCPM-o" },
-    { MiniCPM_v_4_6, "MiniCPM-V-4_6" },
+    { MiniCPM_o,     "MiniCPM-o" },
+    { MiniCPM_o_4_6, "MiniCPM-o-4_6" },
 };
 
 static omni_model_type omni_model_type_from_string(const std::string & str) {
