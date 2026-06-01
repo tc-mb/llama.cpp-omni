@@ -3945,7 +3945,7 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
         // 🔧 TTS流式采样参数 - 与 Python ras_sampling 对齐：
         // Python TTSSamplingParams 默认 temperature=0.8 (modeling_minicpmo.py line 75)
         common_params_sampling tts_sampling = params->sampling;
-        tts_sampling.temp = 0.8f;              // 🔧 [与 Python 对齐] TTSSamplingParams.temperature=0.8
+        tts_sampling.temp = ctx_omni->tts_temperature;  // [与 Python 对齐] TTSSamplingParams.temperature
         tts_sampling.top_p = 0.85f;  // 🔧 [与 Python 对齐] TTSSamplingParams.top_p=0.85             // 🔧 [与 Python streaming 对齐] top_p=0.8
         tts_sampling.top_k = 25;               // top_k = 25 (ras_sampling 参数)
         tts_sampling.penalty_repeat = 1.05f;   // repetition_penalty = 1.05
@@ -4739,7 +4739,7 @@ void llm_thread_func(omni_context* ctx_omni, common_params* params){
                     }
                 }
                 // ========== 子分支2：处理只有音频嵌入的数据（纯音频模式） ==========
-                else {
+                else if (!embeds->audio_embed.empty()) {
                     int n_audio_tokens = embeds->audio_embed.size() / hidden_size;
                     print_with_timestamp("用户语音: %d audio tokens\n", n_audio_tokens);
                     
@@ -4761,10 +4761,22 @@ void llm_thread_func(omni_context* ctx_omni, common_params* params){
                         eval_string(ctx_omni, params, "<|audio_end|>", params->n_batch, &ctx_omni->n_past, false);
                     }
                 }
+                // 子分支3：纯文本输入（turn-based chat 文本对话）
+                // 单工：assistant_prompt 末尾已带 <|im_start|>user\n，文本本身不需要
+                //       任何 <|audio_start|>/<|audio_end|> 之类的 modality 包裹。
+                // 双工：与音频对齐，先 <unit> 再写入文本。
+                else if (!embeds->user_text.empty()) {
+                    if (ctx_omni->duplex_mode) {
+                        eval_string(ctx_omni, params, "<unit>", params->n_batch, &ctx_omni->n_past, false);
+                    }
+                    eval_string(ctx_omni, params, embeds->user_text.c_str(), params->n_batch, &ctx_omni->n_past, false);
+                }
                 
                 // 🔧 [#39 滑动窗口] 注册 unit 结束
                 if (ctx_omni->sliding_window_config.mode != "off") {
-                    std::string input_type = embeds->vision_embed.size() > 0 ? "omni" : "audio";
+                    std::string input_type = embeds->vision_embed.size() > 0 ? "omni"
+                                           : !embeds->audio_embed.empty()    ? "audio"
+                                           :                                   "text";
                     sliding_window_register_unit_end(ctx_omni, input_type, {}, false);
                 }
                 
@@ -5022,8 +5034,7 @@ static bool generate_audio_tokens_local_simplex(
     // Create sampler - matching Python TTSStreamingGenerator
     // Python TTSSamplingParams 默认 temperature=0.8 (modeling_minicpmo.py line 75)
     common_params_sampling tts_sampling = params->sampling;
-    tts_sampling.temp = 0.8f;    // 🔧 [与 Python 对齐] TTSSamplingParams.temperature=0.8
-    tts_sampling.top_p = 0.85f;  // 🔧 [与 Python 对齐] TTSSamplingParams.top_p=0.85   // 🔧 [与 Python streaming 对齐] top_p=0.8
+    tts_sampling.temp = ctx_omni->tts_temperature;  // [与 Python 对齐] TTSSamplingParams.temperature
     tts_sampling.top_k = 25;
     tts_sampling.penalty_repeat = 1.05f;
     tts_sampling.min_p = 0.01f;
@@ -5456,7 +5467,7 @@ static bool generate_audio_tokens_local(
     // 🔧 TTS流式采样参数 - 与 Python TTSStreamingGenerator 对齐
     // Python TTSSamplingParams 默认 temperature=0.8 (modeling_minicpmo.py line 75)
     common_params_sampling tts_sampling = params->sampling;
-    tts_sampling.temp = 0.8f;              // 🔧 [与 Python 对齐] TTSSamplingParams.temperature=0.8
+    tts_sampling.temp = ctx_omni->tts_temperature;  // [与 Python 对齐] TTSSamplingParams.temperature
     tts_sampling.top_p = 0.85f;  // 🔧 [与 Python 对齐] TTSSamplingParams.top_p=0.85             // 🔧 [与 Python streaming 对齐] top_p=0.8
     tts_sampling.top_k = 25;               // top_k = 25
     tts_sampling.penalty_repeat = 1.05f;   // repetition_penalty = 1.05
@@ -9913,7 +9924,7 @@ static bool duplex_decode(omni_context * ctx_omni,
 // ===== END DUPLEX PIPELINE ==================================================
 // ============================================================================
 
-bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::string img_fname, int index, int max_slice_nums) {
+bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::string img_fname, int index, int max_slice_nums, std::string text) {
 
     // 🔧 [Duplex Pipeline Stage 1] 路由：
     //   duplex_mode && async && index > 0 && system prompt 已初始化 时，走新 duplex 路径。
@@ -10236,6 +10247,10 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
                 }
             }
             omni_embeds->index = index;
+            // text 仅作为字面量带过去，由 LLM 线程在锁保护下做 eval_string。
+            if (!text.empty()) {
+                omni_embeds->user_text = text;
+            }
             // 🔧 [整合] <|im_start|>user\n 已在 sys prompt 末尾添加，后续轮次在 stream_decode 结束时添加
             // 不再需要在这里设置 is_round_start 标记
             

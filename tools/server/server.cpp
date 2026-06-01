@@ -5559,12 +5559,18 @@ int main(int argc, char ** argv) {
     // impl: prefill
     const auto handle_stream_prefill_impl = [&ctx_server, &res_ok, &res_error](const json & data, httplib::Response & res) -> void {
         // Expected body fields (aligned with test_case in minicpmo-cli.cpp):
-        //  audio_path_prefix: string (required)
-        //  img_path_prefix: string (optional, default "")
-        //  img_posfix: string (optional, default "")
-        //  cnt: integer (required)
-        if (!data.contains("audio_path_prefix") || !data.at("audio_path_prefix").is_string()) {
-            res_error(res, format_error_response("\"audio_path_prefix\" must be provided as string", ERROR_TYPE_INVALID_REQUEST));
+        //  audio_path_prefix: string (optional, default "")
+        //  img_path_prefix:   string (optional, default "")
+        //  img_posfix:        string (optional, default "")
+        //  text:              string (optional, default "")  ← 文本输入（turn-based 文字对话）
+        //  cnt:               integer (required)
+        // 至少需要 audio/img/text 之一非空，否则视为非法请求。
+        if (data.contains("audio_path_prefix") && !data.at("audio_path_prefix").is_string()) {
+            res_error(res, format_error_response("\"audio_path_prefix\" must be a string when present", ERROR_TYPE_INVALID_REQUEST));
+            return;
+        }
+        if (data.contains("text") && !data.at("text").is_string()) {
+            res_error(res, format_error_response("\"text\" must be a string when present", ERROR_TYPE_INVALID_REQUEST));
             return;
         }
         if (!data.contains("cnt") || !data.at("cnt").is_number_integer()) {
@@ -5580,30 +5586,32 @@ int main(int argc, char ** argv) {
             }
         }
 
-        const std::string audio_path_prefix = data.at("audio_path_prefix");
+        const std::string audio_path_prefix = data.value("audio_path_prefix", std::string(""));
         const std::string img_path_prefix   = data.value("img_path_prefix", "");
         const std::string img_posfix        = data.value("img_posfix", "");
+        const std::string text              = data.value("text", std::string(""));
         const int cnt                        = data.at("cnt");
         // 🔧 [高清+高刷] 可选参数：控制本次 prefill 的图片切片数量
         // -1 (默认) = 使用全局设置, 1 = 不切片, 2 = 高清模式切片
         const int max_slice_nums             = data.value("max_slice_nums", -1);
 
+        if (audio_path_prefix.empty() && img_path_prefix.empty() && text.empty()) {
+            res_error(res, format_error_response(
+                "at least one of \"audio_path_prefix\", \"img_path_prefix\", \"text\" must be non-empty",
+                ERROR_TYPE_INVALID_REQUEST));
+            return;
+        }
+
         bool ok = true;
 
-        // for (int il = 0; ok && il < cnt; ++il) {
-        // std::string aud_fname = audio_path_prefix + std::to_string(0) + ".wav";
         std::string aud_fname = audio_path_prefix;
-        // std::string img_fname;
-        // if (!img_path_prefix.empty()) {
-        //     img_fname = img_path_prefix + std::to_string(0) + img_posfix;
-        // }
         std::string img_fname = img_path_prefix;
-        std::lock_guard<std::mutex> lock(ctx_server.octx_mutex);
-        if (!stream_prefill(ctx_server.octx, aud_fname, img_fname, cnt, max_slice_nums)) {
-            ok = false;
-            // break;
+        {
+            std::lock_guard<std::mutex> lock(ctx_server.octx_mutex);
+            if (!stream_prefill(ctx_server.octx, aud_fname, img_fname, cnt, max_slice_nums, text)) {
+                ok = false;
+            }
         }
-        // }
 
         if (!ok) {
             res_error(res, format_error_response("stream_prefill failed", ERROR_TYPE_SERVER));
@@ -5612,9 +5620,9 @@ int main(int argc, char ** argv) {
 
         json ack = {
             {"success", true},
-            {"audio_path_prefix", data.at("audio_path_prefix")},
-            {"img_path_prefix", data.contains("img_path_prefix") ? data.at("img_path_prefix") : json("")},
-            {"img_posfix", data.contains("img_posfix") ? data.at("img_posfix") : json("")},
+            {"audio_path_prefix", audio_path_prefix},
+            {"img_path_prefix", img_path_prefix},
+            {"img_posfix", img_posfix},
             {"cnt", data.at("cnt")}
         };
         res_ok(res, ack);
