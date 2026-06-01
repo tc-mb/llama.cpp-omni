@@ -1,5 +1,7 @@
 #include "token2wav.h"
+#include "token2wav-profile.h"
 
+#include <chrono>
 #include <cstdio>
 
 namespace omni {
@@ -15,6 +17,7 @@ bool Token2WavSession::init_from_prompt_cache_gguf(const std::string & encoder_g
                                                    int                 n_timesteps,
                                                    float               temperature) {
     // 初始化方式第一种，仅需使用此方式即可，加载模型所有的gguf内容
+    const auto t0 = std::chrono::steady_clock::now();
     reset();
     if (!t2w.load_models(encoder_gguf, flow_matching_gguf, flow_extra_gguf, vocoder_gguf, device_token2mel,
                          device_vocoder)) {
@@ -22,6 +25,12 @@ bool Token2WavSession::init_from_prompt_cache_gguf(const std::string & encoder_g
     }
     if (!t2w.start_stream_with_prompt_cache_gguf(prompt_cache_gguf_path, n_timesteps, temperature)) {
         return false;
+    }
+    const auto   t1     = std::chrono::steady_clock::now();
+    const double init_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    omni::flow::profile::record_init_ms(init_ms);
+    if (omni::flow::profile::verbose()) {
+        std::fprintf(stderr, "[timing] init_from_prompt_cache_gguf=%.3fms\n", init_ms);
     }
 
     return true;
@@ -78,7 +87,15 @@ bool Token2WavSession::feed_window(const int32_t *              tokens,
         return false;
     }
     if (on_audio_chunk && !wave_tmp_.empty()) {
+        const auto t_cb0 = std::chrono::steady_clock::now();
         on_audio_chunk(wave_tmp_.data(), (int64_t) wave_tmp_.size());
+        const auto   t_cb1 = std::chrono::steady_clock::now();
+        const double cb_ms = std::chrono::duration<double, std::milli>(t_cb1 - t_cb0).count();
+        omni::flow::profile::record_ms("callback", cb_ms);
+        if (omni::flow::profile::verbose()) {
+            std::fprintf(stderr, "[timing] callback=%.3fms samples=%lld\n",
+                         cb_ms, (long long) wave_tmp_.size());
+        }
     }
     return true;
 }
