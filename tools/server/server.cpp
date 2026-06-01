@@ -6150,6 +6150,29 @@ int main(int argc, char ** argv) {
                 }
             }
             
+            // [Python 透传] session-level sampling 旋钮，对齐 DuplexConfig
+            // 仅当请求显式提供时覆盖；省略时保留 omni_init 阶段的默认值。
+            if (data.contains("listen_prob_scale") && data.at("listen_prob_scale").is_number()) {
+                ctx_server.octx->listen_prob_scale = data.at("listen_prob_scale").get<float>();
+                SRV_INF("%s: listen_prob_scale set to %.4f\n", __func__,
+                        ctx_server.octx->listen_prob_scale);
+            }
+            if (data.contains("force_listen_count") && data.at("force_listen_count").is_number_integer()) {
+                ctx_server.octx->force_listen_count = data.at("force_listen_count").get<int>();
+                SRV_INF("%s: force_listen_count set to %d\n", __func__,
+                        ctx_server.octx->force_listen_count);
+            }
+            if (data.contains("max_new_speak_tokens_per_chunk") && data.at("max_new_speak_tokens_per_chunk").is_number_integer()) {
+                ctx_server.octx->max_new_speak_tokens_per_chunk = data.at("max_new_speak_tokens_per_chunk").get<int>();
+                SRV_INF("%s: max_new_speak_tokens_per_chunk set to %d\n", __func__,
+                        ctx_server.octx->max_new_speak_tokens_per_chunk);
+            }
+            if (data.contains("tts_temperature") && data.at("tts_temperature").is_number()) {
+                ctx_server.octx->tts_temperature = data.at("tts_temperature").get<float>();
+                SRV_INF("%s: tts_temperature set to %.4f\n", __func__,
+                        ctx_server.octx->tts_temperature);
+            }
+
             // 3. 清空 KV cache
             if (ctx_server.octx->ctx_llama) {
                 llama_memory_t mem = llama_get_memory(ctx_server.octx->ctx_llama);
@@ -6245,6 +6268,12 @@ int main(int argc, char ** argv) {
                 {"mode", ctx_server.octx->sliding_window_config.mode},
                 {"high_water_tokens", ctx_server.octx->sliding_window_config.high_water_tokens},
                 {"low_water_tokens", ctx_server.octx->sliding_window_config.low_water_tokens}
+            }},
+            {"sampling", {
+                {"listen_prob_scale", ctx_server.octx->listen_prob_scale},
+                {"force_listen_count", ctx_server.octx->force_listen_count},
+                {"max_new_speak_tokens_per_chunk", ctx_server.octx->max_new_speak_tokens_per_chunk},
+                {"tts_temperature", ctx_server.octx->tts_temperature},
             }}
         };
         res_ok(res, ack);
