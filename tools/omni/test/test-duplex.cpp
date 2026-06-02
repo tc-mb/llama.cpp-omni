@@ -189,6 +189,9 @@ static void show_usage(const char * prog_name) {
         "  --vision-backend <m>  Vision compute backend: 'metal'(默认) 或 'coreml'(ANE)\n"
         "  --vision-coreml <p>   CoreML/ANE 模型路径 (.mlmodelc)；--vision-backend=coreml 时\n"
         "                        若未指定则默认 <llm 同级目录>/vision/coreml_minicpmo45_vit_all_f16.mlmodelc\n"
+        "  --sliding <mode>    滑窗模式: off|turn|basic|context (默认: off)\n"
+        "  --high-water <n>    滑窗触发水位 token 数 (默认: 4000)\n"
+        "  --low-water <n>     滑窗目标水位 token 数 (默认: 3500)\n"
         "  --test <prefix> <n> 指定测试数据前缀和 chunk 数量\n"
         "  --stream-interval <ms>  push frame 的最小间隔 (默认 0=背靠背压测；\n"
         "                          设为 1000 模拟真实 MiniCPM-o 流式输入)\n"
@@ -221,6 +224,9 @@ int main(int argc, char ** argv) {
     bool use_tts = true;
     bool run_test = false;
     int  stream_interval_ms = 0;  // 0 = 背靠背（压测）；真实流式建议 1000
+    std::string sliding_mode = "off";
+    int sliding_high_water = 4000;
+    int sliding_low_water = 3500;
     std::string test_prefix;
     int test_count = 0;
     std::string token2wav_device = "gpu";
@@ -244,6 +250,9 @@ int main(int argc, char ** argv) {
         else if (arg == "-ngl" && i + 1 < argc) { n_gpu_layers = std::atoi(argv[++i]); }
         else if (arg == "--no-tts") { use_tts = false; }
         else if (arg == "--omni") { media_type = 2; }
+        else if (arg == "--sliding" && i + 1 < argc) { sliding_mode = argv[++i]; }
+        else if (arg == "--high-water" && i + 1 < argc) { sliding_high_water = std::atoi(argv[++i]); }
+        else if (arg == "--low-water" && i + 1 < argc) { sliding_low_water = std::atoi(argv[++i]); }
         else if (arg == "--vision-backend" && i + 1 < argc) {
             vision_backend = argv[++i];
             if (vision_backend != "metal" && vision_backend != "coreml") {
@@ -275,6 +284,16 @@ int main(int argc, char ** argv) {
     if (llm_path.empty()) {
         fprintf(stderr, "Error: -m <llm_model_path> is required\n\n");
         show_usage(argv[0]);
+        return 1;
+    }
+    if (sliding_mode != "off" && sliding_mode != "turn" &&
+        sliding_mode != "basic" && sliding_mode != "context") {
+        fprintf(stderr, "Error: unsupported --sliding mode: %s\n", sliding_mode.c_str());
+        return 1;
+    }
+    if (sliding_high_water <= 0 || sliding_low_water <= 0 ||
+        sliding_high_water <= sliding_low_water) {
+        fprintf(stderr, "Error: sliding watermarks must satisfy high-water > low-water > 0\n");
         return 1;
     }
 
@@ -349,6 +368,11 @@ int main(int argc, char ** argv) {
     }
     ctx_omni->async = true;
     ctx_omni->ref_audio_path = ref_audio_path;
+    ctx_omni->sliding_window_config.mode = sliding_mode;
+    ctx_omni->sliding_window_config.high_water_tokens = sliding_high_water;
+    ctx_omni->sliding_window_config.low_water_tokens = sliding_low_water;
+    printf("  Sliding: %s (high=%d, low=%d)\n",
+           sliding_mode.c_str(), sliding_high_water, sliding_low_water);
 
     const std::string default_prefix = "tools/omni/assets/test_case/audio_test_case/audio_test_case_";
     duplex_test_case(ctx_omni,
