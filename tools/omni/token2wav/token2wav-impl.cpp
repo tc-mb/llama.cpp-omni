@@ -997,6 +997,8 @@ ggml_tensor * fmCausalConditionalCFM::build_forward_chunk_graph(ggml_context *  
 }
 }  // namespace flow_matching
 }  // namespace omni
+namespace omni {
+namespace flow_matching {
 fmCausalConv1d::fmCausalConv1d(int in_channels, int out_channels, int kernel_size) :
     in_channels_(in_channels),
     out_channels_(out_channels),
