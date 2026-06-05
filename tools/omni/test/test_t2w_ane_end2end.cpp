@@ -12,7 +12,7 @@
 //       * meta.txt                                             n_chunks / valid_cache_len_init / inference_cfg_rate
 //
 //   - C++ 端：
-//       1. 加载 ANE mlpackage（coreml_t2w_dit）
+//       1. 加载 CoreML 模型（coreml_t2w_dit）
 //       2. 对每个 chunk：cosine schedule + CFG batch=2 + Euler ODE × n_timesteps
 //          每 step 调一次 t2w_dit_predict
 //       3. 把每 chunk 的 mel 拼接，落盘 /tmp/ane_t2w_work/runtime_state/mel_cpp_ane.bin
@@ -136,10 +136,9 @@ static void build_attn_mask(int B, int T, int Tc, int valid_cache_len, std::vect
 // ---------------------------------------------------------------------------
 
 int main(int argc, char ** argv) {
-    std::string state_dir = "/tmp/ane_t2w_work/runtime_state";
-    std::string mlpkg = "/Users/tianchi/code/project/ane/ane/ane_o45_tts/"
-                        "ane_t2w_dit_f16_chunk56_cache600.mlpackage";
-    std::string out_mel = "/tmp/ane_t2w_work/runtime_state/mel_cpp_ane.bin";
+    std::string state_dir;
+    std::string mlpkg;
+    std::string out_mel;
     std::string dump_io_dir;  // 若非空，把 chunk 0 step 1 的所有 IO 落盘，方便 cross-check
 
     for (int i = 1; i < argc; ++i) {
@@ -153,6 +152,15 @@ int main(int argc, char ** argv) {
                    "[--dump-io-dir <dir>]\n", argv[0]);
             return 0;
         }
+    }
+
+    if (mlpkg.empty() || state_dir.empty()) {
+        fprintf(stderr, "Error: --mlpkg <path> and --state <dir> are required\n");
+        fprintf(stderr, "Usage: %s --mlpkg <path> --state <dir> [--out-mel <file>] [--dump-io-dir <dir>]\n", argv[0]);
+        return 1;
+    }
+    if (out_mel.empty()) {
+        out_mel = state_dir + "/mel_cpp_ane.bin";
     }
 
     // 1. read meta
@@ -183,7 +191,7 @@ int main(int argc, char ** argv) {
     printf("  cfg_rate:    %.3f\n", cfg_rate);
 
     // 2. load ANE
-    printf("\n[1/4] load ANE mlpackage ...\n");
+    printf("\n[1/4] load CoreML model ...\n");
     auto t0 = std::chrono::high_resolution_clock::now();
     t2w_dit_handle_t h = t2w_dit_load(mlpkg.c_str());
     if (!h) { fprintf(stderr, "load failed\n"); return 2; }
@@ -196,7 +204,7 @@ int main(int argc, char ** argv) {
     if (dims.depth != depth || dims.batch != B || dims.chunk_size != chunk_size
         || dims.max_cache_len != max_cache_len || dims.num_heads != num_heads
         || dims.head_dim != head_dim || dims.mel_channels != mel_channels) {
-        fprintf(stderr, "[end2end] meta vs mlpackage dims mismatch\n");
+        fprintf(stderr, "[end2end] meta vs CoreML model dims mismatch\n");
         t2w_dit_free(h);
         return 3;
     }

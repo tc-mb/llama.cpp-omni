@@ -65,6 +65,8 @@ static void show_usage(const char * prog_name) {
         "  --omni              Enable omni mode (audio + vision, media_type=2)\n"
         "  --vision-backend <mode>  Vision compute backend: 'metal' (default) or 'coreml' (ANE)\n"
         "  --vision-coreml <path>   Path to CoreML model (.mlmodelc), required when backend=coreml\n"
+        "  --t2w-coreml <path>  Enable token2wav CoreML backend (DiT on CoreML, encoder on GPU)\n"
+        "                        Use 'auto' to auto-discover CoreML model in model dir\n"
         "  --test <prefix> <n> Run test case with data prefix and count\n"
         "  -h, --help          Show this help message\n\n"
         "Example:\n"
@@ -206,6 +208,7 @@ int main(int argc, char ** argv) {
     std::string projector_path_override;
     std::string vision_backend = "metal";  // vision backend: "metal" (default) or "coreml"
     std::string vision_coreml_model_path;  // CoreML model path (required when vision_backend=coreml)
+    std::string token2wav_coreml_model_path; // CoreML model path for token2wav DiT (empty = GPU only)
     std::string ref_audio_path = "tools/omni/assets/default_ref_audio/default_ref_audio.wav";
     int n_ctx = 4096;
     int n_gpu_layers = 99;  // GPU 层数，默认 99
@@ -262,6 +265,9 @@ int main(int argc, char ** argv) {
         }
         else if (arg == "--vision-coreml" && i + 1 < argc) {
             vision_coreml_model_path = argv[++i];
+        }
+        else if (arg == "--t2w-coreml" && i + 1 < argc) {
+            token2wav_coreml_model_path = argv[++i];
         }
         else if (arg == "--test" && i + 2 < argc) {
             run_test = true;
@@ -321,6 +327,7 @@ int main(int argc, char ** argv) {
         }
         params.vision_coreml_model_path = vision_coreml_model_path;
     }
+    params.token2wav_coreml_model_path = token2wav_coreml_model_path;
     params.n_ctx = n_ctx;
     params.n_gpu_layers = n_gpu_layers;
     
@@ -345,6 +352,9 @@ int main(int argc, char ** argv) {
     }
     printf("  TTS bin dir: %s\n", tts_bin_dir.c_str());
     printf("  Ref audio: %s\n", ref_audio_path.c_str());
+    if (!params.token2wav_coreml_model_path.empty()) {
+        printf("  T2W CoreML: %s\n", params.token2wav_coreml_model_path.c_str());
+    }
     
     // 🔧 Token2Wav 使用 GPU（Metal），已用 ggml_add+ggml_repeat 替代不支持的 ggml_add1
     auto ctx_omni = omni_init(&params, media_type, use_tts, tts_bin_dir, -1, "gpu:0");

@@ -13,8 +13,8 @@
 //
 // 用法:
 //   ./build/bin/llama-omni-test-t2w-dit-ane \
-//       --mlpkg /Users/tianchi/code/project/ane/ane/ane_o45_tts/ane_t2w_dit_f16_chunk56_cache600.mlpackage \
-//       --vec-dir /tmp/ane_t2w_work/test_vectors
+//       --mlpkg <path/to/coreml_minicpmo45_t2w_dit.mlpackage> \
+//       --vec-dir <path/to/test_vectors>
 
 #include "coreml/coreml_t2w_dit.h"
 
@@ -83,14 +83,9 @@ static DiffStats compute_diff(const std::vector<float> & a, const std::vector<fl
 }
 
 int main(int argc, char ** argv) {
-    std::string mlpkg = "/Users/tianchi/code/project/ane/ane/ane_o45_tts/"
-                        "ane_t2w_dit_f16_chunk56_cache600.mlpackage";
-    std::string vec_dir = "/tmp/ane_t2w_work/test_vectors";
+    std::string mlpkg;
+    std::string vec_dir;
     int repeat = 5;
-    // 默认容差：ref 是 CPU_ONLY 跑出来的（fp32 路径）。
-    //   - CPU_ONLY: bit-exact，1e-4 即可
-    //   - ANE / ALL / CPU_GPU: fp16 内部累加，会有 ~0.1-0.5 量级偏差
-    // 可通过 --tol 显式覆盖。
     double tol_max = -1.0;  // -1 表示自动按 compute_units 选
 
     for (int i = 1; i < argc; ++i) {
@@ -117,13 +112,19 @@ int main(int argc, char ** argv) {
         }
     }
 
+    if (mlpkg.empty() || vec_dir.empty()) {
+        fprintf(stderr, "Error: --mlpkg <path> and --vec-dir <dir> are required\n");
+        fprintf(stderr, "Usage: %s --mlpkg <path> --vec-dir <dir> [--repeat <n>] [--tol <max|Δ|>]\n", argv[0]);
+        return 1;
+    }
+
     printf("=== test_t2w_dit_ane ===\n");
     printf("  mlpkg:    %s\n", mlpkg.c_str());
     printf("  vec_dir:  %s\n", vec_dir.c_str());
     printf("  repeat:   %d\n\n", repeat);
 
     // 1. load model
-    printf("[1/4] load mlpackage ...\n");
+    printf("[1/4] load CoreML model ...\n");
     auto t0 = std::chrono::high_resolution_clock::now();
     t2w_dit_handle_t h = t2w_dit_load(mlpkg.c_str());
     if (!h) {

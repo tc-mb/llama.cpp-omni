@@ -61,7 +61,7 @@ struct flowInferenceChunkOut {
     ggml_tensor * conformer_att_cache = nullptr;
     flow_matching::fmCFMCache * estimator_cache = nullptr;
 };
-// ANE 路径：encoder + projector 输出到 mu，跳过 decoder（DiT 走 ANE mlpackage）。
+// CoreML 路径：encoder + projector 输出到 mu，跳过 decoder（DiT 走 CoreML）。
 struct flowEncoderOnlyOut {
     ggml_tensor * mu_ctb              = nullptr;  // (C=80, T_mel, B)，row-major contiguous
     ggml_tensor * spk_proj_cb         = nullptr;  // (C=80, B)，已 normalize+affine
@@ -2049,14 +2049,14 @@ class Token2Mel {
     Token2Mel(const Token2Mel &)             = delete;
     Token2Mel & operator=(const Token2Mel &) = delete;
 
-    // ane_mlpackage_path 非空时启用 ANE 后端：encoder/projector 仍走 GGUF/Metal，
-    // 但 DiT estimator 走 ANE mlpackage（绕过 GPU command queue contention）。
+    // coreml_model_path 非空时启用 CoreML 后端：encoder/projector 仍走 GGUF/Metal，
+    // 但 DiT estimator 走 CoreML（绕过 GPU command queue contention）。
     bool load_model(const std::string & encoder_gguf,
                     const std::string & flow_matching_gguf,
                     const std::string & flow_extra_gguf,
                     const std::string & device              = "gpu",
                     int                 threads             = 8,
-                    const std::string & ane_mlpackage_path  = "");
+                    const std::string & coreml_model_path  = "");
 
     static bool load_prompt_bundle_dir(const std::string & dir, PromptBundle & out);
 
@@ -2103,7 +2103,7 @@ class Token2Mel {
     bool ensure_ready_for_infer() const;
     bool infer_one_chunk(const std::vector<int32_t> & chunk_bt, bool last_chunk, std::vector<float> & mel_bct);
 
-    // ANE 路径：encoder via GGUF runner 输出 mu，DiT × n_timesteps 走 ANE mlpackage。
+    // CoreML 路径：encoder via GGUF runner 输出 mu，DiT × n_timesteps 走 CoreML。
     bool start_stream_ane_(const flowStreamCacheHost & host_cache);
     bool infer_one_chunk_ane_(const std::vector<int32_t> & chunk_bt, bool last_chunk,
                               std::vector<float> & mel_bct);
@@ -2122,7 +2122,7 @@ class Token2Mel {
 
     // ANE 模式专用 state（仅当 backend_kind_ == ANE 时有效）
     void *                          ane_handle_ = nullptr;  // t2w_dit_handle_t (opaque)
-    std::string                     ane_mlpackage_path_;
+    std::string                     coreml_model_path_;
     std::vector<std::vector<float>> ane_cnn_caches_;        // n_timesteps × (depth*B*1024*2)
     std::vector<std::vector<float>> ane_att_caches_;        // n_timesteps × (depth*B*nh*max_cache_len*head_dim*2)
     std::vector<float>              ane_spk_proj_b2_80_;    // (B=2, 80)，[spk; zeros] for CFG
@@ -2206,7 +2206,7 @@ class Token2Wav {
                      const std::string & vocoder_gguf,
                      const std::string & device_token2mel    = "gpu",
                      const std::string & device_vocoder      = "gpu",
-                     const std::string & ane_mlpackage_path  = "");
+                     const std::string & coreml_model_path  = "");
 
     bool start_stream_with_prompt_cache_gguf(const std::string & prompt_cache_gguf_path,
                                              int                 n_timesteps = -1,
@@ -2264,7 +2264,7 @@ struct Token2WavSession {
                                      const std::string & device_vocoder      = "gpu",
                                      int                 n_timesteps         = 10,
                                      float               temperature         = 1.0f,
-                                     const std::string & ane_mlpackage_path  = "");
+                                     const std::string & coreml_model_path  = "");
 
     bool init_from_prompt_bundle(const std::string & encoder_gguf,
                                  const std::string & flow_matching_gguf,
@@ -2275,7 +2275,7 @@ struct Token2WavSession {
                                  const std::string & device_vocoder      = "gpu",
                                  int                 n_timesteps         = 10,
                                  float               temperature         = 1.0f,
-                                 const std::string & ane_mlpackage_path  = "");
+                                 const std::string & coreml_model_path  = "");
 
     bool feed_tokens(const int32_t * tokens, int64_t n_tokens, bool is_final, std::vector<float> & wave_bt_out);
 

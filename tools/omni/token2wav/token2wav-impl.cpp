@@ -8712,7 +8712,7 @@ bool Token2Mel::load_model(const std::string & encoder_gguf,
                            const std::string & flow_extra_gguf,
                            const std::string & device,
                            int                 threads,
-                           const std::string & ane_mlpackage_path) {
+                           const std::string & coreml_model_path) {
     // 用于加载三段GGUF并初始化runner(失败时回退到cpu)
     reset_stream();
     runner_.set_num_threads(threads);
@@ -8732,34 +8732,34 @@ bool Token2Mel::load_model(const std::string & encoder_gguf,
 
     runner_.set_export_caches_to_host(false);
 
-    // ANE 后端：加载 mlpackage handle
+    // CoreML 后端：加载 CoreML 模型
     backend_kind_       = Backend::GGUF;
     ane_handle_         = nullptr;
-    ane_mlpackage_path_.clear();
-    if (!ane_mlpackage_path.empty()) {
+    coreml_model_path_.clear();
+    if (!coreml_model_path.empty()) {
 #if defined(ENABLE_COREML) && defined(__APPLE__)
         std::fprintf(stderr,
-                     "[Token2Mel] ANE backend requested, loading mlpackage: %s\n",
-                     ane_mlpackage_path.c_str());
-        ane_handle_ = (void *) t2w_dit_load(ane_mlpackage_path.c_str());
+                     "[Token2Mel] CoreML backend requested, loading model: %s\n",
+                     coreml_model_path.c_str());
+        ane_handle_ = (void *) t2w_dit_load(coreml_model_path.c_str());
         if (!ane_handle_) {
             LOG_ERROR("Token2Mel.load_model: t2w_dit_load failed for %s; "
                       "falling back to GGUF DiT\n",
-                      ane_mlpackage_path.c_str());
+                      coreml_model_path.c_str());
         } else {
-            ane_mlpackage_path_ = ane_mlpackage_path;
+            coreml_model_path_ = coreml_model_path;
             backend_kind_       = Backend::ANE;
-            std::fprintf(stderr, "[Token2Mel] ANE backend ready (DiT on ANE, encoder on %s)\n",
+            std::fprintf(stderr, "[Token2Mel] CoreML backend ready (DiT on CoreML, encoder on %s)\n",
                          device.c_str());
             // 启用 cache 导出：encoder-only 路径需要 host conformer cache 流转
             runner_.set_export_caches_to_host(true);
             // 设置 export_caches_to_host=true 后，inference_chunk 会比平时多
-            // download conformer + estimator cache，但 ANE 模式下我们不会调
+            // download conformer + estimator cache，但 CoreML 模式下我们不会调
             // inference_chunk（只调 inference_chunk_encoder_only），所以只影响
             // setup_cache 阶段的一次性导出。
         }
 #else
-        LOG_ERROR("Token2Mel.load_model: ANE mlpackage requested but ENABLE_COREML not set; "
+        LOG_ERROR("Token2Mel.load_model: CoreML model requested but ENABLE_COREML not set; "
                   "falling back to GGUF DiT\n");
 #endif
     }
@@ -8974,24 +8974,6 @@ bool Token2Mel::start_stream_with_prompt_cache_gguf(const std::string & prompt_c
         cache_in_.conformer_att_cache = cache_host.conformer_att_cache;
         cache_in_.conformer_att_ne    = cache_host.conformer_att_ne;
         cache_in_.n_timesteps         = use_nt;
-        // [DEBUG] 打印 estimator cache 的 ne，便于实现 5D→4D fold
-        std::fprintf(stderr,
-                     "[t2w-ane-debug] cache_host.n_timesteps=%d depth=%d (assumed) batch=2 (assumed)\n",
-                     cache_host.n_timesteps, kAneDepth);
-        std::fprintf(stderr, "[t2w-ane-debug] estimator_cnn_ne (size=%zu): ",
-                     cache_host.estimator_cnn_ne.size());
-        for (auto v : cache_host.estimator_cnn_ne) std::fprintf(stderr, "%lld ", (long long) v);
-        std::fprintf(stderr, " bytes=%zu\n", cache_host.estimator_cnn_cache.size());
-        std::fprintf(stderr, "[t2w-ane-debug] estimator_att_ne (size=%zu): ",
-                     cache_host.estimator_att_ne.size());
-        for (auto v : cache_host.estimator_att_ne) std::fprintf(stderr, "%lld ", (long long) v);
-        std::fprintf(stderr, " bytes=%zu\n", cache_host.estimator_att_cache.size());
-        std::fprintf(stderr, "[t2w-ane-debug] conformer_cnn_ne: ");
-        for (auto v : cache_host.conformer_cnn_ne) std::fprintf(stderr, "%lld ", (long long) v);
-        std::fprintf(stderr, " bytes=%zu\n", cache_host.conformer_cnn_cache.size());
-        std::fprintf(stderr, "[t2w-ane-debug] conformer_att_ne: ");
-        for (auto v : cache_host.conformer_att_ne) std::fprintf(stderr, "%lld ", (long long) v);
-        std::fprintf(stderr, " bytes=%zu\n", cache_host.conformer_att_cache.size());
         if (!start_stream_ane_(cache_host)) {
             LOG_ERROR("Token2Mel.start_stream_with_prompt_cache_gguf: start_stream_ane_ failed\n");
             return false;
@@ -9051,7 +9033,7 @@ bool Token2Mel::infer_one_chunk(const std::vector<int32_t> & chunk_bt, bool last
 }
 
 // ===========================================================================
-// ANE 路径：encoder 走 GGUF Metal，DiT 走 ANE mlpackage
+// CoreML 路径：encoder 走 GGUF Metal，DiT 走 CoreML
 // ===========================================================================
 
 bool Token2Mel::start_stream_ane_(const flowStreamCacheHost & host_cache) {
@@ -9239,7 +9221,7 @@ bool Token2Mel::infer_one_chunk_ane_(const std::vector<int32_t> & chunk_bt, bool
     }
 
     // ---- Step 1: GGUF encoder-only -> mu (1, 80, 56), spk_proj (1, 80) ----
-    // ANE mlpackage 的 chunk_size 写死 56 = kDt(28) * up_rate(2)。
+    // CoreML 模型的 chunk_size 写死 56 = kDt(28) * up_rate(2)。
     // GGUF encoder 默认 last_chunk=False 时只输出 kChunkMain*2=50 mel（剥掉 lookahead），
     // 形状跟 ANE 静态形状对不上。这里**对 encoder 永远走 last_chunk=true**，让它输出 56 mel
     // 喂给 ANE。**但 DiT 输出的 56 mel 中末尾 6 个对应 lookahead，跟下一个 chunk 开头 6 个
@@ -9678,12 +9660,12 @@ bool Token2Wav::load_models(const std::string & encoder_gguf,
                             const std::string & vocoder_gguf,
                             const std::string & device_token2mel,
                             const std::string & device_vocoder,
-                            const std::string & ane_mlpackage_path) {
+                            const std::string & coreml_model_path) {
     reset_stream();
 
     constexpr int kDefaultThreads = 8;
     if (!t2m_.load_model(encoder_gguf, flow_matching_gguf, flow_extra_gguf, device_token2mel, kDefaultThreads,
-                         ane_mlpackage_path)) {
+                         coreml_model_path)) {
         LOG_ERROR( "Token2Wav.load_models: Token2Mel.load_model failed\n");
         models_loaded_ = false;
         return false;

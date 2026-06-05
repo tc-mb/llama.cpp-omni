@@ -1,11 +1,11 @@
 // coreml_t2w_dit.h
 //
-// Token2Mel DiT estimator -> ANE 桥接（C ABI），独立于 ggml。
+// Token2Mel DiT estimator -> CoreML 桥接（C ABI），独立于 ggml。
 //
 // 用途：MiniCPM-o-4.5 token2wav 的 DiT estimator 跑在 Apple Neural Engine 上，
 //   彻底绕开 Metal command queue 在双工模式下被 LLM 抢资源的瓶颈。
 //
-// mlpackage 由 tools/convert/o45_tts/ane_export_dit.py 生成，输入/输出 schema:
+// CoreML 模型由 tools/convert/o45_tts/ane_export_dit.py 生成，输入/输出 schema:
 //
 //   inputs:
 //     x            (B=2, 80,                                T=56)        fp32
@@ -37,7 +37,7 @@ extern "C" {
 
 typedef void * t2w_dit_handle_t;
 
-// 模型几何信息（mlpackage 加载时从 metadata 读取，便于调用方校验形状）
+// CoreML 模型几何信息（加载时从 metadata 读取，便于调用方校验形状）
 typedef struct {
     int32_t depth;             // 16
     int32_t batch;             // 2  (CFG cond + uncond batched)
@@ -51,14 +51,14 @@ typedef struct {
     int32_t spk_dim;           // 80
 } t2w_dit_dims_t;
 
-// 加载 mlpackage（路径），默认 compute_units = CPUAndNeuralEngine。
+// 加载 CoreML 模型（路径），默认 compute_units = CPUAndNeuralEngine。
 // 环境变量 OMNI_T2W_DIT_COMPUTE_UNITS 可覆盖：
 //   "ane"     -> CPUAndNeuralEngine（默认，目标场景）
 //   "all"     -> All
 //   "cpu_gpu" -> CPUAndGPU
 //   "cpu"     -> CPUOnly
 // 失败返回 nullptr。
-t2w_dit_handle_t t2w_dit_load(const char * mlpackage_path);
+t2w_dit_handle_t t2w_dit_load(const char * model_path);
 
 // 读取模型几何。
 // 失败返回非 0。

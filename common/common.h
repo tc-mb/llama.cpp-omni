@@ -573,11 +573,14 @@ struct common_params {
     int image_max_tokens = -1;
 
     // omni models (see tools/omni)
-    std::string tts_model               = ""; // TTS weights GGUF
-    std::string apm_model               = ""; // audio encoder GGUF
-    std::string vpm_model               = ""; // vision encoder GGUF
-    std::string projector_model         = ""; // projector GGUF
-    std::string vision_coreml_model_path = ""; // path to CoreML .mlmodelc for vision ANE
+    std::string tts_model                = ""; // TTS weights GGUF
+    std::string apm_model                = ""; // audio encoder GGUF
+    std::string vpm_model                = ""; // vision encoder GGUF
+    std::string projector_model          = ""; // projector GGUF
+
+    // Apple Neural Engine (CoreML) support
+    std::string vision_coreml_model_path     = ""; // path to CoreML .mlmodelc for vision ANE
+    std::string token2wav_coreml_model_path  = ""; // path to CoreML model (.mlmodelc/.mlpackage) for token2wav DiT
 
     // finetune
     struct lr_opt lr;
