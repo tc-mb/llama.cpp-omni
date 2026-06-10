@@ -1,46 +1,32 @@
-ARG UBUNTU_VERSION=24.04
+ARG UBUNTU_VERSION=26.04
+ARG BUILD_DATE=N/A
+ARG APP_VERSION=N/A
+ARG APP_REVISION=N/A
 
 FROM ubuntu:$UBUNTU_VERSION AS build
-
-# Ref: https://vulkan.lunarg.com/doc/sdk/latest/linux/getting_started.html
 
 # Install build tools
 RUN apt update && apt install -y git build-essential cmake wget xz-utils
 
-# Install Vulkan SDK
-ARG VULKAN_VERSION=1.4.321.1
-RUN ARCH=$(uname -m) && \
-    wget -qO /tmp/vulkan-sdk.tar.xz https://sdk.lunarg.com/sdk/download/${VULKAN_VERSION}/linux/vulkan-sdk-linux-${ARCH}-${VULKAN_VERSION}.tar.xz && \
-    mkdir -p /opt/vulkan && \
-    tar -xf /tmp/vulkan-sdk.tar.xz -C /tmp --strip-components=1 && \
-    mv /tmp/${ARCH}/* /opt/vulkan/ && \
-    rm -rf /tmp/*
-
-# Install cURL and Vulkan SDK dependencies
-RUN apt install -y libcurl4-openssl-dev curl \
-    libxcb-xinput0 libxcb-xinerama0 libxcb-cursor-dev
-
-# Set environment variables
-ENV VULKAN_SDK=/opt/vulkan
-ENV PATH=$VULKAN_SDK/bin:$PATH
-ENV LD_LIBRARY_PATH=$VULKAN_SDK/lib:$LD_LIBRARY_PATH
-ENV CMAKE_PREFIX_PATH=$VULKAN_SDK:$CMAKE_PREFIX_PATH
-ENV PKG_CONFIG_PATH=$VULKAN_SDK/lib/pkgconfig:$PKG_CONFIG_PATH
+# Install SSL and Vulkan SDK dependencies
+RUN apt install -y libssl-dev curl \
+    libxcb-xinput0 libxcb-xinerama0 libxcb-cursor-dev libvulkan-dev glslc spirv-headers
 
 # Build it
 WORKDIR /app
 
 COPY . .
 
-RUN cmake -B build -DGGML_NATIVE=OFF -DGGML_VULKAN=1  -DLLAMA_BUILD_TESTS=OFF -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON && \
+RUN cmake -B build -DGGML_NATIVE=OFF -DGGML_VULKAN=ON -DLLAMA_BUILD_TESTS=OFF -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON && \
     cmake --build build --config Release -j$(nproc)
 
 RUN mkdir -p /app/lib && \
-    find build -name "*.so" -exec cp {} /app/lib \;
+    find build -name "*.so*" -exec cp -P {} /app/lib \;
 
 RUN mkdir -p /app/full \
     && cp build/bin/* /app/full \
     && cp *.py /app/full \
+    && cp -r conversion /app/full \
     && cp -r gguf-py /app/full \
     && cp -r requirements /app/full \
     && cp requirements.txt /app/full \
@@ -49,8 +35,22 @@ RUN mkdir -p /app/full \
 ## Base image
 FROM ubuntu:$UBUNTU_VERSION AS base
 
+ARG BUILD_DATE=N/A
+ARG APP_VERSION=N/A
+ARG APP_REVISION=N/A
+ARG IMAGE_URL=https://github.com/ggml-org/llama.cpp
+ARG IMAGE_SOURCE=https://github.com/ggml-org/llama.cpp
+LABEL org.opencontainers.image.created=$BUILD_DATE \
+      org.opencontainers.image.version=$APP_VERSION \
+      org.opencontainers.image.revision=$APP_REVISION \
+      org.opencontainers.image.title="llama.cpp" \
+      org.opencontainers.image.description="LLM inference in C/C++" \
+      org.opencontainers.image.url=$IMAGE_URL \
+      org.opencontainers.image.source=$IMAGE_SOURCE
+
 RUN apt-get update \
-    && apt-get install -y libgomp1 curl libvulkan-dev \
+    && apt-get install -y libgomp1 curl libvulkan1 mesa-vulkan-drivers \
+    libglvnd0 libgl1 libglx0 libegl1 libgles2 \
     && apt autoremove -y \
     && apt clean -y \
     && rm -rf /tmp/* /var/tmp/* \
@@ -66,14 +66,20 @@ COPY --from=build /app/full /app
 
 WORKDIR /app
 
+ENV PATH="/root/.venv/bin:/root/.local/bin:${PATH}"
+
+# Flag for compatibility with pip
+ARG UV_INDEX_STRATEGY="unsafe-best-match"
 RUN apt-get update \
     && apt-get install -y \
+    build-essential \
+    curl \
     git \
-    python3 \
-    python3-pip \
-    python3-wheel \
-    && pip install --break-system-packages --upgrade setuptools \
-    && pip install --break-system-packages -r requirements.txt \
+    ca-certificates \
+    && curl -LsSf https://astral.sh/uv/install.sh | sh \
+    && uv python install 3.13 \
+    && uv venv --python 3.13 /root/.venv \
+    && uv pip install --python /root/.venv/bin/python -r requirements.txt \
     && apt autoremove -y \
     && apt clean -y \
     && rm -rf /tmp/* /var/tmp/* \
@@ -85,7 +91,7 @@ ENTRYPOINT ["/app/tools.sh"]
 ### Light, CLI only
 FROM base AS light
 
-COPY --from=build /app/full/llama-cli /app
+COPY --from=build /app/full/llama-cli /app/full/llama-completion /app
 
 WORKDIR /app
 

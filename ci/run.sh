@@ -25,6 +25,15 @@
 # # with KLEIDIAI support
 # GG_BUILD_KLEIDIAI=1 bash ./ci/run.sh ./tmp/results ./tmp/mnt
 #
+# # with BLAS support
+# GG_BUILD_BLAS=1 bash ./ci/run.sh ./tmp/results ./tmp/mnt
+#
+# with BLAS support (custom vendor)
+# GG_BUILD_BLAS=1 GG_BUILD_BLAS_VENDOR=Intel10_64lp bash ./ci/run.sh ./tmp/results ./tmp/mnt
+#
+# with OPENVINO support
+# GG_BUILD_OPENVINO=1 GG_BUILD_LOW_PERF=1 GGML_OPENVINO_DEVICE=CPU bash ./ci/run.sh ./tmp/results ./tmp/mnt
+#
 
 if [ -z "$2" ]; then
     echo "usage: $0 <output-dir> <mnt-dir>"
@@ -45,14 +54,25 @@ sd=`dirname $0`
 cd $sd/../
 SRC=`pwd`
 
-CMAKE_EXTRA="-DLLAMA_FATAL_WARNINGS=ON -DLLAMA_CURL=ON"
+CMAKE_EXTRA="-DLLAMA_FATAL_WARNINGS=${LLAMA_FATAL_WARNINGS:-ON} -DLLAMA_OPENSSL=OFF -DGGML_SCHED_NO_REALLOC=ON"
+CTEST_EXTRA=""
+
+# Default to use make unless specified for compatibility
+CMAKE_GENERATOR="Unix Makefiles"
+
+if [ ! -z "${GG_BUILD_NINJA}" ]; then
+    CMAKE_GENERATOR="Ninja"
+fi
 
 if [ ! -z ${GG_BUILD_METAL} ]; then
     CMAKE_EXTRA="${CMAKE_EXTRA} -DGGML_METAL=ON"
+else
+    CMAKE_EXTRA="${CMAKE_EXTRA} -DGGML_METAL=OFF"
 fi
 
 if [ ! -z ${GG_BUILD_CUDA} ]; then
-    CMAKE_EXTRA="${CMAKE_EXTRA} -DGGML_CUDA=ON"
+    # TODO: Remove GGML_CUDA_CUB_3DOT2 flag once CCCL 3.2 is bundled within CTK and that CTK version is used in this project
+    CMAKE_EXTRA="${CMAKE_EXTRA} -DGGML_CUDA=ON -DGGML_CUDA_CUB_3DOT2=ON"
 
     if command -v nvidia-smi >/dev/null 2>&1; then
         CUDA_ARCH=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d '.')
@@ -75,7 +95,7 @@ if [ ! -z ${GG_BUILD_ROCM} ]; then
         exit 1
     fi
 
-    CMAKE_EXTRA="${CMAKE_EXTRA} -DAMDGPU_TARGETS=${GG_BUILD_AMDGPU_TARGETS}"
+    CMAKE_EXTRA="${CMAKE_EXTRA} -DGPU_TARGETS=${GG_BUILD_AMDGPU_TARGETS}"
 fi
 
 if [ ! -z ${GG_BUILD_SYCL} ]; then
@@ -96,15 +116,36 @@ fi
 if [ ! -z ${GG_BUILD_VULKAN} ]; then
     CMAKE_EXTRA="${CMAKE_EXTRA} -DGGML_VULKAN=1"
 
-    # if on Mac, disable METAL
     if [[ "$OSTYPE" == "darwin"* ]]; then
-        CMAKE_EXTRA="${CMAKE_EXTRA} -DGGML_METAL=OFF -DGGML_BLAS=OFF"
+        MACOS_RUNNER_CUSTOM_VULKAN_CMAKE_LOCATION="/usr/local/lib/cmake/vulkan"
+        MACOS_RUNNER_CUSTOM_SPIRV_HEADERS_LOCATION="${MACOS_RUNNER_CUSTOM_VULKAN_CMAKE_LOCATION}/SPIRV-Headers/SPIRV-HeadersConfig.cmake"
+        if [[ -f "${MACOS_RUNNER_CUSTOM_SPIRV_HEADERS_LOCATION}" || -h "${MACOS_RUNNER_CUSTOM_SPIRV_HEADERS_LOCATION}" ]]; then
+            CMAKE_EXTRA="${CMAKE_EXTRA} -DSPIRV-Headers_DIR=${MACOS_RUNNER_CUSTOM_VULKAN_CMAKE_LOCATION}/SPIRV-Headers"
+        fi
     fi
 
+    # Build shared libs on Windows
+    # to reduce binary size and avoid errors in library loading unit tests
+    if uname -s | grep -qi nt; then
+        CMAKE_EXTRA="${CMAKE_EXTRA} -DBUILD_SHARED_LIBS=ON"
+    fi
 fi
 
 if [ ! -z ${GG_BUILD_WEBGPU} ]; then
     CMAKE_EXTRA="${CMAKE_EXTRA} -DGGML_WEBGPU=1"
+
+    if [ ! -z "${GG_BUILD_WEBGPU_DAWN_PREFIX}" ]; then
+        if [ -z "${CMAKE_PREFIX_PATH}" ]; then
+            export CMAKE_PREFIX_PATH="${GG_BUILD_WEBGPU_DAWN_PREFIX}"
+        else
+            export CMAKE_PREFIX_PATH="${GG_BUILD_WEBGPU_DAWN_PREFIX}:${CMAKE_PREFIX_PATH}"
+        fi
+    fi
+
+    # For some systems, Dawn_DIR needs to be set explicitly, e.g., the lib64 path
+    if [ ! -z "${GG_BUILD_WEBGPU_DAWN_DIR}" ]; then
+        CMAKE_EXTRA="${CMAKE_EXTRA} -DDawn_DIR=${GG_BUILD_WEBGPU_DAWN_DIR}"
+    fi
 fi
 
 if [ ! -z ${GG_BUILD_MUSA} ]; then
@@ -120,30 +161,25 @@ fi
 
 if [ -n "${GG_BUILD_KLEIDIAI}" ]; then
     echo ">>===== Enabling KleidiAI support"
+    CMAKE_EXTRA="${CMAKE_EXTRA:+$CMAKE_EXTRA } -DGGML_CPU_KLEIDIAI=ON"
+fi
 
-    CANDIDATES=("armv9-a+dotprod+i8mm" "armv8.6-a+dotprod+i8mm" "armv8.2-a+dotprod")
-    CPU=""
+if [ ! -z ${GG_BUILD_BLAS} ]; then
+    CMAKE_EXTRA="${CMAKE_EXTRA} -DGGML_BLAS=ON -DGGML_BLAS_VENDOR=${GG_BUILD_BLAS_VENDOR:-OpenBLAS}"
+else
+    CMAKE_EXTRA="${CMAKE_EXTRA} -DGGML_BLAS=OFF"
+fi
 
-    for cpu in "${CANDIDATES[@]}"; do
-        if echo 'int main(){}' | ${CXX:-c++} -march="$cpu" -x c++ - -c -o /dev/null >/dev/null 2>&1; then
-            CPU="$cpu"
-            break
-        fi
-    done
-
-    if [ -z "$CPU" ]; then
-        echo "ERROR: None of the required ARM baselines (armv9/armv8.6/armv8.2 + dotprod) are supported by this compiler."
+if [ ! -z ${GG_BUILD_OPENVINO} ]; then
+    if [ -z ${OpenVINO_DIR} ]; then
+        echo "OpenVINO_DIR not found, please install OpenVINO via archives and enable it by:"
+        echo "source /opt/intel/openvino/setupvars.sh"
         exit 1
     fi
+    CMAKE_EXTRA="${CMAKE_EXTRA} -DGGML_OPENVINO=ON"
 
-    echo ">>===== Using ARM baseline: ${CPU}"
-
-    CMAKE_EXTRA="${CMAKE_EXTRA:+$CMAKE_EXTRA } \
-        -DGGML_NATIVE=OFF \
-        -DGGML_CPU_KLEIDIAI=ON \
-        -DGGML_CPU_AARCH64=ON \
-        -DGGML_CPU_ARM_ARCH=${CPU} \
-        -DBUILD_SHARED_LIBS=OFF"
+    # TODO: fix and re-enable the `test-llama-archs` test below
+    CTEST_EXTRA="-E test-llama-archs"
 fi
 
 ## helpers
@@ -197,13 +233,13 @@ function gg_run_ctest_debug {
 
     set -e
 
-    # Check cmake, make and ctest are installed
+    # Check required binaries are installed
     gg_check_build_requirements
 
-    (time cmake -DCMAKE_BUILD_TYPE=Debug ${CMAKE_EXTRA} .. ) 2>&1 | tee -a $OUT/${ci}-cmake.log
-    (time make -j$(nproc)                                  ) 2>&1 | tee -a $OUT/${ci}-make.log
+    (cmake -G "${CMAKE_GENERATOR}" -DCMAKE_BUILD_TYPE=Debug ${CMAKE_EXTRA} .. ) 2>&1 | tee -a $OUT/${ci}-cmake.log
+    (time cmake --build . --config Debug -j$(nproc)) 2>&1 | tee -a $OUT/${ci}-make.log
 
-    (time ctest --output-on-failure -L main -E "test-opt|test-backend-ops" ) 2>&1 | tee -a $OUT/${ci}-ctest.log
+    (time ctest -C Debug --output-on-failure -L main -E "test-opt|test-backend-ops|test-llama-archs" ${CTEST_EXTRA}) 2>&1 | tee -a $OUT/${ci}-ctest.log
 
     set +e
 }
@@ -228,16 +264,16 @@ function gg_run_ctest_release {
 
     set -e
 
-    # Check cmake, make and ctest are installed
+    # Check required binaries are installed
     gg_check_build_requirements
 
-    (time cmake -DCMAKE_BUILD_TYPE=Release ${CMAKE_EXTRA} .. ) 2>&1 | tee -a $OUT/${ci}-cmake.log
-    (time make -j$(nproc)                                    ) 2>&1 | tee -a $OUT/${ci}-make.log
+    (cmake -G "${CMAKE_GENERATOR}" -DCMAKE_BUILD_TYPE=Release ${CMAKE_EXTRA} .. ) 2>&1 | tee -a $OUT/${ci}-cmake.log
+    (time cmake --build . --config Release -j$(nproc)) 2>&1 | tee -a $OUT/${ci}-make.log
 
     if [ -z ${GG_BUILD_LOW_PERF} ]; then
-        (time ctest --output-on-failure -L main ) 2>&1 | tee -a $OUT/${ci}-ctest.log
+        (time ctest -C Release --output-on-failure -L 'main|python' ${CTEST_EXTRA}) 2>&1 | tee -a $OUT/${ci}-ctest.log
     else
-        (time ctest --output-on-failure -L main -E test-opt ) 2>&1 | tee -a $OUT/${ci}-ctest.log
+        (time ctest -C Release --output-on-failure -L main -E test-opt ${CTEST_EXTRA}) 2>&1 | tee -a $OUT/${ci}-ctest.log
     fi
 
     set +e
@@ -278,7 +314,8 @@ function gg_sum_test_scripts {
 }
 
 function gg_get_model {
-    local gguf_0="$MNT/models/qwen3/0.6B/ggml-model-f16.gguf"
+    #local gguf_0="$MNT/models/qwen3/0.6B/ggml-model-f16.gguf"
+    local gguf_0="$MNT/models/qwen3/0.6B/ggml-model-q4_0.gguf"
     if [[ -s $gguf_0 ]]; then
         echo -n "$gguf_0"
     else
@@ -294,7 +331,7 @@ function gg_run_ctest_with_model_debug {
     cd build-ci-debug
     set -e
 
-    (LLAMACPP_TEST_MODELFILE="$model" time ctest --output-on-failure -L model) 2>&1 | tee -a $OUT/${ci}-ctest.log
+    (LLAMACPP_TEST_MODELFILE="$model" time ctest -C Debug --output-on-failure -L model) 2>&1 | tee -a $OUT/${ci}-ctest.log
 
     set +e
     cd ..
@@ -307,7 +344,7 @@ function gg_run_ctest_with_model_release {
     cd build-ci-release
     set -e
 
-    (LLAMACPP_TEST_MODELFILE="$model" time ctest --output-on-failure -L model) 2>&1 | tee -a $OUT/${ci}-ctest.log
+    (LLAMACPP_TEST_MODELFILE="$model" time ctest -C Release --output-on-failure -L model) 2>&1 | tee -a $OUT/${ci}-ctest.log
 
     # test memory leaks
     #if [[ ! -z ${GG_BUILD_METAL} ]]; then
@@ -361,8 +398,8 @@ function gg_run_qwen3_0_6b {
 
     set -e
 
-    (time cmake -DCMAKE_BUILD_TYPE=Release ${CMAKE_EXTRA} .. ) 2>&1 | tee -a $OUT/${ci}-cmake.log
-    (time make -j$(nproc)                                    ) 2>&1 | tee -a $OUT/${ci}-make.log
+    (cmake -G "${CMAKE_GENERATOR}" -DCMAKE_BUILD_TYPE=Release ${CMAKE_EXTRA} .. ) 2>&1 | tee -a $OUT/${ci}-cmake.log
+    (time cmake --build . --config Release -j$(nproc)) 2>&1 | tee -a $OUT/${ci}-make.log
 
     python3 ../convert_hf_to_gguf.py ${path_models} --outfile ${path_models}/ggml-model-f16.gguf  --outtype f16
     python3 ../convert_hf_to_gguf.py ${path_models} --outfile ${path_models}/ggml-model-bf16.gguf --outtype bf16
@@ -393,18 +430,20 @@ function gg_run_qwen3_0_6b {
     ./bin/llama-quantize ${model_bf16} ${model_q5_k} q5_k $(nproc)
     ./bin/llama-quantize ${model_bf16} ${model_q6_k} q6_k $(nproc)
 
-    (time ./bin/llama-cli -no-cnv --model ${model_f16}  -ngl 99 -c 1024 -s 1234 -n 64 --ignore-eos -p "I believe the meaning of life is" ) 2>&1 | tee -a $OUT/${ci}-tg-f16.log
-    (time ./bin/llama-cli -no-cnv --model ${model_bf16} -ngl 99 -c 1024 -s 1234 -n 64 --ignore-eos -p "I believe the meaning of life is" ) 2>&1 | tee -a $OUT/${ci}-tg-bf16.log
-    (time ./bin/llama-cli -no-cnv --model ${model_q8_0} -ngl 99 -c 1024 -s 1234 -n 64 --ignore-eos -p "I believe the meaning of life is" ) 2>&1 | tee -a $OUT/${ci}-tg-q8_0.log
-    (time ./bin/llama-cli -no-cnv --model ${model_q4_0} -ngl 99 -c 1024 -s 1234 -n 64 --ignore-eos -p "I believe the meaning of life is" ) 2>&1 | tee -a $OUT/${ci}-tg-q4_0.log
-    (time ./bin/llama-cli -no-cnv --model ${model_q4_1} -ngl 99 -c 1024 -s 1234 -n 64 --ignore-eos -p "I believe the meaning of life is" ) 2>&1 | tee -a $OUT/${ci}-tg-q4_1.log
-    (time ./bin/llama-cli -no-cnv --model ${model_q5_0} -ngl 99 -c 1024 -s 1234 -n 64 --ignore-eos -p "I believe the meaning of life is" ) 2>&1 | tee -a $OUT/${ci}-tg-q5_0.log
-    (time ./bin/llama-cli -no-cnv --model ${model_q5_1} -ngl 99 -c 1024 -s 1234 -n 64 --ignore-eos -p "I believe the meaning of life is" ) 2>&1 | tee -a $OUT/${ci}-tg-q5_1.log
-    (time ./bin/llama-cli -no-cnv --model ${model_q2_k} -ngl 99 -c 1024 -s 1234 -n 64 --ignore-eos -p "I believe the meaning of life is" ) 2>&1 | tee -a $OUT/${ci}-tg-q2_k.log
-    (time ./bin/llama-cli -no-cnv --model ${model_q3_k} -ngl 99 -c 1024 -s 1234 -n 64 --ignore-eos -p "I believe the meaning of life is" ) 2>&1 | tee -a $OUT/${ci}-tg-q3_k.log
-    (time ./bin/llama-cli -no-cnv --model ${model_q4_k} -ngl 99 -c 1024 -s 1234 -n 64 --ignore-eos -p "I believe the meaning of life is" ) 2>&1 | tee -a $OUT/${ci}-tg-q4_k.log
-    (time ./bin/llama-cli -no-cnv --model ${model_q5_k} -ngl 99 -c 1024 -s 1234 -n 64 --ignore-eos -p "I believe the meaning of life is" ) 2>&1 | tee -a $OUT/${ci}-tg-q5_k.log
-    (time ./bin/llama-cli -no-cnv --model ${model_q6_k} -ngl 99 -c 1024 -s 1234 -n 64 --ignore-eos -p "I believe the meaning of life is" ) 2>&1 | tee -a $OUT/${ci}-tg-q6_k.log
+    (time ./bin/llama-fit-params --model ${model_f16} 2>&1 | tee -a $OUT/${ci}-fp-f16.log)
+
+    (time ./bin/llama-completion -no-cnv --model ${model_f16}  -ngl 99 -c 1024 -s 1234 -n 64 --ignore-eos -p "I believe the meaning of life is" ) 2>&1 | tee -a $OUT/${ci}-tg-f16.log
+    (time ./bin/llama-completion -no-cnv --model ${model_bf16} -ngl 99 -c 1024 -s 1234 -n 64 --ignore-eos -p "I believe the meaning of life is" ) 2>&1 | tee -a $OUT/${ci}-tg-bf16.log
+    (time ./bin/llama-completion -no-cnv --model ${model_q8_0} -ngl 99 -c 1024 -s 1234 -n 64 --ignore-eos -p "I believe the meaning of life is" ) 2>&1 | tee -a $OUT/${ci}-tg-q8_0.log
+    (time ./bin/llama-completion -no-cnv --model ${model_q4_0} -ngl 99 -c 1024 -s 1234 -n 64 --ignore-eos -p "I believe the meaning of life is" ) 2>&1 | tee -a $OUT/${ci}-tg-q4_0.log
+    (time ./bin/llama-completion -no-cnv --model ${model_q4_1} -ngl 99 -c 1024 -s 1234 -n 64 --ignore-eos -p "I believe the meaning of life is" ) 2>&1 | tee -a $OUT/${ci}-tg-q4_1.log
+    (time ./bin/llama-completion -no-cnv --model ${model_q5_0} -ngl 99 -c 1024 -s 1234 -n 64 --ignore-eos -p "I believe the meaning of life is" ) 2>&1 | tee -a $OUT/${ci}-tg-q5_0.log
+    (time ./bin/llama-completion -no-cnv --model ${model_q5_1} -ngl 99 -c 1024 -s 1234 -n 64 --ignore-eos -p "I believe the meaning of life is" ) 2>&1 | tee -a $OUT/${ci}-tg-q5_1.log
+    (time ./bin/llama-completion -no-cnv --model ${model_q2_k} -ngl 99 -c 1024 -s 1234 -n 64 --ignore-eos -p "I believe the meaning of life is" ) 2>&1 | tee -a $OUT/${ci}-tg-q2_k.log
+    (time ./bin/llama-completion -no-cnv --model ${model_q3_k} -ngl 99 -c 1024 -s 1234 -n 64 --ignore-eos -p "I believe the meaning of life is" ) 2>&1 | tee -a $OUT/${ci}-tg-q3_k.log
+    (time ./bin/llama-completion -no-cnv --model ${model_q4_k} -ngl 99 -c 1024 -s 1234 -n 64 --ignore-eos -p "I believe the meaning of life is" ) 2>&1 | tee -a $OUT/${ci}-tg-q4_k.log
+    (time ./bin/llama-completion -no-cnv --model ${model_q5_k} -ngl 99 -c 1024 -s 1234 -n 64 --ignore-eos -p "I believe the meaning of life is" ) 2>&1 | tee -a $OUT/${ci}-tg-q5_k.log
+    (time ./bin/llama-completion -no-cnv --model ${model_q6_k} -ngl 99 -c 1024 -s 1234 -n 64 --ignore-eos -p "I believe the meaning of life is" ) 2>&1 | tee -a $OUT/${ci}-tg-q6_k.log
 
     (time ./bin/llama-perplexity --model ${model_f16}  -f ${wiki_test} -ngl 99 -c 1024 -b 512 --chunks 2 ) 2>&1 | tee -a $OUT/${ci}-tg-f16.log
     if [ -z ${GG_BUILD_NO_BF16} ]; then
@@ -423,10 +462,10 @@ function gg_run_qwen3_0_6b {
 
     (time ./bin/llama-imatrix --model ${model_f16} -f ${wiki_test} -ngl 99 -c 1024 -b 512 --chunks 2 ) 2>&1 | tee -a $OUT/${ci}-imatrix.log
 
-    (time ./bin/llama-save-load-state --model ${model_q4_0} -ngl 10 -c 1024 -fa off ) 2>&1 | tee -a $OUT/${ci}-save-load-state.log
-    (time ./bin/llama-save-load-state --model ${model_q4_0} -ngl 10 -c 1024 -fa on  ) 2>&1 | tee -a $OUT/${ci}-save-load-state.log
-    (time ./bin/llama-save-load-state --model ${model_q4_0} -ngl 99 -c 1024 -fa off ) 2>&1 | tee -a $OUT/${ci}-save-load-state.log
-    (time ./bin/llama-save-load-state --model ${model_q4_0} -ngl 99 -c 1024 -fa on  ) 2>&1 | tee -a $OUT/${ci}-save-load-state.log
+    (time ./bin/test-save-load-state --model ${model_q4_0} -ngl 10 -c 1024 -fa off --no-op-offload) 2>&1 | tee -a $OUT/${ci}-save-load-state.log
+    (time ./bin/test-save-load-state --model ${model_q4_0} -ngl 10 -c 1024 -fa on  --no-op-offload) 2>&1 | tee -a $OUT/${ci}-save-load-state.log
+    (time ./bin/test-save-load-state --model ${model_q4_0} -ngl 99 -c 1024 -fa off                ) 2>&1 | tee -a $OUT/${ci}-save-load-state.log
+    (time ./bin/test-save-load-state --model ${model_q4_0} -ngl 99 -c 1024 -fa on                 ) 2>&1 | tee -a $OUT/${ci}-save-load-state.log
 
     function check_ppl {
         qnt="$1"
@@ -508,8 +547,8 @@ function gg_run_embd_bge_small {
 
     set -e
 
-    (time cmake -DCMAKE_BUILD_TYPE=Release ${CMAKE_EXTRA} .. ) 2>&1 | tee -a $OUT/${ci}-cmake.log
-    (time make -j$(nproc)                                    ) 2>&1 | tee -a $OUT/${ci}-make.log
+    (cmake -G "${CMAKE_GENERATOR}" -DCMAKE_BUILD_TYPE=Release ${CMAKE_EXTRA} .. ) 2>&1 | tee -a $OUT/${ci}-cmake.log
+    (time cmake --build . --config Release -j$(nproc)) 2>&1 | tee -a $OUT/${ci}-make.log
 
     python3 ../convert_hf_to_gguf.py ${path_models} --outfile ${path_models}/ggml-model-f16.gguf
 
@@ -518,8 +557,10 @@ function gg_run_embd_bge_small {
 
     ./bin/llama-quantize ${model_f16} ${model_q8_0} q8_0
 
-    (time ./bin/llama-embedding --model ${model_f16}  -p "I believe the meaning of life is" -ngl 99 -c 0 ) 2>&1 | tee -a $OUT/${ci}-tg-f16.log
-    (time ./bin/llama-embedding --model ${model_q8_0} -p "I believe the meaning of life is" -ngl 99 -c 0 ) 2>&1 | tee -a $OUT/${ci}-tg-q8_0.log
+    (time ./bin/llama-fit-params --model ${model_f16} 2>&1 | tee -a $OUT/${ci}-fp-f16.log)
+
+    (time ./bin/llama-embedding --model ${model_f16}  -p "I believe the meaning of life is" -ngl 99 -c 0 --no-op-offload) 2>&1 | tee -a $OUT/${ci}-tg-f16.log
+    (time ./bin/llama-embedding --model ${model_q8_0} -p "I believe the meaning of life is" -ngl 99 -c 0 --no-op-offload) 2>&1 | tee -a $OUT/${ci}-tg-q8_0.log
 
     set +e
 }
@@ -551,15 +592,17 @@ function gg_run_rerank_tiny {
 
     set -e
 
-    (time cmake -DCMAKE_BUILD_TYPE=Release ${CMAKE_EXTRA} .. ) 2>&1 | tee -a $OUT/${ci}-cmake.log
-    (time make -j$(nproc)                                    ) 2>&1 | tee -a $OUT/${ci}-make.log
+    (cmake -G "${CMAKE_GENERATOR}" -DCMAKE_BUILD_TYPE=Release ${CMAKE_EXTRA} .. ) 2>&1 | tee -a $OUT/${ci}-cmake.log
+    (time cmake --build . --config Release -j$(nproc)) 2>&1 | tee -a $OUT/${ci}-make.log
 
     python3 ../convert_hf_to_gguf.py ${path_models} --outfile ${path_models}/ggml-model-f16.gguf
 
     model_f16="${path_models}/ggml-model-f16.gguf"
 
+    (time ./bin/llama-fit-params --model ${model_f16} 2>&1 | tee -a $OUT/${ci}-fp-f16.log)
+
     # for this model, the SEP token is "</s>"
-    (time ./bin/llama-embedding --model ${model_f16} -p "what is panda?\thi\nwhat is panda?\tit's a bear\nwhat is panda?\tThe giant panda (Ailuropoda melanoleuca), sometimes called a panda bear or simply panda, is a bear species endemic to China." -ngl 99 -c 0 --pooling rank --embd-normalize -1 --verbose-prompt) 2>&1 | tee -a $OUT/${ci}-rk-f16.log
+    (time ./bin/llama-embedding --model ${model_f16} -p "what is panda?\thi\nwhat is panda?\tit's a bear\nwhat is panda?\tThe giant panda (Ailuropoda melanoleuca), sometimes called a panda bear or simply panda, is a bear species endemic to China." -ngl 99 -c 0 --pooling rank --embd-normalize -1 --no-op-offload --verbose-prompt) 2>&1 | tee -a $OUT/${ci}-rk-f16.log
 
     # sample output
     # rerank score 0:    0.029
@@ -596,12 +639,36 @@ function gg_sum_rerank_tiny {
 }
 
 function gg_check_build_requirements {
+    if ! command -v git &> /dev/null; then
+        gg_printf 'git not found, please install'
+    fi
+
+    if ! command -v git-lfs &> /dev/null; then
+        gg_printf 'git-lfs not found, please install'
+    fi
+
+    if ! command -v wget &> /dev/null; then
+        gg_printf 'wget not found, please install'
+    fi
+
+    if ! command -v python3 &> /dev/null; then
+        gg_printf 'python3 not found, please install'
+    fi
+
+    if ! command -v pip3 &> /dev/null; then
+        gg_printf 'pip3 not found, please install'
+    fi
+
+    if ! python3 -m ensurepip --help &> /dev/null; then
+        gg_printf 'ensurepip not found, please install python3-venv package'
+    fi
+
     if ! command -v cmake &> /dev/null; then
         gg_printf 'cmake not found, please install'
     fi
 
-    if ! command -v make &> /dev/null; then
-        gg_printf 'make not found, please install'
+    if ! command -v ccache &> /dev/null; then
+        gg_printf 'ccache not found, please consider installing for faster builds'
     fi
 
     if ! command -v ctest &> /dev/null; then
@@ -609,10 +676,33 @@ function gg_check_build_requirements {
     fi
 }
 
+function gg_run_test_backend_ops_cpu {
+    cd ${SRC}
+
+    cd build-ci-release
+
+    set -e
+
+    (time ./bin/test-backend-ops -b CPU ) 2>&1 | tee -a $OUT/${ci}-test-backend-ops-cpu.log
+
+    set +e
+}
+
+function gg_sum_test_backend_ops_cpu {
+    gg_printf '### %s\n\n' "${ci}"
+
+    gg_printf 'Runs test-backend-ops for CPU backend\n'
+    gg_printf '- status: %s\n' "$(cat $OUT/${ci}.exit)"
+    gg_printf '```\n'
+    gg_printf '%s\n' "$(cat $OUT/${ci}-test-backend-ops-cpu.log)"
+    gg_printf '```\n'
+    gg_printf '\n'
+}
+
 ## main
 
-export LLAMA_LOG_PREFIX=1
-export LLAMA_LOG_TIMESTAMPS=1
+export LLAMA_ARG_LOG_PREFIX=1
+export LLAMA_ARG_LOG_TIMESTAMPS=1
 
 if [ -z ${GG_BUILD_LOW_PERF} ]; then
     # Create symlink: ./llama.cpp/models-mnt -> $MNT/models
@@ -636,6 +726,10 @@ ret=0
 
 test $ret -eq 0 && gg_run ctest_debug
 test $ret -eq 0 && gg_run ctest_release
+
+if [ ! -z ${GG_BUILD_HIGH_PERF} ]; then
+    test $ret -eq 0 && gg_run test_backend_ops_cpu
+fi
 
 if [ -z ${GG_BUILD_LOW_PERF} ]; then
     test $ret -eq 0 && gg_run embd_bge_small

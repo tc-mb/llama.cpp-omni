@@ -2,6 +2,9 @@
 #include <cstdint>
 #include <utility>
 
+template<typename T, size_t>
+using type_for_index = T;
+
 static __device__ __forceinline__ float op_repeat(const float a, const float b) {
     return b;
     GGML_UNUSED(a);
@@ -39,16 +42,20 @@ static __global__ void k_bin_bcast(const src0_t *         src0,
                                    const uint3            ne11,
                                    const uint3            ne12,
                                    const uint3            ne13,
-                                   /*int s0, */ const int s1,
+                                 /*const int              s0,*/
+                                   const int              s1,
                                    const int              s2,
                                    const int              s3,
-                                   /*int s00,*/ const int s01,
+                                   const int              s00,
+                                   const int              s01,
                                    const int              s02,
                                    const int              s03,
-                                   /*int s10,*/ const int s11,
+                                   const int              s10,
+                                   const int              s11,
                                    const int              s12,
                                    const int              s13,
                                    src1_ptrs... src1s) {
+    ggml_cuda_pdl_lc();
     const uint32_t i0s = blockDim.x * blockIdx.x + threadIdx.x;
     const uint32_t i1  = (blockDim.y * blockIdx.y + threadIdx.y);
     const uint32_t i2  = fastdiv((blockDim.z * blockIdx.z + threadIdx.z), ne3);
@@ -69,14 +76,15 @@ static __global__ void k_bin_bcast(const src0_t *         src0,
     const src0_t * src0_row = src0 ? (src0 + i_src0) : nullptr;
     dst_t * dst_row = dst + i_dst;
 
+    ggml_cuda_pdl_sync();
     for (int i0 = i0s; i0 < ne0; i0 += blockDim.x * gridDim.x) {
         const uint32_t i10 = fastmodulo(i0, ne10);
 
-        float result = src0_row ? (float) src0_row[i0] : 0.0f;
+        float result = src0_row ? (float) src0_row[i0*s00] : 0.0f;
         if constexpr (sizeof...(src1_ptrs) > 0) {
-            result = (..., (result = bin_op(result, (float)src1s[i_src1 + i10])));
+            result = (..., (result = bin_op(result, (float)src1s[i_src1 + i10*s10])));
         } else {
-            result = bin_op(result, (float)src1[i_src1 + i10]);
+            result = bin_op(result, (float)src1[i_src1 + i10*s10]);
         }
 
         dst_row[i0] = (dst_t) result;
@@ -101,13 +109,16 @@ static __global__ void k_bin_bcast_unravel(const src0_t *         src0,
                                            const uint3            ne11,
                                            const uint3            ne12,
                                            const uint3            ne13,
-                                           /*int s0, */ const int s1,
+                                         /*const int              s0,*/
+                                           const int              s1,
                                            const int              s2,
                                            const int              s3,
-                                           /*int s00,*/ const int s01,
+                                           const int              s00,
+                                           const int              s01,
                                            const int              s02,
                                            const int              s03,
-                                           /*int s10,*/ const int s11,
+                                           const int              s10,
+                                           const int              s11,
                                            const int              s12,
                                            const int              s13,
                                            src1_ptrs... src1s) {
@@ -135,11 +146,12 @@ static __global__ void k_bin_bcast_unravel(const src0_t *         src0,
 
     const int i10 = fastmodulo(i0, ne10);
 
-    float result = src0_row ? (float) src0_row[i0] : 0.0f;
+    ggml_cuda_pdl_sync();
+    float result = src0_row ? (float) src0_row[i0*s00] : 0.0f;
     if constexpr (sizeof...(src1_ptrs) > 0) {
-        result = (..., (result = bin_op(result, (float)src1s[i_src1 + i10])));
+        result = (..., (result = bin_op(result, (float)src1s[i_src1 + i10*s10])));
     } else {
-        result = bin_op(result, (float)src1[i_src1 + i10]);
+        result = bin_op(result, (float)src1[i_src1 + i10*s10]);
     }
 
     dst_row[i0] = (dst_t) result;
@@ -179,7 +191,7 @@ static void launch_bin_bcast_pack(const ggml_tensor * src0, const ggml_tensor * 
         cnb[3] *= cne[3];
     };
 
-    if (ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)) {
+    if (ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && !ggml_is_permuted(src0) && !ggml_is_permuted(src1)) {
         for (int i = 0; i < 4; i++) {
             if (nr[i] != 1) {
                 break;
@@ -221,7 +233,7 @@ static void launch_bin_bcast_pack(const ggml_tensor * src0, const ggml_tensor * 
         size_t nb12 = cnb1[2];
         size_t nb13 = cnb1[3];
 
-        size_t s0 = nb0 / sizeof(dst_t);
+      //size_t s0 = nb0 / sizeof(dst_t);
         size_t s1 = nb1 / sizeof(dst_t);
         size_t s2 = nb2 / sizeof(dst_t);
         size_t s3 = nb3 / sizeof(dst_t);
@@ -251,10 +263,6 @@ static void launch_bin_bcast_pack(const ggml_tensor * src0, const ggml_tensor * 
         GGML_ASSERT(nb12 % sizeof(src1_t) == 0);
         GGML_ASSERT(nb13 % sizeof(src1_t) == 0);
 
-        GGML_ASSERT(s0 == 1);
-        GGML_ASSERT(s00 == 1);
-        GGML_ASSERT(s10 == 1);
-
         const int block_size = 128;
 
         int64_t hne0 = std::max(ne0 / 2LL, 1LL);
@@ -272,7 +280,7 @@ static void launch_bin_bcast_pack(const ggml_tensor * src0, const ggml_tensor * 
         const uint3 ne12 = init_fastdiv_values((uint32_t) cne1[2]);
         const uint3 ne13 = init_fastdiv_values((uint32_t) cne1[3]);
 
-        if (block_nums.z > 65535) {
+        if (block_nums.z > 65535 || block_nums.y > 65535) {
             int         block_num  = (ne0 * ne1 * ne2 * ne3 + block_size - 1) / block_size;
             const uint3 prod_012    = init_fastdiv_values((uint32_t) (ne0 * ne1 * ne2));
             const uint3 prod_01     = init_fastdiv_values((uint32_t) (ne0 * ne1));
@@ -280,35 +288,24 @@ static void launch_bin_bcast_pack(const ggml_tensor * src0, const ggml_tensor * 
             const uint3 ne1_fastdiv = init_fastdiv_values((uint32_t) ne1);
             const uint3 ne2_fastdiv = init_fastdiv_values((uint32_t) ne2);
 
-            if constexpr (sizeof...(I) > 0) {
-                k_bin_bcast_unravel<bin_op, src0_t, src1_t, dst_t><<<block_num, block_size, 0, stream>>>(
+            {
+                const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)block_num, block_size, 0, stream);
+                ggml_cuda_kernel_launch(k_bin_bcast_unravel<bin_op, src0_t, src1_t, dst_t, type_for_index<const src1_t *, I>...>, launch_params,
                     src0_dd, src1_dd, dst_dd, ne0_fastdiv, ne1_fastdiv, ne2_fastdiv, ne3, prod_012, prod_01, ne10, ne11,
                     ne12, ne13,
-                    /* s0, */ s1, s2, s3,
-                    /* s00,*/ s01, s02, s03,
-                    /* s10,*/ s11, s12, s13, (const src1_t *) dst->src[I + 1]->data...);
-            } else {
-                k_bin_bcast_unravel<bin_op, src0_t, src1_t, dst_t>
-                    <<<block_num, block_size, 0, stream>>>(src0_dd, src1_dd, dst_dd, ne0_fastdiv, ne1_fastdiv,
-                                                           ne2_fastdiv, ne3, prod_012, prod_01, ne10, ne11, ne12, ne13,
-                                                           /* s0, */ s1, s2, s3,
-                                                           /* s00,*/ s01, s02, s03,
-                                                           /* s10,*/ s11, s12, s13);
+                  /*s0,*/ s1,  s2,  s3,
+                    s00, s01, s02, s03,
+                    s10, s11, s12, s13, (const src1_t *) dst->src[I + 1]->data...);
             }
         } else {
             const uint3 ne3_fastdiv = init_fastdiv_values((uint32_t) ne3);
-            if constexpr (sizeof...(I) > 0) {
-                k_bin_bcast<bin_op, src0_t, src1_t, dst_t><<<block_nums, block_dims, 0, stream>>>(
+            {
+                const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
+                ggml_cuda_kernel_launch(k_bin_bcast<bin_op, src0_t, src1_t, dst_t, type_for_index<const src1_t *, I>...>, launch_params,
                     src0_dd, src1_dd, dst_dd, ne0, ne1, ne2, ne3_fastdiv, ne10, ne11, ne12, ne13,
-                    /* s0, */ s1, s2, s3,
-                    /* s00,*/ s01, s02, s03,
-                    /* s10,*/ s11, s12, s13, (const src1_t *) dst->src[I + 1]->data...);
-            } else {
-                k_bin_bcast<bin_op, src0_t, src1_t, dst_t><<<block_nums, block_dims, 0, stream>>>(
-                    src0_dd, src1_dd, dst_dd, ne0, ne1, ne2, ne3_fastdiv, ne10, ne11, ne12, ne13,
-                    /* s0, */ s1, s2, s3,
-                    /* s00,*/ s01, s02, s03,
-                    /* s10,*/ s11, s12, s13);
+                  /*s0,*/ s1, s2,  s3,
+                    s00, s01, s02, s03,
+                    s10, s11, s12, s13, (const src1_t *) dst->src[I + 1]->data...);
             }
         }
     }
@@ -331,6 +328,7 @@ static __global__ void k_repeat_back(
     }
 
     T sum = 0;
+    ggml_cuda_pdl_sync();
     for (int64_t i3 = tid3; i3 < ne03; i3 += ne3) {
         for (int64_t i2 = tid2; i2 < ne02; i2 += ne2) {
             for (int64_t i1 = tid1; i1 < ne01; i1 += ne1) {
@@ -464,6 +462,36 @@ void ggml_cuda_op_fused_add(ggml_backend_cuda_context & ctx, ggml_tensor * dst, 
             break;
         case 8:
             ggml_cuda_op_fused_binbcast_impl<op_add, 8>(ctx, dst);
+            break;
+        default:
+            GGML_ASSERT(false && "Unsupported n_fuse value");
+    }
+}
+
+void ggml_cuda_op_fused_mul(ggml_backend_cuda_context & ctx, ggml_tensor * dst, int n_fuse) {
+    GGML_ASSERT(2 <= n_fuse && n_fuse <= 8);
+
+    switch (n_fuse) {
+        case 2:
+            ggml_cuda_op_fused_binbcast_impl<op_mul, 2>(ctx, dst);
+            break;
+        case 3:
+            ggml_cuda_op_fused_binbcast_impl<op_mul, 3>(ctx, dst);
+            break;
+        case 4:
+            ggml_cuda_op_fused_binbcast_impl<op_mul, 4>(ctx, dst);
+            break;
+        case 5:
+            ggml_cuda_op_fused_binbcast_impl<op_mul, 5>(ctx, dst);
+            break;
+        case 6:
+            ggml_cuda_op_fused_binbcast_impl<op_mul, 6>(ctx, dst);
+            break;
+        case 7:
+            ggml_cuda_op_fused_binbcast_impl<op_mul, 7>(ctx, dst);
+            break;
+        case 8:
+            ggml_cuda_op_fused_binbcast_impl<op_mul, 8>(ctx, dst);
             break;
         default:
             GGML_ASSERT(false && "Unsupported n_fuse value");

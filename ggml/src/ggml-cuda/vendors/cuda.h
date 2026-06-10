@@ -6,9 +6,18 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
-#if CUDART_VERSION >= 12050
+#ifdef GGML_USE_NCCL
+#include <nccl.h>
+#endif // GGML_USE_NCCL
+
+#if CUDART_VERSION >= 11080
 #include <cuda_fp8.h>
-#endif // CUDART_VERSION >= 12050
+#define FP8_AVAILABLE
+#endif // CUDART_VERSION >= 11080
+
+#if CUDART_VERSION >= 12080
+#include <cuda_fp4.h>
+#endif // CUDART_VERSION >= 12080
 
 #if CUDART_VERSION < 11020
 #define CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED CU_DEVICE_ATTRIBUTE_VIRTUAL_ADDRESS_MANAGEMENT_SUPPORTED

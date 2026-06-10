@@ -268,6 +268,7 @@ struct audition_ctx {
     }
 
     ~audition_ctx() {
+        audition_whisper_free_kv_cache(this);
         ggml_backend_free(backend);
         if (backend != backend_cpu) {
             ggml_backend_free(backend_cpu);

@@ -41,7 +41,8 @@ def test_chat_completion(model, system_prompt, user_prompt, max_tokens, re_conte
     assert res.status_code == 200
     assert "cmpl" in res.body["id"] # make sure the completion id has the expected format
     assert res.body["system_fingerprint"].startswith("b")
-    assert res.body["model"] == model if model is not None else server.model_alias
+    # we no longer reflect back the model name, see https://github.com/ggml-org/llama.cpp/pull/17668
+    # assert res.body["model"] == model if model is not None else server.model_alias
     assert res.body["usage"]["prompt_tokens"] == n_prompt
     assert res.body["usage"]["completion_tokens"] == n_predicted
     choice = res.body["choices"][0]
@@ -49,6 +50,27 @@ def test_chat_completion(model, system_prompt, user_prompt, max_tokens, re_conte
     assert match_regex(re_content, choice["message"]["content"]), f'Expected {re_content}, got {choice["message"]["content"]}'
     assert choice["finish_reason"] == finish_reason
 
+
+def test_chat_completion_cached_tokens():
+    global server
+    server.n_slots = 1
+    server.start()
+    seq = [
+        ("1 2 3 4 5 6", 77, 0),
+        ("1 2 3 4 5 6", 77, 76),
+        ("1 2 3 4 5 9", 77, 51),
+        ("1 2 3 9 9 9", 77, 47),
+    ]
+    for user_prompt, n_prompt, n_cache in seq:
+        res = server.make_request("POST", "/chat/completions", data={
+            "max_tokens": 8,
+            "messages": [
+                {"role": "system", "content": "Test"},
+                {"role": "user", "content": user_prompt},
+            ],
+        })
+        assert res.body["usage"]["prompt_tokens"] == n_prompt
+        assert res.body["usage"]["prompt_tokens_details"]["cached_tokens"] == n_cache
 
 @pytest.mark.parametrize(
     "system_prompt,user_prompt,max_tokens,re_content,n_prompt,n_predicted,finish_reason",
@@ -59,7 +81,7 @@ def test_chat_completion(model, system_prompt, user_prompt, max_tokens, re_conte
 )
 def test_chat_completion_stream(system_prompt, user_prompt, max_tokens, re_content, n_prompt, n_predicted, finish_reason):
     global server
-    server.model_alias = None # try using DEFAULT_OAICOMPAT_MODEL
+    server.model_alias = "llama-test-model"
     server.start()
     res = server.make_stream_request("POST", "/chat/completions", data={
         "max_tokens": max_tokens,
@@ -81,7 +103,7 @@ def test_chat_completion_stream(system_prompt, user_prompt, max_tokens, re_conte
             else:
                 assert "role" not in choice["delta"]
             assert data["system_fingerprint"].startswith("b")
-            assert "gpt-3.5" in data["model"] # DEFAULT_OAICOMPAT_MODEL, maybe changed in the future
+            assert data["model"] == "llama-test-model"
             if last_cmpl_id is None:
                 last_cmpl_id = data["id"]
             assert last_cmpl_id == data["id"] # make sure the completion id is the same for all events in the stream
@@ -136,11 +158,12 @@ def test_chat_template():
 
 @pytest.mark.parametrize("prefill,re_prefill", [
     ("Whill", "Whill"),
-    ([{"type": "text", "text": "Wh"}, {"type": "text", "text": "ill"}], "Whill"),
+    ([{"type": "text", "text": "Wh"}, {"type": "text", "text": "ill"}], "Wh\n\nill"),
 ])
 def test_chat_template_assistant_prefill(prefill, re_prefill):
     global server
-    server.chat_template = "llama3"
+    server.jinja = True
+    server.chat_template_file = "../../../models/templates/meta-llama-Llama-3.1-8B-Instruct.jinja"
     server.debug = True  # to get the "__verbose" object in the response
     server.start()
     res = server.make_request("POST", "/chat/completions", data={
@@ -153,7 +176,47 @@ def test_chat_template_assistant_prefill(prefill, re_prefill):
     })
     assert res.status_code == 200
     assert "__verbose" in res.body
-    assert res.body["__verbose"]["prompt"] == f"<s> <|start_header_id|>system<|end_header_id|>\n\nBook<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nWhat is the best book<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n{re_prefill}"
+    assert res.body["__verbose"]["prompt"].endswith(f"<|start_header_id|>user<|end_header_id|>\n\nWhat is the best book<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n{re_prefill}")
+
+
+def test_chat_template_continue_final_message_vllm_compat():
+    """continue_final_message is the vLLM/transformers explicit alias for the prefill_assistant heuristic.
+    Both must produce the same prompt."""
+    global server
+    server.jinja = True
+    server.chat_template_file = "../../../models/templates/meta-llama-Llama-3.1-8B-Instruct.jinja"
+    server.debug = True
+    server.start()
+    res = server.make_request("POST", "/chat/completions", data={
+        "max_tokens": 8,
+        "add_generation_prompt": False,
+        "continue_final_message": True,
+        "messages": [
+            {"role": "system", "content": "Book"},
+            {"role": "user", "content": "What is the best book"},
+            {"role": "assistant", "content": "Whill"},
+        ]
+    })
+    assert res.status_code == 200
+    assert "__verbose" in res.body
+    assert res.body["__verbose"]["prompt"].endswith("<|start_header_id|>user<|end_header_id|>\n\nWhat is the best book<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\nWhill")
+
+
+def test_chat_template_continue_final_message_mutual_exclusion():
+    """add_generation_prompt and continue_final_message both set to true must be rejected"""
+    global server
+    server.chat_template = "llama3"
+    server.start()
+    res = server.make_request("POST", "/chat/completions", data={
+        "max_tokens": 8,
+        "add_generation_prompt": True,
+        "continue_final_message": True,
+        "messages": [
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "Hello"},
+        ]
+    })
+    assert res.status_code == 400
 
 
 def test_apply_chat_template():
@@ -198,7 +261,7 @@ def test_completion_with_response_format(response_format: dict, n_predicted: int
         choice = res.body["choices"][0]
         assert match_regex(re_content, choice["message"]["content"])
     else:
-        assert res.status_code != 200
+        assert res.status_code == 400
         assert "error" in res.body
 
 
@@ -209,6 +272,7 @@ def test_completion_with_response_format(response_format: dict, n_predicted: int
 def test_completion_with_json_schema(jinja: bool, json_schema: dict, n_predicted: int, re_content: str):
     global server
     server.jinja = jinja
+    server.debug = True
     server.start()
     res = server.make_request("POST", "/chat/completions", data={
         "max_tokens": n_predicted,
@@ -433,21 +497,21 @@ def test_context_size_exceeded_stream():
 @pytest.mark.parametrize(
     "n_batch,batch_count,reuse_cache",
     [
-        (64, 15, False),
-        (64, 1, True),
+        (64, 4, False),
+        (64, 2, True),
     ]
 )
-def test_return_progresssss(n_batch, batch_count, reuse_cache):
+def test_return_progress(n_batch, batch_count, reuse_cache):
     global server
     server.n_batch = n_batch
-    server.n_ctx = 2048
+    server.n_ctx = 256
     server.n_slots = 1
     server.start()
     def make_cmpl_request():
         return server.make_stream_request("POST", "/chat/completions", data={
             "max_tokens": 10,
             "messages": [
-                {"role": "user", "content": "This is a test" * 100},
+                {"role": "user", "content": "This is a test" * 10},
             ],
             "stream": True,
             "return_progress": True,
@@ -461,10 +525,18 @@ def test_return_progresssss(n_batch, batch_count, reuse_cache):
     res = make_cmpl_request()
     last_progress = None
     total_batch_count = 0
+
     for data in res:
         cur_progress = data.get("prompt_progress", None)
         if cur_progress is None:
             continue
+        if total_batch_count == 0:
+            # first progress report must have n_cache == n_processed
+            assert cur_progress["total"] > 0
+            assert cur_progress["cache"] == cur_progress["processed"]
+            if reuse_cache:
+                # when reusing cache, we expect some cached tokens
+                assert cur_progress["cache"] > 0
         if last_progress is not None:
             assert cur_progress["total"] == last_progress["total"]
             assert cur_progress["cache"] == last_progress["cache"]
@@ -472,7 +544,32 @@ def test_return_progresssss(n_batch, batch_count, reuse_cache):
         total_batch_count += 1
         last_progress = cur_progress
 
+    # last progress should indicate completion (all tokens processed)
     assert last_progress is not None
     assert last_progress["total"] > 0
     assert last_progress["processed"] == last_progress["total"]
     assert total_batch_count == batch_count
+
+
+def test_chat_completions_multiple_choices():
+    global server
+    server.start()
+    # make sure cache can be reused across multiple choices and multiple requests
+    # ref: https://github.com/ggml-org/llama.cpp/pull/18663
+    for _ in range(2):
+        res = server.make_request("POST", "/chat/completions", data={
+            "max_tokens": 8,
+            "n": 2,
+            "messages": [
+                {"role": "system", "content": "Book"},
+                {"role": "user", "content": "What is the best book"},
+            ],
+            # test forcing the same slot to be used
+            # the scheduler should not be locked up in this case
+            "id_slot": 0,
+        })
+        assert res.status_code == 200
+        assert len(res.body["choices"]) == 2
+        for choice in res.body["choices"]:
+            assert "assistant" == choice["message"]["role"]
+            assert choice["finish_reason"] == "length"

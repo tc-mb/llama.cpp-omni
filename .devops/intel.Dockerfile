@@ -1,12 +1,22 @@
-ARG ONEAPI_VERSION=2025.2.2-0-devel-ubuntu24.04
+ARG ONEAPI_VERSION=2025.3.3-0-devel-ubuntu24.04
+ARG BUILD_DATE=N/A
+ARG APP_VERSION=N/A
+ARG APP_REVISION=N/A
 
 ## Build Image
 
 FROM intel/deep-learning-essentials:$ONEAPI_VERSION AS build
 
 ARG GGML_SYCL_F16=OFF
+ARG LEVEL_ZERO_VERSION=1.28.2
+ARG LEVEL_ZERO_UBUNTU_VERSION=u24.04
 RUN apt-get update && \
-    apt-get install -y git libcurl4-openssl-dev
+    apt-get install -y git libssl-dev wget ca-certificates && \
+    cd /tmp && \
+    wget -q "https://github.com/oneapi-src/level-zero/releases/download/v${LEVEL_ZERO_VERSION}/level-zero_${LEVEL_ZERO_VERSION}%2B${LEVEL_ZERO_UBUNTU_VERSION}_amd64.deb" -O level-zero.deb && \
+    wget -q "https://github.com/oneapi-src/level-zero/releases/download/v${LEVEL_ZERO_VERSION}/level-zero-devel_${LEVEL_ZERO_VERSION}%2B${LEVEL_ZERO_UBUNTU_VERSION}_amd64.deb" -O level-zero-devel.deb && \
+    apt-get -o Dpkg::Options::="--force-overwrite" install -y ./level-zero.deb ./level-zero-devel.deb && \
+    rm -f /tmp/level-zero.deb /tmp/level-zero-devel.deb
 
 WORKDIR /app
 
@@ -21,11 +31,12 @@ RUN if [ "${GGML_SYCL_F16}" = "ON" ]; then \
     cmake --build build --config Release -j$(nproc)
 
 RUN mkdir -p /app/lib && \
-    find build -name "*.so" -exec cp {} /app/lib \;
+    find build -name "*.so*" -exec cp -P {} /app/lib \;
 
 RUN mkdir -p /app/full \
     && cp build/bin/* /app/full \
     && cp *.py /app/full \
+    && cp -r conversion /app/full \
     && cp -r gguf-py /app/full \
     && cp -r requirements /app/full \
     && cp requirements.txt /app/full \
@@ -33,8 +44,38 @@ RUN mkdir -p /app/full \
 
 FROM intel/deep-learning-essentials:$ONEAPI_VERSION AS base
 
+ARG BUILD_DATE=N/A
+ARG APP_VERSION=N/A
+ARG APP_REVISION=N/A
+ARG IMAGE_URL=https://github.com/ggml-org/llama.cpp
+ARG IMAGE_SOURCE=https://github.com/ggml-org/llama.cpp
+LABEL org.opencontainers.image.created=$BUILD_DATE \
+      org.opencontainers.image.version=$APP_VERSION \
+      org.opencontainers.image.revision=$APP_REVISION \
+      org.opencontainers.image.title="llama.cpp" \
+      org.opencontainers.image.description="LLM inference in C/C++" \
+      org.opencontainers.image.url=$IMAGE_URL \
+      org.opencontainers.image.source=$IMAGE_SOURCE
+
+ARG IGC_VERSION=v2.20.5
+ARG IGC_VERSION_FULL=2_2.20.5+19972
+ARG COMPUTE_RUNTIME_VERSION=25.40.35563.10
+ARG COMPUTE_RUNTIME_VERSION_FULL=25.40.35563.10-0
+ARG IGDGMM_VERSION=22.8.2
+RUN mkdir /tmp/neo/ && cd /tmp/neo/ \
+  && wget https://github.com/intel/intel-graphics-compiler/releases/download/$IGC_VERSION/intel-igc-core-${IGC_VERSION_FULL}_amd64.deb \
+  && wget https://github.com/intel/intel-graphics-compiler/releases/download/$IGC_VERSION/intel-igc-opencl-${IGC_VERSION_FULL}_amd64.deb \
+  && wget https://github.com/intel/compute-runtime/releases/download/$COMPUTE_RUNTIME_VERSION/intel-ocloc-dbgsym_${COMPUTE_RUNTIME_VERSION_FULL}_amd64.ddeb \
+  && wget https://github.com/intel/compute-runtime/releases/download/$COMPUTE_RUNTIME_VERSION/intel-ocloc_${COMPUTE_RUNTIME_VERSION_FULL}_amd64.deb \
+  && wget https://github.com/intel/compute-runtime/releases/download/$COMPUTE_RUNTIME_VERSION/intel-opencl-icd-dbgsym_${COMPUTE_RUNTIME_VERSION_FULL}_amd64.ddeb \
+  && wget https://github.com/intel/compute-runtime/releases/download/$COMPUTE_RUNTIME_VERSION/intel-opencl-icd_${COMPUTE_RUNTIME_VERSION_FULL}_amd64.deb \
+  && wget https://github.com/intel/compute-runtime/releases/download/$COMPUTE_RUNTIME_VERSION/libigdgmm12_${IGDGMM_VERSION}_amd64.deb \
+  && wget https://github.com/intel/compute-runtime/releases/download/$COMPUTE_RUNTIME_VERSION/libze-intel-gpu1-dbgsym_${COMPUTE_RUNTIME_VERSION_FULL}_amd64.ddeb \
+  && wget https://github.com/intel/compute-runtime/releases/download/$COMPUTE_RUNTIME_VERSION/libze-intel-gpu1_${COMPUTE_RUNTIME_VERSION_FULL}_amd64.deb \
+  && dpkg --install *.deb
+
 RUN apt-get update \
-    && apt-get install -y libgomp1 curl\
+    && apt-get install -y libgomp1 curl \
     && apt autoremove -y \
     && apt clean -y \
     && rm -rf /tmp/* /var/tmp/* \
@@ -73,7 +114,7 @@ ENTRYPOINT ["/app/tools.sh"]
 FROM base AS light
 
 COPY --from=build /app/lib/ /app
-COPY --from=build /app/full/llama-cli /app
+COPY --from=build /app/full/llama-cli /app/full/llama-completion /app
 
 WORKDIR /app
 
@@ -92,4 +133,3 @@ WORKDIR /app
 HEALTHCHECK CMD [ "curl", "-f", "http://localhost:8080/health" ]
 
 ENTRYPOINT [ "/app/llama-server" ]
-

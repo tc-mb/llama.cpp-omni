@@ -1,11 +1,14 @@
-cmake_minimum_required(VERSION 3.14) # for add_link_options and implicit target directories.
+cmake_minimum_required(VERSION 3.14...3.28) # for add_link_options and implicit target directories.
+
 project("ggml" C CXX ASM)
 
 ### GGML Version
 set(GGML_VERSION_MAJOR 0)
-set(GGML_VERSION_MINOR 9)
-set(GGML_VERSION_PATCH 4)
+set(GGML_VERSION_MINOR 13)
+set(GGML_VERSION_PATCH 1)
 set(GGML_VERSION_BASE "${GGML_VERSION_MAJOR}.${GGML_VERSION_MINOR}.${GGML_VERSION_PATCH}")
+
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/")
 
 find_program(GIT_EXE NAMES git git.exe NO_CMAKE_FIND_ROOT_PATH)
 if(GIT_EXE)
@@ -25,14 +28,15 @@ if(GIT_EXE)
     )
 endif()
 
-# Build the version string with optional dirty flag
 set(GGML_VERSION "${GGML_VERSION_BASE}")
-if(GGML_GIT_DIRTY AND NOT GGML_GIT_DIRTY EQUAL 0)
-    set(GGML_VERSION "${GGML_VERSION}-dirty")
-endif()
 
 if(NOT GGML_BUILD_COMMIT)
     set(GGML_BUILD_COMMIT "unknown")
+endif()
+
+# Build the commit string with optional dirty flag
+if(DEFINED GGML_GIT_DIRTY AND GGML_GIT_DIRTY EQUAL 1)
+    set(GGML_BUILD_COMMIT "${GGML_BUILD_COMMIT}-dirty")
 endif()
 
 include(CheckIncludeFileCXX)
@@ -53,6 +57,10 @@ if (CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     # TODO
 else()
     set(GGML_STANDALONE OFF)
+
+    if (NOT CMAKE_RUNTIME_OUTPUT_DIRECTORY)
+        set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    endif()
 endif()
 
 if (EMSCRIPTEN)
@@ -161,27 +169,25 @@ if (NOT MSVC)
     option(GGML_AMX_INT8     "ggml: enable AMX-INT8"         OFF)
     option(GGML_AMX_BF16     "ggml: enable AMX-BF16"         OFF)
 endif()
-option(GGML_LASX             "ggml: enable lasx"             ON)
-option(GGML_LSX              "ggml: enable lsx"              ON)
-option(GGML_RVV              "ggml: enable rvv"              ON)
-option(GGML_RV_ZFH           "ggml: enable riscv zfh"        ON)
-option(GGML_RV_ZVFH          "ggml: enable riscv zvfh"       ON)
-option(GGML_RV_ZICBOP        "ggml: enable riscv zicbop"     ON)
-option(GGML_XTHEADVECTOR     "ggml: enable xtheadvector"     OFF)
-option(GGML_VXE              "ggml: enable vxe"              ON)
+option(GGML_LASX             "ggml: enable lasx"              ON)
+option(GGML_LSX              "ggml: enable lsx"               ON)
+option(GGML_RVV              "ggml: enable rvv"               ON)
+option(GGML_RV_ZFH           "ggml: enable riscv zfh"         ON)
+option(GGML_RV_ZVFH          "ggml: enable riscv zvfh"        ON)
+option(GGML_RV_ZICBOP        "ggml: enable riscv zicbop"      ON)
+option(GGML_RV_ZIHINTPAUSE   "ggml: enable riscv zihintpause" ON)
+option(GGML_RV_ZVFBFWMA      "ggml: enable riscv zvfbfwma"    OFF)
+option(GGML_XTHEADVECTOR     "ggml: enable xtheadvector"      OFF)
+option(GGML_VXE              "ggml: enable vxe"               ${GGML_NATIVE})
 
 option(GGML_CPU_ALL_VARIANTS "ggml: build all variants of the CPU backend (requires GGML_BACKEND_DL)" OFF)
 set(GGML_CPU_ARM_ARCH        "" CACHE STRING "ggml: CPU architecture for ARM")
 set(GGML_CPU_POWERPC_CPUTYPE "" CACHE STRING "ggml: CPU type for PowerPC")
 
-
-if (MINGW)
-    set(GGML_WIN_VER "0xA00" CACHE STRING   "ggml: Windows version")
-endif()
-
 # ggml core
 set(GGML_SCHED_MAX_COPIES  "4" CACHE STRING "ggml: max input copies for pipeline parallelism")
 option(GGML_CPU                             "ggml: enable CPU backend"                        ON)
+option(GGML_SCHED_NO_REALLOC                "ggml: disallow reallocations in ggml-alloc (for debugging)" OFF)
 
 # 3rd party libs / backends
 option(GGML_ACCELERATE                      "ggml: enable Accelerate framework"               ON)
@@ -201,12 +207,14 @@ option(GGML_CUDA_NO_VMM                     "ggml: do not try to use CUDA VMM"  
 option(GGML_CUDA_FA                         "ggml: compile ggml FlashAttention CUDA kernels"  ON)
 option(GGML_CUDA_FA_ALL_QUANTS              "ggml: compile all quants for FlashAttention"     OFF)
 option(GGML_CUDA_GRAPHS                     "ggml: use CUDA graphs (llama.cpp only)"          ${GGML_CUDA_GRAPHS_DEFAULT})
+option(GGML_CUDA_NCCL                       "ggml: use NVIDIA Collective Comm. Library"       ON)
 set   (GGML_CUDA_COMPRESSION_MODE "size" CACHE STRING
                                             "ggml: cuda link binary compression mode; requires cuda 12.8+")
 set_property(CACHE GGML_CUDA_COMPRESSION_MODE PROPERTY STRINGS "none;speed;balance;size")
 
 option(GGML_HIP                             "ggml: use HIP"                                   OFF)
-option(GGML_HIP_GRAPHS                      "ggml: use HIP graph, experimental, slow"         OFF)
+option(GGML_HIP_GRAPHS                      "ggml: use HIP graph"                              ON)
+option(GGML_HIP_RCCL                        "ggml: use ROCm Collective Comm. Library"         OFF)
 option(GGML_HIP_NO_VMM                      "ggml: do not try to use HIP VMM"                 ON)
 option(GGML_HIP_ROCWMMA_FATTN               "ggml: enable rocWMMA for FlashAttention"         OFF)
 option(GGML_HIP_MMQ_MFMA                    "ggml: enable MFMA MMA for CDNA in MMQ"           ON)
@@ -224,8 +232,10 @@ option(GGML_WEBGPU                          "ggml: use WebGPU"                  
 option(GGML_WEBGPU_DEBUG                    "ggml: enable WebGPU debug output"                OFF)
 option(GGML_WEBGPU_CPU_PROFILE              "ggml: enable WebGPU profiling (CPU)"             OFF)
 option(GGML_WEBGPU_GPU_PROFILE              "ggml: enable WebGPU profiling (GPU)"             OFF)
-
+option(GGML_WEBGPU_JSPI                     "ggml: use JSPI for WebGPU"                       ON)
 option(GGML_ZDNN                            "ggml: use zDNN"                                  OFF)
+option(GGML_VIRTGPU                         "ggml: use the VirtGPU/Virglrenderer API Remoting frontend"     OFF)
+option(GGML_VIRTGPU_BACKEND                 "ggml: build the VirtGPU/Virglrenderer API Remoting backend"    OFF)
 option(GGML_METAL                           "ggml: use Metal"                                 ${GGML_METAL_DEFAULT})
 option(GGML_METAL_NDEBUG                    "ggml: disable Metal debugging"                   OFF)
 option(GGML_METAL_SHADER_DEBUG              "ggml: compile Metal with -fno-fast-math"         OFF)
@@ -238,21 +248,31 @@ option(GGML_RPC                             "ggml: use RPC"                     
 option(GGML_SYCL                            "ggml: use SYCL"                                  OFF)
 option(GGML_SYCL_F16                        "ggml: use 16 bit floats for sycl calculations"   OFF)
 option(GGML_SYCL_GRAPH                      "ggml: enable graphs in the SYCL backend"         ON)
+option(GGML_SYCL_HOST_MEM_FALLBACK          "ggml: allow host memory fallback in SYCL reorder (requires kernel 6.8+)" ON)
+option(GGML_SYCL_SUPPORT_LEVEL_ZERO         "ggml: use Level Zero API in SYCL backend"  ON)
 option(GGML_SYCL_DNN                        "ggml: enable oneDNN in the SYCL backend"         ON)
 set   (GGML_SYCL_TARGET "INTEL" CACHE STRING
                                             "ggml: sycl target device")
 set   (GGML_SYCL_DEVICE_ARCH "" CACHE STRING
                                             "ggml: sycl device architecture")
 
+option(GGML_OPENVINO                        "ggml: use OPENVINO"                              OFF)
+
 option(GGML_OPENCL                          "ggml: use OpenCL"                                OFF)
 option(GGML_OPENCL_PROFILING                "ggml: use OpenCL profiling (increases overhead)" OFF)
 option(GGML_OPENCL_EMBED_KERNELS            "ggml: embed kernels"                             ON)
 option(GGML_OPENCL_USE_ADRENO_KERNELS       "ggml: use optimized kernels for Adreno"          ON)
 set   (GGML_OPENCL_TARGET_VERSION "300" CACHE STRING
-                                            "gmml: OpenCL API version to target")
+                                            "ggml: OpenCL API version to target")
+
+option(GGML_HEXAGON                         "ggml: enable Hexagon backend"                    OFF)
+set(GGML_HEXAGON_FP32_QUANTIZE_GROUP_SIZE 128 CACHE STRING "ggml: quantize group size (32, 64, or 128)")
 
 # toolchain for vulkan-shaders-gen
 set   (GGML_VULKAN_SHADERS_GEN_TOOLCHAIN "" CACHE FILEPATH "ggml: toolchain file for vulkan-shaders-gen")
+
+option(GGML_ZENDNN                          "ggml: use ZenDNN"                                OFF)
+option(ZENDNN_ROOT                          "ggml: path to ZenDNN installation"               "")
 
 # extra artifacts
 option(GGML_BUILD_TESTS    "ggml: build tests"    ${GGML_STANDALONE})
@@ -312,9 +332,12 @@ set(GGML_PUBLIC_HEADERS
     include/ggml-opt.h
     include/ggml-metal.h
     include/ggml-rpc.h
+    include/ggml-virtgpu.h
     include/ggml-sycl.h
     include/ggml-vulkan.h
     include/ggml-webgpu.h
+    include/ggml-zendnn.h
+    include/ggml-openvino.h
     include/gguf.h)
 
 set_target_properties(ggml PROPERTIES PUBLIC_HEADER "${GGML_PUBLIC_HEADERS}")
@@ -330,7 +353,7 @@ if (GGML_STANDALONE)
         @ONLY)
 
     install(FILES ${CMAKE_CURRENT_BINARY_DIR}/ggml.pc
-        DESTINATION share/pkgconfig)
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
 endif()
 
 #
@@ -404,62 +427,79 @@ if (MSVC)
         /wd4996  # Disable POSIX deprecation warnings
         /wd4702  # Unreachable code warnings
     )
-    function(disable_msvc_warnings target_name)
+    set(MSVC_COMPILE_OPTIONS
+        "$<$<COMPILE_LANGUAGE:C>:/utf-8>"
+        "$<$<COMPILE_LANGUAGE:CXX>:/utf-8>"
+    )
+    function(configure_msvc_target target_name)
         if(TARGET ${target_name})
             target_compile_options(${target_name} PRIVATE ${MSVC_WARNING_FLAGS})
+            target_compile_options(${target_name} PRIVATE ${MSVC_COMPILE_OPTIONS})
         endif()
     endfunction()
 
-    disable_msvc_warnings(ggml-base)
-    disable_msvc_warnings(ggml)
-    disable_msvc_warnings(ggml-cpu)
-    disable_msvc_warnings(ggml-cpu-x64)
-    disable_msvc_warnings(ggml-cpu-sse42)
-    disable_msvc_warnings(ggml-cpu-sandybridge)
-    disable_msvc_warnings(ggml-cpu-haswell)
-    disable_msvc_warnings(ggml-cpu-skylakex)
-    disable_msvc_warnings(ggml-cpu-icelake)
-    disable_msvc_warnings(ggml-cpu-alderlake)
+    configure_msvc_target(ggml-base)
+    configure_msvc_target(ggml)
+    configure_msvc_target(ggml-cpu)
+    configure_msvc_target(ggml-cpu-x64)
+    configure_msvc_target(ggml-cpu-sse42)
+    configure_msvc_target(ggml-cpu-sandybridge)
+    # __FMA__ and __F16C__ are not defined in MSVC, however they are implied with AVX2/AVX512
+    # skipping            ggml-cpu-ivybridge
+    # skipping            ggml-cpu-piledriver
+    configure_msvc_target(ggml-cpu-haswell)
+    configure_msvc_target(ggml-cpu-skylakex)
+    configure_msvc_target(ggml-cpu-cannonlake)
+    configure_msvc_target(ggml-cpu-cascadelake)
+    configure_msvc_target(ggml-cpu-icelake)
+    # MSVC 2022 doesn't support BF16 intrinsics without `/arch:AVX10.1` ?!
+    # https://learn.microsoft.com/en-us/cpp/intrinsics/x64-amd64-intrinsics-list?view=msvc-170
+    # https://learn.microsoft.com/en-us/cpp/build/reference/arch-x64?view=msvc-170
+    # skipping            ggml-cpu-cooperlake
+    # skipping            ggml-cpu-zen4
+    configure_msvc_target(ggml-cpu-alderlake)
+    # MSVC doesn't support AMX
+    # skipping            ggml-cpu-sapphirerapids
 
     if (GGML_BUILD_EXAMPLES)
-        disable_msvc_warnings(common-ggml)
-        disable_msvc_warnings(common)
+        configure_msvc_target(common-ggml)
+        configure_msvc_target(common)
 
-        disable_msvc_warnings(mnist-common)
-        disable_msvc_warnings(mnist-eval)
-        disable_msvc_warnings(mnist-train)
+        configure_msvc_target(mnist-common)
+        configure_msvc_target(mnist-eval)
+        configure_msvc_target(mnist-train)
 
-        disable_msvc_warnings(gpt-2-ctx)
-        disable_msvc_warnings(gpt-2-alloc)
-        disable_msvc_warnings(gpt-2-backend)
-        disable_msvc_warnings(gpt-2-sched)
-        disable_msvc_warnings(gpt-2-quantize)
-        disable_msvc_warnings(gpt-2-batched)
+        configure_msvc_target(gpt-2-ctx)
+        configure_msvc_target(gpt-2-alloc)
+        configure_msvc_target(gpt-2-backend)
+        configure_msvc_target(gpt-2-sched)
+        configure_msvc_target(gpt-2-quantize)
+        configure_msvc_target(gpt-2-batched)
 
-        disable_msvc_warnings(gpt-j)
-        disable_msvc_warnings(gpt-j-quantize)
+        configure_msvc_target(gpt-j)
+        configure_msvc_target(gpt-j-quantize)
 
-        disable_msvc_warnings(magika)
-        disable_msvc_warnings(yolov3-tiny)
-        disable_msvc_warnings(sam)
+        configure_msvc_target(magika)
+        configure_msvc_target(yolov3-tiny)
+        configure_msvc_target(sam)
 
-        disable_msvc_warnings(simple-ctx)
-        disable_msvc_warnings(simple-backend)
+        configure_msvc_target(simple-ctx)
+        configure_msvc_target(simple-backend)
     endif()
 
     if (GGML_BUILD_TESTS)
-        disable_msvc_warnings(test-mul-mat)
-        disable_msvc_warnings(test-arange)
-        disable_msvc_warnings(test-backend-ops)
-        disable_msvc_warnings(test-cont)
-        disable_msvc_warnings(test-conv-transpose)
-        disable_msvc_warnings(test-conv-transpose-1d)
-        disable_msvc_warnings(test-conv1d)
-        disable_msvc_warnings(test-conv2d)
-        disable_msvc_warnings(test-conv2d-dw)
-        disable_msvc_warnings(test-customop)
-        disable_msvc_warnings(test-dup)
-        disable_msvc_warnings(test-opt)
-        disable_msvc_warnings(test-pool)
+        configure_msvc_target(test-mul-mat)
+        configure_msvc_target(test-arange)
+        configure_msvc_target(test-backend-ops)
+        configure_msvc_target(test-cont)
+        configure_msvc_target(test-conv-transpose)
+        configure_msvc_target(test-conv-transpose-1d)
+        configure_msvc_target(test-conv1d)
+        configure_msvc_target(test-conv2d)
+        configure_msvc_target(test-conv2d-dw)
+        configure_msvc_target(test-customop)
+        configure_msvc_target(test-dup)
+        configure_msvc_target(test-opt)
+        configure_msvc_target(test-pool)
     endif ()
 endif()

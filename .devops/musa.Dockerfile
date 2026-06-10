@@ -6,6 +6,10 @@ ARG BASE_MUSA_DEV_CONTAINER=mthreads/musa:${MUSA_VERSION}-devel-ubuntu${UBUNTU_V
 
 ARG BASE_MUSA_RUN_CONTAINER=mthreads/musa:${MUSA_VERSION}-runtime-ubuntu${UBUNTU_VERSION}-amd64
 
+ARG BUILD_DATE=N/A
+ARG APP_VERSION=N/A
+ARG APP_REVISION=N/A
+
 FROM ${BASE_MUSA_DEV_CONTAINER} AS build
 
 # MUSA architecture to build for (defaults to all supported archs)
@@ -18,7 +22,7 @@ RUN apt-get update && \
     python3 \
     python3-pip \
     git \
-    libcurl4-openssl-dev \
+    libssl-dev \
     libgomp1
 
 WORKDIR /app
@@ -32,11 +36,12 @@ RUN if [ "${MUSA_DOCKER_ARCH}" != "default" ]; then \
     cmake --build build --config Release -j$(nproc)
 
 RUN mkdir -p /app/lib && \
-    find build -name "*.so" -exec cp {} /app/lib \;
+    find build -name "*.so*" -exec cp -P {} /app/lib \;
 
 RUN mkdir -p /app/full \
     && cp build/bin/* /app/full \
     && cp *.py /app/full \
+    && cp -r conversion /app/full \
     && cp -r gguf-py /app/full \
     && cp -r requirements /app/full \
     && cp requirements.txt /app/full \
@@ -45,8 +50,21 @@ RUN mkdir -p /app/full \
 ## Base image
 FROM ${BASE_MUSA_RUN_CONTAINER} AS base
 
+ARG BUILD_DATE=N/A
+ARG APP_VERSION=N/A
+ARG APP_REVISION=N/A
+ARG IMAGE_URL=https://github.com/ggml-org/llama.cpp
+ARG IMAGE_SOURCE=https://github.com/ggml-org/llama.cpp
+LABEL org.opencontainers.image.created=$BUILD_DATE \
+      org.opencontainers.image.version=$APP_VERSION \
+      org.opencontainers.image.revision=$APP_REVISION \
+      org.opencontainers.image.title="llama.cpp" \
+      org.opencontainers.image.description="LLM inference in C/C++" \
+      org.opencontainers.image.url=$IMAGE_URL \
+      org.opencontainers.image.source=$IMAGE_SOURCE
+
 RUN apt-get update \
-    && apt-get install -y libgomp1 curl\
+    && apt-get install -y libgomp1 curl \
     && apt autoremove -y \
     && apt clean -y \
     && rm -rf /tmp/* /var/tmp/* \
@@ -81,7 +99,7 @@ ENTRYPOINT ["/app/tools.sh"]
 ### Light, CLI only
 FROM base AS light
 
-COPY --from=build /app/full/llama-cli /app
+COPY --from=build /app/full/llama-cli /app/full/llama-completion /app
 
 WORKDIR /app
 

@@ -20,6 +20,11 @@ extern "C" {
 // BREAKING CHANGES are expected.
 //
 
+// Set callback for all future logging events.
+// If this is not called, or NULL is supplied, everything is output on stderr.
+// Note: this also call mtmd_log_set() internally
+MTMD_API void mtmd_helper_log_set(ggml_log_callback log_callback, void * user_data);
+
 // helper function to construct a mtmd_bitmap from a file
 // it calls mtmd_helper_bitmap_init_from_buf() internally
 // returns nullptr on failure
@@ -41,6 +46,10 @@ MTMD_API size_t mtmd_helper_get_n_tokens(const mtmd_input_chunks * chunks);
 // helper to count the total position of tokens from a list of chunks, useful to keep track of n_past
 // normally, n_pos is equal to n_tokens, but for M-RoPE it is different
 MTMD_API llama_pos mtmd_helper_get_n_pos(const mtmd_input_chunks * chunks);
+
+// helper to get the list of relative positions corresponding to the embedding tokens, to be used by M-RoPE
+// out_pos must have length == mtmd_helper_get_n_tokens(image)
+MTMD_API void mtmd_helper_image_get_decoder_pos(const mtmd_image_tokens * image, llama_pos pos_0, struct mtmd_decoder_pos * out_pos);
 
 // helper function that automatically:
 // 1. run llama_decode() on text chunks

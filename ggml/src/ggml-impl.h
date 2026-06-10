@@ -24,15 +24,13 @@
 #include <arm_neon.h>
 #endif
 
-#if defined(__F16C__)
-#include <immintrin.h>
-#endif
-
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 void ggml_print_backtrace(void);
+
+uint64_t ggml_graph_next_uid(void);
 
 #ifndef MIN
 #    define MIN(a, b) ((a) < (b) ? (a) : (b))
@@ -102,7 +100,11 @@ static bool ggml_op_is_empty(enum ggml_op op) {
     }
 }
 
-static inline float ggml_softplus(float input) {
+static inline bool ggml_impl_is_view(const struct ggml_tensor * t) {
+    return t->view_src != NULL;
+}
+
+static inline float ggml_compute_softplus_f32(float input) {
     return (input > 20.0f) ? input : logf(1 + expf(input));
 }
 //
@@ -338,6 +340,10 @@ struct ggml_cgraph {
     struct ggml_hash_set visited_hash_set;
 
     enum ggml_cgraph_eval_order order;
+
+    // an optional identifier that can be utilized to recognize same graphs if two non-zero values match
+    // a value of 0 means it is not set and should be ignored
+    uint64_t uid;
 };
 
 // returns a slice of cgraph with nodes [i0, i1)
@@ -491,6 +497,61 @@ static inline float ggml_e8m0_to_fp32_half(uint8_t x) {
 #define GGML_E8M0_TO_FP32(x) ggml_e8m0_to_fp32(x)
 #define GGML_E8M0_TO_FP32_HALF(x) ggml_e8m0_to_fp32_half(x)
 
+// UE4M3: unsigned, 4 exp bits (bias=7), 3 mantissa bits
+// Returns value * 0.5 to match kvalues_mxfp4 convention (kvalues = 2 * E2M1_float)
+static inline float ggml_ue4m3_to_fp32(uint8_t x) {
+    if (x == 0 || x == 0x7F) {
+        return 0.0f;
+    }
+    int   exp = (x >> 3) & 0xF;
+    int   man = x & 0x7;
+    float raw;
+    if (exp == 0) {
+        raw = ldexpf((float) man, -9);
+    } else {
+        raw = ldexpf(1.0f + (float) man / 8.0f, exp - 7);
+    }
+    return raw * 0.5f;
+}
+
+static inline uint8_t ggml_fp32_to_ue4m3(float x) {
+    if (!(x > 0.0f)) {
+        return 0;
+    }
+    if (x > 448.0f) {
+        x = 448.0f;
+    }
+    uint32_t bits;
+    memcpy(&bits, &x, 4);
+    int fp32_exp  = ((bits >> 23) & 0xFF) - 127;
+    int fp32_man  = (bits >> 20) & 0x7;
+    int ue4m3_exp = fp32_exp + 7;
+    if (ue4m3_exp <= 0) {
+        // subnormal: value = man * 2^-9, man = round(x * 2^9)
+        int man = (int) (x * 512.0f + 0.5f);
+        if (man > 7) {
+            man = 7;
+        }
+        if (man < 1) {
+            return 0;
+        }
+        return (uint8_t) man;
+    }
+    if (ue4m3_exp >= 15) {
+        return 0x7E;
+    }
+    int round_bit = (bits >> 19) & 1;
+    int ue4m3_man = fp32_man + round_bit;
+    if (ue4m3_man > 7) {
+        ue4m3_man = 0;
+        ue4m3_exp++;
+        if (ue4m3_exp >= 15) {
+            return 0x7E;
+        }
+    }
+    return (uint8_t) ((ue4m3_exp << 3) | ue4m3_man);
+}
+
 /**
  * Converts brain16 to float32.
  *
@@ -565,14 +626,23 @@ static inline ggml_bf16_t ggml_compute_fp32_to_bf16(float s) {
 #define GGML_FP32_TO_BF16(x) ggml_compute_fp32_to_bf16(x)
 #define GGML_BF16_TO_FP32(x) ggml_compute_bf16_to_fp32(x)
 
+static inline int32_t ggml_node_get_use_count(const struct ggml_cgraph * cgraph, int node_idx) {
+    const struct ggml_tensor * node = cgraph->nodes[node_idx];
+
+    size_t hash_pos = ggml_hash_find(&cgraph->visited_hash_set, node);
+    if (!ggml_bitset_get(cgraph->visited_hash_set.used, hash_pos)) {
+        return 0;
+    }
+    return cgraph->use_counts[hash_pos];
+}
+
 // return true if the node's results are only used by N other nodes
 // and can be fused into their calculations.
 static inline bool ggml_node_has_n_uses(const struct ggml_cgraph * cgraph, int node_idx, int32_t n_uses) {
     const struct ggml_tensor * node = cgraph->nodes[node_idx];
 
     // check the use count against how many we're replacing
-    size_t hash_pos = ggml_hash_find(&cgraph->visited_hash_set, node);
-    if (!ggml_bitset_get(cgraph->visited_hash_set.used, hash_pos) || cgraph->use_counts[hash_pos] != n_uses) {
+    if (ggml_node_get_use_count(cgraph, node_idx) != n_uses) {
         return false;
     }
 
@@ -604,6 +674,9 @@ static inline bool ggml_can_fuse_ext(const struct ggml_cgraph * cgraph, const in
 
         struct ggml_tensor * node = cgraph->nodes[node_idxs[i]];
         if (node->op != ops[i]) {
+            return false;
+        }
+        if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
             return false;
         }
         if (i < num_ops - 1 && !ggml_node_has_n_uses(cgraph, node_idxs[i], 1)) {
@@ -638,11 +711,42 @@ static inline bool ggml_can_fuse(const struct ggml_cgraph * cgraph, int node_idx
     return ggml_can_fuse_ext(cgraph, idxs, ops, num_ops);
 }
 
+GGML_API bool ggml_can_fuse_subgraph_ext(const struct ggml_cgraph * cgraph,
+                                         const int *                node_idxs,
+                                         int                        count,
+                                         const enum ggml_op *       ops,
+                                         const int *                outputs,
+                                         int                        num_outputs);
+
+// Returns true if the subgraph formed by {node_idxs} can be fused
+// checks whethers all nodes which are not part of outputs can be elided
+// by checking if their num_uses are confined to the subgraph
+static inline bool ggml_can_fuse_subgraph(const struct ggml_cgraph * cgraph,
+                                          int                        node_idx,
+                                          int                        count,
+                                          const enum ggml_op *       ops,
+                                          const int *                outputs,
+                                          int                        num_outputs) {
+    GGML_ASSERT(count < 32);
+    if (node_idx + count > cgraph->n_nodes) {
+        return false;
+    }
+
+    int idxs[32];
+
+    for (int i = 0; i < count; ++i) {
+        idxs[i] = node_idx + i;
+    }
+
+    return ggml_can_fuse_subgraph_ext(cgraph, idxs, count, ops, outputs, num_outputs);
+}
+
 #ifdef __cplusplus
 }
 #endif
 
 #ifdef __cplusplus
+#include <array>
 #include <initializer_list>
 #include <vector>
 
@@ -651,8 +755,29 @@ inline bool ggml_can_fuse(const struct ggml_cgraph * cgraph, int node_idx, std::
     return ggml_can_fuse(cgraph, node_idx, ops.begin(), (int)ops.size());
 }
 
+inline bool ggml_can_fuse_subgraph(const struct ggml_cgraph *          cgraph,
+                                   int                                 start_idx,
+                                   std::initializer_list<enum ggml_op> ops,
+                                   std::initializer_list<int>          outputs = {}) {
+    return ggml_can_fuse_subgraph(cgraph, start_idx, ops.size(), ops.begin(), outputs.begin(), outputs.size());
+}
+
+// Return true if the edges in the graph match expectations.
+inline bool ggml_check_edges(const struct ggml_cgraph *                cgraph,
+                             int                                       start_idx,
+                             std::initializer_list<std::array<int, 3>> edges) {
+    for (const auto & edge : edges) {
+        int dst_node = edge[0];
+        int src_idx  = edge[1];
+        int src_node = edge[2];
+        if (cgraph->nodes[start_idx + dst_node]->src[src_idx] != cgraph->nodes[start_idx + src_node]) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // expose GGUF internals for test code
 GGML_API size_t gguf_type_size(enum gguf_type type);
-GGML_API struct gguf_context * gguf_init_from_file_impl(FILE * file, struct gguf_init_params params);
 GGML_API void gguf_write_to_buf(const struct gguf_context * ctx, std::vector<int8_t> & buf, bool only_meta);
 #endif // __cplusplus

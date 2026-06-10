@@ -1,3 +1,4 @@
+#pragma once
 #include "common.cuh"
 
 #define CUDA_DEQUANTIZE_BLOCK_SIZE 256
@@ -38,6 +39,25 @@ template<typename dst_t, typename src_t>
         return __float2bfloat16(float(x));
     } else if constexpr(std::is_same_v<src_t, nv_bfloat16>) {
         return __bfloat162float(x);
+    } else if constexpr(std::is_same_v<src_t, float2> && std::is_same_v<dst_t, half2>) {
+        return __float22half2_rn(x);
+    } else if constexpr(std::is_same_v<src_t, nv_bfloat162> && std::is_same_v<dst_t, float2>) {
+#ifdef GGML_USE_HIP
+        return make_float2(__bfloat162float(__low2bfloat16(x)), __bfloat162float(__high2bfloat16(x)));
+#else
+#if __CUDA_ARCH__ >= 800
+        return __bfloat1622float2(x);
+#else
+        return make_float2(__bfloat162float(x.x), __bfloat162float(x.y));
+#endif // __CUDA_ARCH__ >= 800
+#endif // GGML_USE_HIP
+    } else if constexpr(std::is_same_v<src_t, float2> && std::is_same_v<dst_t, nv_bfloat162>) {
+        // bypass compile error on cuda 12.0.1
+#ifdef GGML_USE_HIP
+        return __float22bfloat162_rn(x);
+#else
+        return {x.x, x.y};
+#endif // GGML_USE_HIP
     } else if constexpr(std::is_same_v<dst_t, int32_t>) {
         return int32_t(x);
     } else {

@@ -28,9 +28,6 @@ def _build_repetition(item_rule, min_items, max_items, separator_rule=None):
     return f'({result})?' if min_items == 0 else result
 
 def _generate_min_max_int(min_value: Optional[int], max_value: Optional[int], out: list, decimals_left: int = 16, top_level: bool = True):
-    has_min = min_value != None
-    has_max = max_value != None
-
     def digit_range(from_char: str, to_char: str):
         out.append("[")
         if from_char == to_char:
@@ -106,7 +103,7 @@ def _generate_min_max_int(min_value: Optional[int], max_value: Optional[int], ou
                 out.append(to_str[i])
                 out.append("]")
 
-    if has_min and has_max:
+    if min_value is not None and max_value is not None:
         if min_value < 0 and max_value < 0:
             out.append("\"-\" (")
             _generate_min_max_int(-max_value, -min_value, out, decimals_left, top_level=True)
@@ -133,7 +130,7 @@ def _generate_min_max_int(min_value: Optional[int], max_value: Optional[int], ou
 
     less_decimals = max(decimals_left - 1, 1)
 
-    if has_min:
+    if min_value is not None:
         if min_value < 0:
             out.append("\"-\" (")
             _generate_min_max_int(None, -min_value, out, decimals_left, top_level=False)
@@ -177,7 +174,7 @@ def _generate_min_max_int(min_value: Optional[int], max_value: Optional[int], ou
                 more_digits(length - 1, less_decimals)
         return
 
-    if has_max:
+    if max_value is not None:
         if max_value >= 0:
             if top_level:
                 out.append("\"-\" [1-9] ")
@@ -231,9 +228,9 @@ DOT = '[^\\x0A\\x0D]'
 RESERVED_NAMES = set(["root", "dot", *PRIMITIVE_RULES.keys(), *STRING_FORMAT_RULES.keys()])
 
 INVALID_RULE_CHARS_RE = re.compile(r'[^a-zA-Z0-9-]+')
-GRAMMAR_LITERAL_ESCAPE_RE = re.compile(r'[\r\n"]')
+GRAMMAR_LITERAL_ESCAPE_RE = re.compile(r'[\r\n"\\]')
 GRAMMAR_RANGE_LITERAL_ESCAPE_RE = re.compile(r'[\r\n"\]\-\\]')
-GRAMMAR_LITERAL_ESCAPES = {'\r': '\\r', '\n': '\\n', '"': '\\"', '-': '\\-', ']': '\\]'}
+GRAMMAR_LITERAL_ESCAPES = {'\r': '\\r', '\n': '\\n', '"': '\\"', '-': '\\-', ']': '\\]', '\\': '\\\\'}
 
 NON_LITERAL_SET = set('|.()[]{}*+?')
 ESCAPED_IN_REGEXPS_BUT_NOT_IN_LITERALS = set('^$.[]()|{}*+?')
@@ -371,8 +368,17 @@ class SchemaConverter:
                         raise ValueError(f'Unsupported ref {ref}')
 
                     for sel in ref.split('#')[-1].split('/')[1:]:
-                        assert target is not None and sel in target, f'Error resolving ref {ref}: {sel} not in {target}'
-                        target = target[sel]
+                        assert target is not None, f'Error resolving ref {ref}: {sel} not in {target}'
+                        if isinstance(target, list):
+                            try:
+                                sel_index = int(sel)
+                            except ValueError:
+                                raise ValueError(f'Error resolving ref {ref}: {sel} not in {target}')
+                            assert 0 <= sel_index < len(target), f'Error resolving ref {ref}: {sel} not in {target}'
+                            target = target[sel_index]
+                        else:
+                            assert sel in target, f'Error resolving ref {ref}: {sel} not in {target}'
+                            target = target[sel]
 
                     self._refs[ref] = target
                 else:
@@ -393,7 +399,7 @@ class SchemaConverter:
             Transforms a regular expression pattern into a GBNF rule.
 
             Input: https://json-schema.org/understanding-json-schema/reference/regular_expressions
-            Output: https://github.com/ggerganov/llama.cpp/blob/master/grammars/README.md
+            Output: https://github.com/ggml-org/llama.cpp/blob/master/grammars/README.md
 
             Unsupported features: negative/positive lookaheads, greedy/non-greedy modifiers.
 
@@ -547,7 +553,8 @@ class SchemaConverter:
 
 
     def _resolve_ref(self, ref):
-        ref_name = ref.split('/')[-1]
+        ref_fragment = ref.split('#')[-1]
+        ref_name = 'ref' + re.sub(r'[^a-zA-Z0-9-]+', '-', ref_fragment)
         if ref_name not in self._rules and ref not in self._refs_being_resolved:
             self._refs_being_resolved.add(ref)
             resolved = self._refs[ref]
@@ -623,7 +630,7 @@ class SchemaConverter:
             return self._add_rule(rule_name, self._build_object_rule(properties, required, hybrid_name, additional_properties=None))
 
         elif schema_type in (None, 'array') and ('items' in schema or 'prefixItems' in schema):
-            items = schema.get('items') or schema['prefixItems']
+            items = schema.get('items', schema.get('prefixItems'))
             if isinstance(items, list):
                 return self._add_rule(
                     rule_name,
@@ -678,6 +685,11 @@ class SchemaConverter:
 
         elif (schema_type == 'object') or (len(schema) == 0):
             return self._add_rule(rule_name, self._add_primitive('object', PRIMITIVE_RULES['object']))
+
+        elif schema_type is None and isinstance(schema, dict):
+            # No type constraint and no recognized structural keywords (e.g. {"description": "..."}).
+            # Per JSON Schema semantics this is equivalent to {} and accepts any value.
+            return self._add_rule(rule_name, self._add_primitive('value', PRIMITIVE_RULES['value']))
 
         else:
             assert schema_type in PRIMITIVE_RULES, f'Unrecognized schema: {schema}'

@@ -11,25 +11,33 @@ from typing import Any, Callable, Sequence, Mapping, Iterable, Protocol, ClassVa
 try:
     from sentencepiece import SentencePieceProcessor
 except ImportError:
-    SentencePieceProcessor = None
+    SentencePieceProcessor: Any = None
 
 try:
-    from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
-    from mistral_common.tokens.tokenizers.tekken import Tekkenizer
-    from mistral_common.tokens.tokenizers.utils import (
+    from mistral_common.tokens.tokenizers.mistral import MistralTokenizer # type: ignore[import-not-found, ty:unresolved-import]
+    from mistral_common.tokens.tokenizers.tekken import Tekkenizer # type: ignore[import-not-found, ty:unresolved-import]
+    from mistral_common.tokens.tokenizers.utils import ( # type: ignore[import-not-found, ty:unresolved-import]
         _filter_valid_tokenizer_files,
     )
-    from mistral_common.tokens.tokenizers.sentencepiece import (
+    from mistral_common.tokens.tokenizers.sentencepiece import ( # type: ignore[import-not-found, ty:unresolved-import]
         SentencePieceTokenizer,
     )
 except ImportError:
     _mistral_common_installed = False
-    MistralTokenizer = None
-    Tekkenizer = None
-    SentencePieceTokenizer = None
-    _filter_valid_tokenizer_files = None
+    MistralTokenizer: Any = None
+    Tekkenizer: Any = None
+    SentencePieceTokenizer: Any = None
+    _filter_valid_tokenizer_files: Any = None
 else:
     _mistral_common_installed = True
+
+try:
+    from mistral_common.tokens.tokenizers.utils import ( # type: ignore[import-not-found, ty:unresolved-import]
+        get_one_valid_tokenizer_file,
+    )
+except ImportError:
+    # We still want the conversion to work with older mistral-common versions.
+    get_one_valid_tokenizer_file: Any = None
 
 
 import gguf
@@ -535,7 +543,7 @@ class LlamaHfVocab(Vocab):
             cache_dir=base_path,
             local_files_only=True,
         )
-        assert self.tokenizer.is_fast  # assume tokenizer.json is used
+        assert self.tokenizer.is_fast  # assume tokenizer.json is used  # ty: ignore[unresolved-attribute]
 
         # Initialize lists and dictionaries for added tokens
         self.added_tokens_list = []
@@ -544,30 +552,30 @@ class LlamaHfVocab(Vocab):
 
         # Process added tokens
         for tok, tokidx in sorted(
-            self.tokenizer.get_added_vocab().items(), key=lambda x: x[1]
+            self.tokenizer.get_added_vocab().items(), key=lambda x: x[1]  # ty: ignore[unresolved-attribute]
         ):
             # Only consider added tokens that are not in the base vocabulary
-            if tokidx >= self.tokenizer.vocab_size:
+            if tokidx >= self.tokenizer.vocab_size:  # ty: ignore[unresolved-attribute]
                 self.added_tokens_list.append(tok)
                 self.added_tokens_dict[tok] = tokidx
                 self.added_tokens_ids.add(tokidx)
 
         # Store special tokens and their IDs
         self.specials = {
-            tok: self.tokenizer.get_vocab()[tok]
-            for tok in self.tokenizer.all_special_tokens
+            tok: self.tokenizer.get_vocab()[tok]  # ty: ignore[unresolved-attribute]
+            for tok in self.tokenizer.all_special_tokens  # ty: ignore[unresolved-attribute]
         }
-        self.special_ids = set(self.tokenizer.all_special_ids)
+        self.special_ids = set(self.tokenizer.all_special_ids)  # ty: ignore[unresolved-attribute]
 
         # Set vocabulary sizes
-        self.vocab_size_base = self.tokenizer.vocab_size
+        self.vocab_size_base = self.tokenizer.vocab_size  # ty: ignore[unresolved-attribute]
         self.vocab_size      = self.vocab_size_base + len(self.added_tokens_list)
 
         self.fname_tokenizer = fname_tokenizer
 
     def hf_tokens(self) -> Iterable[tuple[bytes, float, gguf.TokenType]]:
         reverse_vocab = {
-            id: encoded_tok for encoded_tok, id in self.tokenizer.get_vocab().items()
+            id: encoded_tok for encoded_tok, id in self.tokenizer.get_vocab().items()  # ty: ignore[unresolved-attribute]
         }
 
         for token_id in range(self.vocab_size_base):
@@ -608,7 +616,7 @@ class LlamaHfVocab(Vocab):
             yield text.encode("utf-8"), score, toktype
 
     def has_newline_token(self):
-        return "<0x0A>" in self.tokenizer.vocab or "\n" in self.tokenizer.vocab
+        return "<0x0A>" in self.tokenizer.vocab or "\n" in self.tokenizer.vocab  # ty: ignore[unresolved-attribute]
 
     def all_tokens(self) -> Iterable[tuple[bytes, float, gguf.TokenType]]:
         yield from self.hf_tokens()
@@ -673,24 +681,30 @@ class MistralVocab(Vocab):
 
         # Find the tokenizer files
         all_files = [f.as_posix() for f in base_path.glob("**/*") if f.is_file()]
-        valid_tokenizer_files = _filter_valid_tokenizer_files(all_files)
 
-        if len(valid_tokenizer_files) == 0:
-            raise ValueError(f"No tokenizer file found in the directory: {base_path}")
-        # If there are multiple tokenizer files, we use tekken.json if it exists, otherwise the versioned one.
-        if len(valid_tokenizer_files) > 1:
-            if "tekken.json" in valid_tokenizer_files:
-                tokenizer_file = "tekken.json"
-            else:
-                tokenizer_file = sorted(valid_tokenizer_files)[-1]
-            logger.warning(
-                f"Multiple tokenizer files found in {base_path}. Using {tokenizer_file}"
-            )
+        if get_one_valid_tokenizer_file is not None:
+            tokenizer_file_path = get_one_valid_tokenizer_file(all_files)
         else:
-            tokenizer_file = valid_tokenizer_files[0]
+            valid_tokenizer_files = _filter_valid_tokenizer_files(all_files)
 
-        self.tokenizer = MistralTokenizer.from_file(
-            base_path / tokenizer_file
+            if len(valid_tokenizer_files) == 0:
+                raise ValueError(f"No tokenizer file found in the directory: {base_path}")
+            # If there are multiple tokenizer files, we use tekken.json if it exists, otherwise the versioned one.
+            if len(valid_tokenizer_files) > 1:
+                if "tekken.json" in valid_tokenizer_files:
+                    tokenizer_file = "tekken.json"
+                else:
+                    tokenizer_file = sorted(valid_tokenizer_files)[-1]
+                logger.warning(
+                    f"Multiple tokenizer files found in {base_path}. Using {tokenizer_file}"
+                )
+            else:
+                tokenizer_file = valid_tokenizer_files[0]
+
+            tokenizer_file_path = base_path / tokenizer_file
+
+        self.tokenizer: Any = MistralTokenizer.from_file(
+            tokenizer_file_path
         ).instruct_tokenizer.tokenizer
         self.tokenizer_type = (
             MistralTokenizerType.tekken
@@ -698,7 +712,7 @@ class MistralVocab(Vocab):
             else MistralTokenizerType.spm
         )
         self.vocab_size = self.tokenizer.n_words
-        self.fname_tokenizer = base_path / tokenizer_file
+        self.fname_tokenizer = tokenizer_file_path
         self._name = (
             "mistral-" + self.tokenizer_type.value + "-" + self.tokenizer.version
         )

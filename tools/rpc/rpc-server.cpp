@@ -1,12 +1,7 @@
-#if defined(_MSC_VER)
-#define _SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING
-#endif
-
 #include "ggml-rpc.h"
 #ifdef _WIN32
 #  define NOMINMAX
 #  define DIRECTORY_SEPARATOR '\\'
-#  include <locale>
 #  include <windows.h>
 #  include <fcntl.h>
 #  include <io.h>
@@ -15,23 +10,46 @@
 #  include <unistd.h>
 #  include <sys/stat.h>
 #endif
-#include <codecvt>
-#include <string>
-#include <stdio.h>
-#include <vector>
-#include <filesystem>
 #include <algorithm>
-#include <thread>
+#include <clocale>
+#include <codecvt>
+#include <filesystem>
 #include <regex>
+#include <stdio.h>
+#include <string>
+#include <thread>
+#include <vector>
 
-namespace fs = std::filesystem;
+#if defined(__linux__)
+#include <sys/types.h>
+#include <pwd.h>
+#endif
+
+// NOTE: this is copied from common.cpp to avoid linking with libcommon
+#ifdef _WIN32
+static std::wstring utf8_to_wstring(const std::string & str) {
+    if (str.empty()) {
+        return std::wstring();
+    }
+
+    int size = MultiByteToWideChar(CP_UTF8, 0, str.c_str(), (int)str.size(), NULL, 0);
+
+    if (size <= 0) {
+        return std::wstring();
+    }
+
+    std::wstring wstr(size, 0);
+    MultiByteToWideChar(CP_UTF8, 0, str.c_str(), (int)str.size(), &wstr[0], size);
+
+    return wstr;
+}
+#endif
 
 // NOTE: this is copied from common.cpp to avoid linking with libcommon
 // returns true if successful, false otherwise
 static bool fs_create_directory_with_parents(const std::string & path) {
 #ifdef _WIN32
-    std::wstring_convert<std::codecvt_utf8<wchar_t>> converter;
-    std::wstring wpath = converter.from_bytes(path);
+    std::wstring wpath = utf8_to_wstring(path);
 
     // if the path already exists, check whether it's a directory
     const DWORD attributes = GetFileAttributesW(wpath.c_str());
@@ -44,9 +62,16 @@ static bool fs_create_directory_with_parents(const std::string & path) {
     // process path from front to back, procedurally creating directories
     while ((pos_slash = path.find('\\', pos_slash)) != std::string::npos) {
         const std::wstring subpath = wpath.substr(0, pos_slash);
-        const wchar_t * test = subpath.c_str();
 
-        const bool success = CreateDirectoryW(test, NULL);
+        pos_slash += 1;
+
+        // skip the drive letter, in some systems it can return an access denied error
+        if (subpath.length() == 2 && subpath[1] == ':') {
+            continue;
+        }
+
+        const bool success = CreateDirectoryW(subpath.c_str(), NULL);
+
         if (!success) {
             const DWORD error = GetLastError();
 
@@ -60,8 +85,6 @@ static bool fs_create_directory_with_parents(const std::string & path) {
                 return false;
             }
         }
-
-        pos_slash += 1;
     }
 
     return true;
@@ -112,16 +135,31 @@ static std::string fs_get_cache_directory() {
     if (getenv("LLAMA_CACHE")) {
         cache_directory = std::getenv("LLAMA_CACHE");
     } else {
-#if defined(__linux__) || defined(__FreeBSD__) || defined(_AIX) || defined(__OpenBSD__)
+#if defined(__linux__) || defined(__FreeBSD__) || defined(_AIX) || \
+    defined(__OpenBSD__) || defined(__NetBSD__)
         if (std::getenv("XDG_CACHE_HOME")) {
             cache_directory = std::getenv("XDG_CACHE_HOME");
-        } else {
+        } else if (std::getenv("HOME")) {
             cache_directory = std::getenv("HOME") + std::string("/.cache/");
+        } else {
+#if defined(__linux__)
+            /* no $HOME is defined, fallback to getpwuid */
+            struct passwd *pw = getpwuid(getuid());
+            if ((!pw) || (!pw->pw_dir)) {
+                throw std::runtime_error("Failed to find $HOME directory");
+            }
+
+            cache_directory = std::string(pw->pw_dir) + std::string("/.cache/");
+#else /* defined(__linux__) */
+            throw std::runtime_error("Failed to find $HOME directory");
+#endif /* defined(__linux__) */
         }
 #elif defined(__APPLE__)
         cache_directory = std::getenv("HOME") + std::string("/Library/Caches/");
 #elif defined(_WIN32)
         cache_directory = std::getenv("LOCALAPPDATA");
+#elif defined(__EMSCRIPTEN__)
+        GGML_ABORT("not implemented on this platform");
 #else
 #  error Unknown architecture
 #endif
@@ -137,7 +175,6 @@ struct rpc_server_params {
     bool                     use_cache   = false;
     int                      n_threads   = std::max(1U, std::thread::hardware_concurrency()/2);
     std::vector<std::string> devices;
-    std::vector<size_t>      dev_mem;
 };
 
 static void print_usage(int /*argc*/, char ** argv, rpc_server_params params) {
@@ -148,7 +185,6 @@ static void print_usage(int /*argc*/, char ** argv, rpc_server_params params) {
     fprintf(stderr, "  -d, --device <dev1,dev2,...>     comma-separated list of devices\n");
     fprintf(stderr, "  -H, --host HOST                  host to bind to (default: %s)\n", params.host.c_str());
     fprintf(stderr, "  -p, --port PORT                  port to bind to (default: %d)\n", params.port);
-    fprintf(stderr, "  -m, --mem <M1,M2,...>            memory size for each device (in MB)\n");
     fprintf(stderr, "  -c, --cache                      enable local file cache\n");
     fprintf(stderr, "\n");
 }
@@ -197,23 +233,6 @@ static bool rpc_server_params_parse(int argc, char ** argv, rpc_server_params & 
             }
         } else if (arg == "-c" || arg == "--cache") {
             params.use_cache = true;
-        } else if (arg == "-m" || arg == "--mem") {
-            if (++i >= argc) {
-                return false;
-            }
-            const std::regex regex{ R"([,/]+)" };
-            std::string mem_str = argv[i];
-            std::sregex_token_iterator iter(mem_str.begin(), mem_str.end(), regex, -1);
-            std::sregex_token_iterator end;
-            for ( ; iter != end; ++iter) {
-                try {
-                    size_t mem = std::stoul(*iter) * 1024 * 1024;
-                    params.dev_mem.push_back(mem);
-                } catch (const std::exception & ) {
-                    fprintf(stderr, "error: invalid memory size: %s\n", iter->str().c_str());
-                    return false;
-                }
-            }
         } else if (arg == "-h" || arg == "--help") {
             print_usage(argc, argv, params);
             exit(0);
@@ -269,6 +288,8 @@ static std::vector<ggml_backend_dev_t> get_devices(const rpc_server_params & par
 }
 
 int main(int argc, char * argv[]) {
+    std::setlocale(LC_NUMERIC, "C");
+
     ggml_backend_load_all();
 
     rpc_server_params params;
@@ -293,22 +314,10 @@ int main(int argc, char * argv[]) {
         return 1;
     }
     std::string endpoint = params.host + ":" + std::to_string(params.port);
-    std::vector<size_t> free_mem, total_mem;
-    for (size_t i = 0; i < devices.size(); i++) {
-        if (i < params.dev_mem.size()) {
-            free_mem.push_back(params.dev_mem[i]);
-            total_mem.push_back(params.dev_mem[i]);
-        } else {
-            size_t free, total;
-            ggml_backend_dev_memory(devices[i], &free, &total);
-            free_mem.push_back(free);
-            total_mem.push_back(total);
-        }
-    }
     const char * cache_dir = nullptr;
     std::string cache_dir_str;
     if (params.use_cache) {
-        cache_dir_str = fs_get_cache_directory() + "rpc/";
+        cache_dir_str = fs_get_cache_directory() + "rpc" + DIRECTORY_SEPARATOR;
         if (!fs_create_directory_with_parents(cache_dir_str)) {
             fprintf(stderr, "Failed to create cache directory: %s\n", cache_dir_str.c_str());
             return 1;
@@ -328,7 +337,6 @@ int main(int argc, char * argv[]) {
         return 1;
     }
 
-    start_server_fn(endpoint.c_str(), cache_dir, params.n_threads, devices.size(),
-        devices.data(), free_mem.data(), total_mem.data());
+    start_server_fn(endpoint.c_str(), cache_dir, params.n_threads, devices.size(), devices.data());
     return 0;
 }

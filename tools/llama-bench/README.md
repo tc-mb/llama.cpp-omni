@@ -62,6 +62,8 @@ test parameters:
   -ot --override-tensors <tensor name pattern>=<buffer type>;...
                                             (default: disabled)
   -nopo, --no-op-offload <0|1>              (default: 0)
+  -fitt, --fit-target <MiB>                 fit model to device memory with this margin per device in MiB (default: off)
+  -fitc, --fit-ctx <n>                      minimum ctx size for --fit-target (default: 4096)
 
 Multiple values can be given for each parameter by separating them with ','
 or by specifying the parameter multiple times. Ranges can be given as
@@ -80,7 +82,10 @@ Each test is repeated the number of times given by `-r`, and the results are ave
 
 Using the `-d <n>` option, each test can be run at a specified context depth, prefilling the KV cache with `<n>` tokens.
 
-For a description of the other options, see the [main example](../main/README.md).
+For a description of the other options, see the [completion example](../completion/README.md).
+
+> [!NOTE]
+> The measurements with `llama-bench` do not include the times for tokenization and for sampling.
 
 ## Examples
 
@@ -131,7 +136,7 @@ $ ./llama-bench -n 0 -n 16 -p 64 -t 1,2,4,8,16,32
 | llama 7B mostly Q4_0           |   3.56 GiB |     6.74 B | CPU        |         16 | pp 64      |     33.52 ± 0.03 |
 | llama 7B mostly Q4_0           |   3.56 GiB |     6.74 B | CPU        |         16 | tg 16      |     15.32 ± 0.05 |
 | llama 7B mostly Q4_0           |   3.56 GiB |     6.74 B | CPU        |         32 | pp 64      |     59.00 ± 1.11 |
-| llama 7B mostly Q4_0           |   3.56 GiB |     6.74 B | CPU        |         32 | tg 16      |     16.41 ± 0.79 ||
+| llama 7B mostly Q4_0           |   3.56 GiB |     6.74 B | CPU        |         32 | tg 16      |     16.41 ± 0.79 |
 
 ### Different numbers of layers offloaded to the GPU
 

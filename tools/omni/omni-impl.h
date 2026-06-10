@@ -20,6 +20,7 @@
 #define KEY_NAME                "general.name"
 #define KEY_DESCRIPTION         "general.description"
 #define KEY_MODEL_TYPE          "general.model_type"
+#define KEY_PROJ_TYPE           "clip.projector_type"
 #define KEY_HAS_AUDIO_ENC       "clip.has_audio_encoder"
 #define KEY_HAS_VISION_ENC      "clip.has_vision_encoder"
 #define KEY_USE_GELU            "clip.use_gelu"
@@ -46,6 +47,7 @@
 #define KEY_IMAGE_GRID_PINPOINTS  "clip.vision.image_grid_pinpoints"
 #define KEY_IMAGE_CROP_RESOLUTION "clip.vision.image_crop_resolution"
 #define KEY_WIN_ATTN_PATTERN      "clip.vision.n_wa_pattern"
+#define KEY_WIN_ATTN_LAYER_INDEXES "clip.vision.wa_layer_indexes"
 #define KEY_ATTN_WINDOW_SIZE      "clip.vision.window_size"
 #define KEY_MINICPMV_VERSION      "clip.minicpmv_version"
 #define KEY_MINICPMV_QUERY_NUM    "clip.minicpmv_query_num"
@@ -76,6 +78,8 @@
 #define TN_LN_PRE          "%s.pre_ln.%s"
 #define TN_LN_POST         "%s.post_ln.%s"
 #define TN_LLAVA_PROJ      "mm.%d.%s"
+#define TN_MM_UP           "mm.up.%s"
+#define TN_MM_DOWN         "mm.down.%s"
 #define TN_MVLM_PROJ_MLP   "mm.model.mlp.%d.%s"
 #define TN_MVLM_PROJ_BLOCK "mm.model.mb_block.%d.block.%d.%s"
 #define TN_MVLM_PROJ_PEG   "mm.model.peg.%d.%s"
@@ -98,6 +102,16 @@
 #define TN_MINICPMV_ATTN       "resampler.attn.%s.%s"
 #define TN_MINICPMV_LN         "resampler.ln_%s.%s"
 
+// MiniCPM-o 4.6 ViT merger (ported from MiniCPM-V 4.6 vision tower)
+#define TN_VIT_MERGER_LN1      "v.vit_merger.ln1.%s"
+#define TN_VIT_MERGER_ATTN_Q   "v.vit_merger.attn_q.%s"
+#define TN_VIT_MERGER_ATTN_K   "v.vit_merger.attn_k.%s"
+#define TN_VIT_MERGER_ATTN_V   "v.vit_merger.attn_v.%s"
+#define TN_VIT_MERGER_ATTN_O   "v.vit_merger.attn_out.%s"
+#define TN_VIT_MERGER_DS_LN    "v.vit_merger.ds_ln.%s"
+#define TN_VIT_MERGER_DS_UP    "v.vit_merger.ds_ffn_up.%s"
+#define TN_VIT_MERGER_DS_DOWN  "v.vit_merger.ds_ffn_down.%s"
+
 #define TN_GLM_ADAPER_CONV      "adapter.conv.%s"
 #define TN_GLM_ADAPTER_LINEAR   "adapter.linear.linear.%s"
 #define TN_GLM_ADAPTER_NORM_1   "adapter.linear.norm1.%s"
@@ -110,11 +124,13 @@
 
 enum omni_model_type {
     MiniCPM_o,
+    MiniCPM_o_4_6,
     OMNI_MODEL_TYPE_UNKNOWN,
 };
 
 static std::map<omni_model_type, std::string> OMNI_MODEL_TYPE_NAMES = {
-    { MiniCPM_o, "MiniCPM-o" },
+    { MiniCPM_o,     "MiniCPM-o" },
+    { MiniCPM_o_4_6, "MiniCPM-o-4_6" },
 };
 
 static omni_model_type omni_model_type_from_string(const std::string & str) {

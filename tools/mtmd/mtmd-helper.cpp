@@ -32,8 +32,69 @@
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb/stb_image.h"
 
-#define LOG_INF(...) fprintf(stdout, __VA_ARGS__)
-#define LOG_ERR(...) fprintf(stderr, __VA_ARGS__)
+#ifdef MTMD_INTERNAL_HEADER
+#error "mtmd-helper is a public library outside of mtmd. it must not include internal headers"
+#endif
+
+//
+// internal logging functions
+//
+
+struct mtmd_helper_logger {
+    ggml_log_callback default_callback = [](ggml_log_level level, const char * text, void * user_data) {
+        (void) level;
+        (void) user_data;
+        fputs(text, stderr);
+        fflush(stderr);
+    };
+
+    ggml_log_callback log_callback = default_callback;
+    void * log_callback_user_data;
+
+    void log_v(enum ggml_log_level level, const char * format, va_list args) {
+        if (format == NULL) {
+            return;
+        }
+        va_list args_copy;
+        va_copy(args_copy, args);
+        char buffer[128];
+        int len = vsnprintf(buffer, 128, format, args);
+        if (len < 128) {
+            log_callback(level, buffer, log_callback_user_data);
+        } else {
+            char * buffer2 = (char *) calloc(len + 1, sizeof(char));
+            vsnprintf(buffer2, len + 1, format, args_copy);
+            buffer2[len] = 0;
+            log_callback(level, buffer2, log_callback_user_data);
+            free(buffer2);
+        }
+        va_end(args_copy);
+    }
+
+    void log(enum ggml_log_level level, const char * format, ...) {
+        va_list args;
+        va_start(args, format);
+        log_v(level, format, args);
+        va_end(args);
+    }
+} g_logger;
+
+#define LOG_INF(...) g_logger.log(GGML_LOG_LEVEL_INFO,  __VA_ARGS__)
+#define LOG_WRN(...) g_logger.log(GGML_LOG_LEVEL_WARN,  __VA_ARGS__)
+#define LOG_ERR(...) g_logger.log(GGML_LOG_LEVEL_ERROR, __VA_ARGS__)
+
+void mtmd_helper_log_set(ggml_log_callback log_callback, void * user_data) {
+    if (log_callback == nullptr) {
+        log_callback = g_logger.default_callback;
+    }
+    g_logger.log_callback = log_callback;
+    g_logger.log_callback_user_data = user_data;
+    mtmd_log_set(log_callback, user_data);
+}
+
+//
+// helper functions
+//
 
 size_t mtmd_helper_get_n_tokens(const mtmd_input_chunks * chunks) {
     size_t n_tokens = 0;
@@ -53,6 +114,13 @@ llama_pos mtmd_helper_get_n_pos(const mtmd_input_chunks * chunks) {
     return n_pos;
 }
 
+void mtmd_helper_image_get_decoder_pos(const mtmd_image_tokens * chunks, llama_pos pos_0, mtmd_decoder_pos * out_pos) {
+    size_t n_tokens = mtmd_image_tokens_get_n_tokens(chunks);
+    for (size_t i = 0; i < n_tokens; i++) {
+        out_pos[i] = mtmd_image_tokens_get_decoder_pos(chunks, pos_0, i);
+    }
+}
+
 // helper struct to make working with embd batch easier
 // note: this will be removed after llama_batch_ext refactoring
 struct decode_embd_batch {
@@ -66,6 +134,7 @@ struct decode_embd_batch {
     std::vector<int8_t>         logits;
     llama_batch batch;
     decode_embd_batch(float * embd, int32_t n_tokens, int n_pos_per_embd, int n_mmproj_embd) : n_pos_per_embd(n_pos_per_embd), n_mmproj_embd(n_mmproj_embd) {
+        GGML_ASSERT(n_tokens > 0 && n_pos_per_embd > 0 && n_mmproj_embd > 0);
         pos     .resize(n_tokens * n_pos_per_embd);
         n_seq_id.resize(n_tokens);
         seq_ids .resize(n_tokens + 1);
@@ -94,17 +163,15 @@ struct decode_embd_batch {
     }
 
     // M-RoPE for image
-    void set_position_mrope_2d(llama_pos pos_0, int nx, int ny, llama_seq_id seq_id) {
+    void set_position_mrope_2d(const std::vector<mtmd_decoder_pos> & rel_pos, llama_seq_id seq_id) {
         GGML_ASSERT(n_pos_per_embd == 4);
+        GGML_ASSERT(!rel_pos.empty() && (int32_t)rel_pos.size() == batch.n_tokens);
         seq_id_0[0] = seq_id;
-        for (int y = 0; y < ny; y++) {
-            for (int x = 0; x < nx; x++) {
-                int i = y * nx + x;
-                pos[i                     ] = pos_0;
-                pos[i + batch.n_tokens    ] = pos_0 + y;
-                pos[i + batch.n_tokens * 2] = pos_0 + x;
-                pos[i + batch.n_tokens * 3] = 0; // last pos dim is unused
-            }
+        for (int32_t i = 0; i < batch.n_tokens; i++) {
+            pos[i                     ] = rel_pos[i].t;
+            pos[i + batch.n_tokens    ] = rel_pos[i].y;
+            pos[i + batch.n_tokens * 2] = rel_pos[i].x;
+            pos[i + batch.n_tokens * 3] = rel_pos[i].z;
         }
         for (int i = 0; i < batch.n_tokens; i++) {
             batch.n_seq_id[i] = 1;
@@ -121,7 +188,7 @@ struct decode_embd_batch {
             pos[i                     ] = pos_0 + i;
             pos[i + batch.n_tokens    ] = pos_0 + i;
             pos[i + batch.n_tokens * 2] = pos_0 + i;
-            pos[i + batch.n_tokens * 3] = 0; // last pos dim is unused
+            pos[i + batch.n_tokens * 3] = pos_0 + i;
         }
         for (int i = 0; i < batch.n_tokens; i++) {
             batch.n_seq_id[i] = 1;
@@ -131,6 +198,7 @@ struct decode_embd_batch {
     }
 
     llama_batch get_view(int offset, int n_tokens) {
+        GGML_ASSERT(offset >= 0 && n_tokens > 0 && offset + n_tokens <= batch.n_tokens);
         llama_pos * pos_ptr;
         pos_view.clear();
         pos_view.reserve(n_tokens * n_pos_per_embd);
@@ -174,6 +242,7 @@ int32_t mtmd_helper_decode_image_chunk(
         llama_seq_id seq_id,
         int32_t n_batch,
         llama_pos * new_n_past) {
+    GGML_ASSERT(n_batch > 0);
     auto chunk_type = mtmd_input_chunk_get_type(chunk);
     const char * name = chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE ? "image" : "audio";
     if (chunk_type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
@@ -182,12 +251,12 @@ int32_t mtmd_helper_decode_image_chunk(
     }
 
     const llama_model * model = llama_get_model(lctx);
-    int n_mmproj_embd = llama_model_n_embd(model);
+    int n_mmproj_embd = llama_model_n_embd_inp(model);
     int n_pos_per_embd = mtmd_decode_use_mrope(ctx) ? 4 : 1;
 
     int32_t n_tokens = mtmd_input_chunk_get_n_tokens(chunk);
     int32_t i_batch = 0;
-    int32_t n_img_batches = GGML_PAD(n_tokens, n_batch) / n_batch;
+    int32_t n_img_batches = (n_tokens + n_batch - 1) / n_batch;
     decode_embd_batch batch_embd(encoded_embd, n_tokens, n_pos_per_embd, n_mmproj_embd);
 
     if (mtmd_decode_use_mrope(ctx)) {
@@ -197,9 +266,10 @@ int32_t mtmd_helper_decode_image_chunk(
                 LOG_ERR("failed to decode chunk: image tokens are null\n");
                 return -1;
             }
-            const int nx = mtmd_image_tokens_get_nx(image_tokens);
-            const int ny = mtmd_image_tokens_get_ny(image_tokens);
-            batch_embd.set_position_mrope_2d(n_past, nx, ny, seq_id);
+            const auto n_tokens = mtmd_image_tokens_get_n_tokens(image_tokens);
+            std::vector<mtmd_decoder_pos> rel_pos(n_tokens);
+            mtmd_helper_image_get_decoder_pos(image_tokens, n_past, rel_pos.data());
+            batch_embd.set_position_mrope_2d(rel_pos, seq_id);
         } else if (chunk_type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
             batch_embd.set_position_mrope_1d(n_past, seq_id);
         } else {
@@ -209,7 +279,8 @@ int32_t mtmd_helper_decode_image_chunk(
         batch_embd.set_position_normal(n_past, seq_id);
     }
 
-    if (mtmd_decode_use_non_causal(ctx)) {
+    const bool use_non_causal = mtmd_decode_use_non_causal(ctx, chunk);
+    if (use_non_causal) {
         llama_set_causal_attn(lctx, false);
         // TODO @ngxson : need to make sure only one image is processed at a time, and n_ubatch must be enough to hold the image
     }
@@ -237,7 +308,7 @@ int32_t mtmd_helper_decode_image_chunk(
     n_past += mtmd_input_chunk_get_n_pos(chunk);
     *new_n_past = n_past;
 
-    if (mtmd_decode_use_non_causal(ctx)) {
+    if (use_non_causal) {
         llama_set_causal_attn(lctx, true);
     }
     return 0;
@@ -251,6 +322,7 @@ int32_t mtmd_helper_eval_chunk_single(mtmd_context * ctx,
         int32_t n_batch,
         bool logits_last,
         llama_pos * new_n_past) {
+    GGML_ASSERT(n_batch > 0);
     int32_t ret;
     llama_batch text_batch = llama_batch_init(n_batch, 0, 1);
     auto chunk_type = mtmd_input_chunk_get_type(chunk);
@@ -325,7 +397,7 @@ int32_t mtmd_helper_eval_chunks(mtmd_context * ctx,
                                 llama_pos * new_n_past) {
     size_t n_chunks = mtmd_input_chunks_size(chunks);
     if (n_chunks == 0) {
-        LOG_ERR("no chunks to eval\n");
+        LOG_WRN("no chunks to eval\n");
         return 0;
     }
 
@@ -409,12 +481,12 @@ static bool decode_audio_from_buf(const unsigned char * buf_in, size_t len, int 
 mtmd_bitmap * mtmd_helper_bitmap_init_from_buf(mtmd_context * ctx, const unsigned char * buf, size_t len) {
     if (audio_helpers::is_audio_file((const char *)buf, len)) {
         std::vector<float> pcmf32;
-        int bitrate = mtmd_get_audio_bitrate(ctx);
-        if (bitrate < 0) {
+        const int sample_rate = mtmd_get_audio_sample_rate(ctx);
+        if (sample_rate < 0) {
             LOG_ERR("This model does not support audio input\n");
             return nullptr;
         }
-        if (!audio_helpers::decode_audio_from_buf(buf, len, bitrate, pcmf32)) {
+        if (!audio_helpers::decode_audio_from_buf(buf, len, sample_rate, pcmf32)) {
             LOG_ERR("Unable to read WAV audio file from buffer\n");
             return nullptr;
         }
@@ -447,6 +519,11 @@ mtmd_bitmap * mtmd_helper_bitmap_init_from_file(mtmd_context * ctx, const char *
     fseek(f, 0, SEEK_END);
     long file_size = ftell(f);
     fseek(f, 0, SEEK_SET);
+    if (file_size < 0) {
+        LOG_ERR("Failed to get file size of %s\n", fname);
+        fclose(f);
+        return nullptr;
+    }
     buf.resize(file_size);
 
     size_t n_read = fread(buf.data(), 1, file_size, f);

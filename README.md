@@ -194,50 +194,356 @@ tools/omni/output/
 
 ---
 
-## 🌐 WebRTC Demo — Real-Time Video Interaction
+## 🌐 Recommended Companion Demo — MiniCPM-o-Demo (Comni)
 
-Full-duplex real-time video interaction demo based on WebRTC. Supports **macOS (Metal)**, **Linux (CUDA)**, and **Windows (CUDA)**.
+For an out-of-the-box, end-to-end omni video-call experience built on top of `llama-server`, we recommend the **Comni** branch of the official demo:
 
-### Fastest Way: oneclick.sh (No Docker Needed)
+🔗 **[OpenBMB/MiniCPM-o-Demo @ Comni](https://github.com/OpenBMB/MiniCPM-o-Demo/tree/Comni)**
+
+It bundles a Python gateway + worker (which spawns and orchestrates `llama-server`) and a desktop + mobile React frontend, supporting **macOS (Metal)**, **Linux (CUDA)**, and **Windows (CUDA)**. Use it when you want a turnkey video-call demo without writing your own HTTP integration.
+
+> 💡 **Don't want to compile?** Pre-built one-click installers (**Comni for Windows / macOS**) are available on the [llama.cpp-omni Releases page](https://github.com/tc-mb/llama.cpp-omni/releases).
+
+### TL;DR — Five Commands From Scratch
+
+If you already have the GGUF weights from [Prerequisites](#prerequisites):
 
 ```bash
-# One command — auto-downloads everything, compiles, and starts all services
-PYTHON_CMD=/path/to/python bash oneclick.sh start
+# 1. Build the C++ engine
+git clone https://github.com/tc-mb/llama.cpp-omni.git
+cd llama.cpp-omni && git checkout feat/web-demo \
+    && cmake -B build -DCMAKE_BUILD_TYPE=Release \
+    && cmake --build build --target llama-server -j
+cd ..
+
+# 2. Set up the demo (Python venv + mobile frontend)
+git clone https://github.com/OpenBMB/MiniCPM-o-Demo.git
+cd MiniCPM-o-Demo && git checkout Comni
+bash install.sh
+( cd frontend/mobile && bun install && bun run --bun build:static )   # or `npm`
+
+# 3. Configure (use absolute paths)
+cp config.example.json config.json
+# Edit config.json:
+#   "backend": "cpp"
+#   "cpp_backend.llamacpp_root" = absolute path to ../llama.cpp-omni
+#   "cpp_backend.model_dir"     = absolute path to MiniCPM-o-4_5-gguf
+
+# 4. Launch
+CUDA_VISIBLE_DEVICES=0 bash start_all.sh
+
+# 5. Open in browser
+#    https://localhost:8040/         (desktop)
+#    https://localhost:8040/mobile/  (mobile React)
 ```
 
-Open **https://localhost:8088** after startup.
+The detailed walkthrough below is the same content the demo repo's
+[`README.md`](https://github.com/OpenBMB/MiniCPM-o-Demo/blob/Comni/README.md) /
+[`README_zh.md`](https://github.com/OpenBMB/MiniCPM-o-Demo/blob/Comni/README_zh.md) covers — kept here so you don't have to bounce between repos.
 
-### Alternative: Docker Deployment
+### Architecture
+
+```
+gateway.py        :8040 (HTTPS)        ─┐
+                                        │  HTTP / WS  (internal)
+worker.py         :22440 + i  GPU i    ─┘
+    │  spawns + HTTP-calls
+    ▼
+llama-server      :19080 + i  GPU i
+    /v1/stream/omni_init
+    /v1/stream/update_session_config
+    /v1/stream/prefill
+    /v1/stream/decode    (SSE)
+    /v1/stream/break
+```
+
+### Step-by-Step
+
+**1. Build `llama-server` from this repo**
 
 ```bash
-# Build llama-server
+git clone https://github.com/tc-mb/llama.cpp-omni.git
+cd llama.cpp-omni
+git checkout feat/web-demo
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --target llama-server -j
-
-# Download and load Docker images
-# 📦 Download: https://drive.google.com/file/d/191h2OJYir9aAL4KIE-mFF_XJ1jT6gnxj/view?usp=sharing
-
-# One-click deployment (simplex)
-./deploy_all.sh \
-    --cpp-dir /path/to/llama.cpp-omni \
-    --model-dir /path/to/MiniCPM-o-4_5-gguf
-
-# Duplex mode
-./deploy_all.sh \
-    --cpp-dir /path/to/llama.cpp-omni \
-    --model-dir /path/to/MiniCPM-o-4_5-gguf \
-    --duplex
 ```
 
-Open **http://localhost:3000** after startup.
+CMake auto-detects CUDA (Linux + NVIDIA) and Metal (macOS). After the build, `build/bin/llama-server` is the binary `worker.py` will spawn — you do **not** need to start `llama-server` yourself.
 
-### Service Ports
+**2. Install Python dependencies**
 
-| Service | Port | Description |
-|---------|------|-------------|
-| Frontend | 3000 (Docker) / 8088 (oneclick) | Web UI |
-| Backend | 8025 (Docker) / 8021 (oneclick) | Backend API |
-| LiveKit | 7880 | Real-time communication |
-| Inference | 9060 | C++ HTTP API |
+```bash
+git clone https://github.com/OpenBMB/MiniCPM-o-Demo.git
+cd MiniCPM-o-Demo
+git checkout Comni
+bash install.sh                   # creates .venv/base/ + installs deps
+# PYTHON=python3.11 bash install.sh   # to use a different interpreter
+```
 
-📖 **Full Documentation**: [MiniCPM-o-cookbook WebRTC Demo](https://github.com/OpenSQZ/MiniCPM-V-CookBook/blob/main/demo/web_demo/WebRTC_Demo/README.md)
+`install.sh` creates `.venv/base/` (Python 3.10), upgrades `pip`, installs `torch==2.8.0` + `torchaudio==2.8.0`, and finally installs `requirements.txt`. The C++ backend doesn't use PyTorch at runtime, but the worker is still a Python process so the venv is needed.
+
+**3. Configure `config.json`**
+
+Copy the template and set `backend` to `cpp`:
+
+```bash
+cp config.example.json config.json
+```
+
+```json
+{
+    "backend": "cpp",
+    "cpp_backend": {
+        "llamacpp_root":   "/abs/path/to/llama.cpp-omni",
+        "model_dir":       "/abs/path/to/MiniCPM-o-4_5-gguf",
+        "llm_model":       "MiniCPM-o-4_5-Q4_K_M.gguf",
+        "cpp_server_port": 19080,
+        "ctx_size":        8192,
+        "n_gpu_layers":    99
+    },
+    "audio":   { "ref_audio_path": "assets/ref_audio/ref_minicpm_signature.wav",
+                 "playback_delay_ms": 200 },
+    "service": {
+        "gateway_port":     8040,
+        "worker_base_port": 22440,
+        "num_workers":      1,
+        "max_queue_size":   1000,
+        "request_timeout":  300.0,
+        "data_dir":         "data"
+    },
+    "duplex":  { "pause_timeout": 60.0 }
+}
+```
+
+| Field | Purpose |
+|-------|---------|
+| `cpp_backend.llamacpp_root` | Absolute path to your `llama.cpp-omni` checkout. `worker.py` runs `${llamacpp_root}/build/bin/llama-server` and uses `${llamacpp_root}/tools/omni/output_<port>/` as the TTS WAV output dir |
+| `cpp_backend.model_dir` | Absolute path to the GGUF directory (LLM + `audio/` + `tts/` + `vision/` + `token2wav-gguf/`) |
+| `cpp_backend.llm_model` | LLM filename inside `model_dir`. Pick the quantization you downloaded (`Q4_K_M` / `Q8_0` / `F16`) |
+| `cpp_backend.cpp_server_port` | HTTP port `worker.py` will start `llama-server` on. Worker `i` uses `cpp_server_port + i` |
+| `cpp_backend.ctx_size` / `n_gpu_layers` | Forwarded to `llama-server` as `--ctx-size` / `--n-gpu-layers` |
+
+**4. Build the mobile frontend (one-time)**
+
+The `/mobile/` route is served from `static/mobile/`, which is **gitignored** — it's the build output of the React + Vite project under `frontend/mobile/`:
+
+```bash
+cd frontend/mobile
+bun install                    # or `npm install` (Node ≥ 20.19)
+bun run --bun build:static     # publishes to ../../static/mobile/
+cd ../..
+```
+
+See the demo repo's [`frontend/mobile/README.md`](https://github.com/OpenBMB/MiniCPM-o-Demo/blob/Comni/frontend/mobile/README.md) for dev proxy / npm-only / hot-reload details.
+
+**5. Start the stack**
+
+```bash
+CUDA_VISIBLE_DEVICES=0 bash start_all.sh
+```
+
+First boot loads all GGUF modules (VPM, APM, LLM, TTS, Token2Wav) and takes 10–60 s. The worker's `/health` returns `worker_status: "idle"` once `omni_init` finishes.
+
+Then open:
+
+- `https://localhost:8040/`            — desktop entry (Home / Omni / Audio-Duplex / Turnbased / Half-Duplex)
+- `https://localhost:8040/mobile/`     — mobile React frontend
+- `https://localhost:8040/mobile-omni/` — mobile-adapted Omni page (DOM bridge over the desktop `omni-app.js`)
+
+> ⚠️ Camera / microphone require HTTPS. The self-signed certs under `certs/` work locally — accept the browser warning. Falling back to `bash start_all.sh --http` will only allow text input (browsers block `MediaDevices` on insecure origins).
+
+### Stop
+
+```bash
+pkill -f "gateway.py|worker.py|llama-server"
+```
+
+`worker.py` automatically restarts `llama-server` after each session (`full_reinit`) to keep KV cache state clean across runs.
+
+### Multi-GPU
+
+Set `service.num_workers > 1` in `config.json` and pass the visible devices:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 bash start_all.sh
+```
+
+Each worker is bound to its own GPU (via `CUDA_VISIBLE_DEVICES`) and spawns its own `llama-server` on `cpp_server_port + worker_index`.
+
+### Troubleshooting
+
+| Symptom | Likely cause |
+|---------|--------------|
+| Worker log: `llama-server not found` | `cpp_backend.llamacpp_root` is wrong, or `cmake --build … --target llama-server` was not run |
+| Worker `/health` stays at `worker_status: "loading"` for a long time | `omni_init` is still loading GGUF modules. Check `tmp/worker_<i>.log` for lines tagged `[CPP]` |
+| WAV files appear under `${llamacpp_root}/tools/omni/output_<port>/round_XXX/` but the browser plays nothing | The gateway is HTTP — many browsers block `Audio` / `MediaDevices` on insecure origins. Use the default HTTPS mode |
+| `kv_cache_length` keeps shrinking mid-conversation | C++ side sliding-window pruning is kicking in. The desktop and mobile UIs expose a "Stop on KV pruning" toggle (default on) that ends the session cleanly when this happens |
+
+For more details and Chinese documentation, see the demo repo: [`README.md`](https://github.com/OpenBMB/MiniCPM-o-Demo/blob/Comni/README.md) / [`README_zh.md`](https://github.com/OpenBMB/MiniCPM-o-Demo/blob/Comni/README_zh.md).
+
+
+
+
+
+## HTTP API & Integration Guide
+> 📝 This section is based on community integration experience.
+
+This section documents the HTTP API call sequence for integrating llama-server into your own application (e.g. a Tauri/Electron desktop app). The official CLI is a black box — if you want programmatic control, you need to call these endpoints directly.
+
+> This guide is based on real-world integration experience. Several critical details are **not documented elsewhere**.
+
+---
+
+### 1. Start llama-server
+
+```bash
+./llama-server \
+  --host 0.0.0.0 \
+  --port 9060 \
+  --model /path/to/MiniCPM-o-4_5-Q4_K_M.gguf \
+  -ngl 99 \
+  --ctx-size 8192 \
+  --repeat-penalty 1.05 \
+  --temp 0.7
+```
+
+Poll `GET /health` until it returns 200 before proceeding. It typically takes 10–60 seconds.
+
+```bash
+# Wait for ready
+curl http://localhost:9060/health
+```
+
+---
+
+### 2. Initialize — `POST /v1/stream/omni_init`
+
+Call this **once per application lifecycle**. It loads all model modules, sets up voice cloning, and internally executes the `index=0` prefill (system prompt initialization).
+
+```json
+POST /v1/stream/omni_init
+
+{
+  "media_type": 2,
+  "use_tts": true,
+  "duplex_mode": true,
+  "model_dir": "/path/to/MiniCPM-o-4_5-gguf",
+  "tts_bin_dir": "/path/to/MiniCPM-o-4_5-gguf/tts",
+  "tts_gpu_layers": 100,
+  "token2wav_device": "gpu:0",
+  "output_dir": "/path/to/output",
+  "voice_audio": "/path/to/reference_voice.wav"
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `media_type` | `2` = vision + audio (full omni) |
+| `duplex_mode` | `true` enables full-duplex streaming |
+| `voice_audio` | Reference WAV for voice cloning. Omit to use default voice |
+| `output_dir` | Directory where TTS WAV files will be written |
+
+**Expected response:**
+```json
+{ "success": true, ... }
+```
+
+> ⚠️ `omni_init` internally completes `index=0` prefill. **Do not** send a separate `cnt=0` prefill after this call. Start your prefill counter at `1`.
+
+---
+
+### 3. Prefill Loop — `POST /v1/stream/prefill`
+
+After `omni_init`, enter a continuous loop. Each iteration sends 1 second of audio + 1 screenshot frame. The counter `cnt` increments by 1 each call and **never resets** within a session.
+
+```json
+POST /v1/stream/prefill
+
+{
+  "audio_path_prefix": "/path/to/audio_chunk.wav",
+  "img_path_prefix": "/path/to/screenshot.png",
+  "cnt": 1
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `cnt` | Starts at `1`, increments every call. `0` is reserved for `omni_init` |
+| `audio_path_prefix` | 1-second audio chunk (16kHz WAV). Send a silence chunk if mic is muted |
+| `img_path_prefix` | Current screen frame. Can reuse last frame if no update |
+
+> ⚠️ **Always send an audio chunk**, even when muted. Submitting a silence segment keeps the duplex loop rhythm intact. Skipping will cause timing drift.
+
+**Recommended loop cadence:** 1000ms per iteration.
+
+---
+
+### 4. Decode — `POST /v1/stream/decode`
+
+Call decode **after each prefill**. It triggers the LLM to generate a response and returns an SSE stream.
+
+```json
+POST /v1/stream/decode
+
+{
+  "debug_dir": "/path/to/output",
+  "stream": true
+}
+```
+
+**SSE stream response format:**
+
+```
+data: {"content": "Hello", "is_listen": false, "stop": false}
+data: {"content": "!", "is_listen": false, "stop": false}
+data: {"is_listen": true, "stop": false}
+data: [DONE]
+```
+
+| Field | Description |
+|-------|-------------|
+| `content` | Text token chunk. Empty string is possible, filter before display |
+| `is_listen` | `true` = model has switched to listening state (stop playing audio) |
+| `stop` | `true` = generation fully complete |
+
+> ⚠️ The text field is **`content`**, not `text`. This is inconsistent with standard OpenAI-compatible SSE format.
+
+---
+
+### 5. Audio Output
+
+TTS WAV files are written incrementally to `output_dir/round_XXX/tts_wav/`. Watch this directory for new files and play them in order.
+
+Use a filesystem watcher (e.g. `notify` in Rust) to detect new WAV files as they appear during decode.
+
+```
+output_dir/
+├── round_000/
+│   └── tts_wav/
+│       ├── wav_0.wav
+│       ├── wav_1.wav
+│       └── ...
+└── round_001/
+    └── tts_wav/
+        └── wav_1000.wav
+```
+
+> ⚠️ Mute your microphone input while playing back TTS audio to prevent echo feedback into the prefill loop.
+
+---
+
+### Full Call Sequence Summary
+
+```
+start llama-server
+    ↓
+GET /health  (poll until 200)
+    ↓
+POST /v1/stream/omni_init  (cnt=0 handled internally, start your counter at 1)
+    ↓
+loop every ~1000ms:
+    POST /v1/stream/prefill  { cnt: N, audio, image }
+    POST /v1/stream/decode   → consume SSE → play WAV files from output_dir
+    N++
+```

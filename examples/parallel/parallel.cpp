@@ -7,12 +7,13 @@
 #include "log.h"
 #include "llama.h"
 
+#include <algorithm>
+#include <clocale>
 #include <cmath>
 #include <cstdio>
 #include <string>
 #include <vector>
 #include <ctime>
-#include <algorithm>
 
 // trim whitespace from the beginning and end of a string
 static std::string trim(const std::string & str) {
@@ -153,6 +154,8 @@ static std::vector<std::string> split_string(const std::string& input, char deli
 }
 
 int main(int argc, char ** argv) {
+    std::setlocale(LC_NUMERIC, "C");
+
     srand(1234);
 
     common_params params;
@@ -160,11 +163,11 @@ int main(int argc, char ** argv) {
     params.n_predict = 128;
     params.n_junk = 1;
 
+    common_init();
+
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_PARALLEL)) {
         return 1;
     }
-
-    common_init();
 
     // number of simultaneous "clients" to simulate
     const int32_t n_clients = params.n_parallel;
@@ -192,10 +195,10 @@ int main(int argc, char ** argv) {
     llama_numa_init(params.numa);
 
     // load the target model
-    common_init_result llama_init = common_init_from_params(params);
+    auto llama_init = common_init_from_params(params);
 
-    llama_model * model = llama_init.model.get();
-    llama_context * ctx = llama_init.context.get();
+    auto * model = llama_init->model();
+    auto * ctx   = llama_init->context();
 
     auto * mem = llama_get_memory(ctx);
 

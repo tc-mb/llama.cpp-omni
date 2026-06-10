@@ -294,7 +294,7 @@ static void llama_adapter_lora_init_impl(llama_model & model, const char * path_
     }
 
     // get extra buffer types of the CPU
-    // TODO: a more general solution for non-CPU extra buft should be imlpemented in the future
+    // TODO: a more general solution for non-CPU extra buft should be implemented in the future
     //       ref: https://github.com/ggml-org/llama.cpp/pull/12593#pullrequestreview-2718659948
     std::vector<ggml_backend_buffer_type_t> buft_extra;
     {
@@ -411,11 +411,14 @@ static void llama_adapter_lora_init_impl(llama_model & model, const char * path_
         }
     }
 
+    // register adapter with model
+    model.loras.insert(&adapter);
+
     LLAMA_LOG_INFO("%s: loaded %zu tensors from lora file\n", __func__, adapter.ab_map.size()*2);
 }
 
 llama_adapter_lora * llama_adapter_lora_init(llama_model * model, const char * path_lora) {
-    llama_adapter_lora * adapter = new llama_adapter_lora();
+    llama_adapter_lora * adapter = new llama_adapter_lora(model);
 
     try {
         llama_adapter_lora_init_impl(*model, path_lora, *adapter);
@@ -469,6 +472,15 @@ int32_t llama_adapter_meta_val_str_by_index(const llama_adapter_lora * adapter, 
 }
 
 void llama_adapter_lora_free(llama_adapter_lora * adapter) {
+    if (adapter == nullptr) {
+        return;
+    }
+
+    if (adapter->model != nullptr) {
+        adapter->model->loras.erase(adapter);
+        adapter->model = nullptr;
+    }
+
     delete adapter;
 }
 

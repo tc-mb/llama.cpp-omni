@@ -1,3 +1,4 @@
+#include "common.h"
 #include "log.h"
 
 #include <chrono>
@@ -22,32 +23,12 @@
 
 int common_log_verbosity_thold = LOG_DEFAULT_LLAMA;
 
-void common_log_set_verbosity_thold(int verbosity) {
-    common_log_verbosity_thold = verbosity;
+int common_log_get_verbosity_thold(void) {
+    return common_log_verbosity_thold;
 }
 
-// Auto-detect if colors should be enabled based on terminal and environment
-static bool common_log_should_use_colors_auto() {
-    // Check NO_COLOR environment variable (https://no-color.org/)
-    if (const char * no_color = std::getenv("NO_COLOR")) {
-        if (no_color[0] != '\0') {
-            return false;
-        }
-    }
-
-    // Check TERM environment variable
-    if (const char * term = std::getenv("TERM")) {
-        if (std::strcmp(term, "dumb") == 0) {
-            return false;
-        }
-    }
-
-    // Check if stdout and stderr are connected to a terminal
-    // We check both because log messages can go to either
-    bool stdout_is_tty = isatty(fileno(stdout));
-    bool stderr_is_tty = isatty(fileno(stderr));
-
-    return stdout_is_tty || stderr_is_tty;
+void common_log_set_verbosity_thold(int verbosity) {
+    common_log_verbosity_thold = verbosity;
 }
 
 static int64_t t_us() {
@@ -68,7 +49,7 @@ enum common_log_col : int {
 };
 
 // disable colors by default
-static std::vector<const char *> g_col = {
+static const char* g_col[] = {
     "",
     "",
     "",
@@ -266,7 +247,6 @@ public:
 
             entries = std::move(new_entries);
         }
-
         cv.notify_one();
     }
 
@@ -284,7 +264,6 @@ public:
                 {
                     std::unique_lock<std::mutex> lock(mtx);
                     cv.wait(lock, [this]() { return head != tail; });
-
                     cur = entries[head];
 
                     head = (head + 1) % entries.size();
@@ -320,7 +299,6 @@ public:
 
                 tail = (tail + 1) % entries.size();
             }
-
             cv.notify_one();
         }
 
@@ -357,7 +335,7 @@ public:
             g_col[COMMON_LOG_COL_CYAN]    = LOG_COL_CYAN;
             g_col[COMMON_LOG_COL_WHITE]   = LOG_COL_WHITE;
         } else {
-            for (size_t i = 0; i < g_col.size(); i++) {
+            for (size_t i = 0; i < std::size(g_col); i++) {
                 g_col[i] = "";
             }
         }
@@ -387,14 +365,20 @@ struct common_log * common_log_init() {
 }
 
 struct common_log * common_log_main() {
-    static struct common_log log;
+    // We intentionally leak (i.e. do not delete) the logger singleton because
+    // common_log destructor called at DLL teardown phase will cause hanging on Windows.
+    // OS will release resources anyway so it should not be a significant issue,
+    // though this design may cause logs to be lost if not flushed before the program exits.
+    // Refer to https://github.com/ggml-org/llama.cpp/issues/22142 for details.
+    static struct common_log * log;
     static std::once_flag    init_flag;
     std::call_once(init_flag, [&]() {
+        log = new common_log;
         // Set default to auto-detect colors
-        log.set_colors(common_log_should_use_colors_auto());
+        log->set_colors(tty_can_use_colors());
     });
 
-    return &log;
+    return log;
 }
 
 void common_log_pause(struct common_log * log) {
@@ -422,7 +406,7 @@ void common_log_set_file(struct common_log * log, const char * file) {
 
 void common_log_set_colors(struct common_log * log, log_colors colors) {
     if (colors == LOG_COLORS_AUTO) {
-        log->set_colors(common_log_should_use_colors_auto());
+        log->set_colors(tty_can_use_colors());
         return;
     }
 
@@ -441,4 +425,29 @@ void common_log_set_prefix(struct common_log * log, bool prefix) {
 
 void common_log_set_timestamps(struct common_log * log, bool timestamps) {
     log->set_timestamps(timestamps);
+}
+
+void common_log_flush(struct common_log * log) {
+    log->pause();
+    log->resume();
+}
+
+static int common_get_verbosity(enum ggml_log_level level) {
+    switch (level) {
+        case GGML_LOG_LEVEL_DEBUG: return LOG_LEVEL_DEBUG;
+        case GGML_LOG_LEVEL_INFO:  return LOG_LEVEL_TRACE;
+        case GGML_LOG_LEVEL_WARN:  return LOG_LEVEL_WARN;
+        case GGML_LOG_LEVEL_ERROR: return LOG_LEVEL_ERROR;
+        case GGML_LOG_LEVEL_CONT:  return LOG_LEVEL_TRACE;
+        case GGML_LOG_LEVEL_NONE:
+        default:
+            return LOG_LEVEL_OUTPUT;
+    }
+}
+
+void common_log_default_callback(enum ggml_log_level level, const char * text, void * /*user_data*/) {
+    auto verbosity = common_get_verbosity(level);
+    if (verbosity <= common_log_verbosity_thold) {
+        common_log_add(common_log_main(), level, "%s", text);
+    }
 }

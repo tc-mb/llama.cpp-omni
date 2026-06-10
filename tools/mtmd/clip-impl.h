@@ -1,3 +1,5 @@
+#pragma once
+
 #include "ggml.h"
 #include "gguf.h"
 #include "clip.h"
@@ -13,6 +15,8 @@
 
 // Internal header for clip.cpp
 
+#define MTMD_INTERNAL_HEADER
+
 #define KEY_FTYPE               "general.file_type"
 #define KEY_NAME                "general.name"
 #define KEY_DESCRIPTION         "general.description"
@@ -27,10 +31,16 @@
 #define KEY_N_BLOCK             "clip.%s.block_count"
 #define KEY_PROJ_DIM            "clip.%s.projection_dim"
 #define KEY_N_HEAD              "clip.%s.attention.head_count"
+#define KEY_N_HEAD_KV           "clip.%s.attention.head_count_kv"
 #define KEY_LAYER_NORM_EPS      "clip.%s.attention.layer_norm_epsilon"
 
 // vision-specific
+#define KEY_VISION_PROJ_TYPE    "clip.vision.projector_type" // for models with mixed modalities
 #define KEY_IMAGE_SIZE          "clip.vision.image_size"
+#define KEY_IMAGE_MIN_PIXELS    "clip.vision.image_min_pixels"
+#define KEY_IMAGE_MAX_PIXELS    "clip.vision.image_max_pixels"
+#define KEY_PREPROC_MIN_TILES   "clip.vision.preproc_min_tiles"
+#define KEY_PREPROC_MAX_TILES   "clip.vision.preproc_max_tiles"
 #define KEY_PREPROC_IMAGE_SIZE  "clip.vision.preproc_image_size"
 #define KEY_PATCH_SIZE          "clip.vision.patch_size"
 #define KEY_IMAGE_MEAN          "clip.vision.image_mean"
@@ -38,18 +48,29 @@
 #define KEY_FEATURE_LAYER       "clip.vision.feature_layer"
 #define KEY_PROJ_SCALE_FACTOR   "clip.vision.projector.scale_factor"
 #define KEY_SPATIAL_MERGE_SIZE  "clip.vision.spatial_merge_size"
+#define KEY_IS_DEEPSTACK_LAYERS "clip.vision.is_deepstack_layers"
 
-#define KEY_MM_PATCH_MERGE_TYPE   "clip.vision.mm_patch_merge_type"
-#define KEY_IMAGE_GRID_PINPOINTS  "clip.vision.image_grid_pinpoints"
-#define KEY_IMAGE_CROP_RESOLUTION "clip.vision.image_crop_resolution"
-#define KEY_WIN_ATTN_PATTERN      "clip.vision.n_wa_pattern"
-#define KEY_ATTN_WINDOW_SIZE      "clip.vision.window_size"
-#define KEY_MINICPMV_VERSION      "clip.minicpmv_version"
-#define KEY_MINICPMV_QUERY_NUM    "clip.minicpmv_query_num"
-
+#define KEY_MM_PATCH_MERGE_TYPE    "clip.vision.mm_patch_merge_type"
+#define KEY_IMAGE_GRID_PINPOINTS   "clip.vision.image_grid_pinpoints"
+#define KEY_WIN_ATTN_PATTERN       "clip.vision.n_wa_pattern"
+#define KEY_WIN_ATTN_LAYER_INDEXES "clip.vision.wa_layer_indexes"
+#define KEY_WA_PATTERN_MODE        "clip.vision.wa_pattern_mode"
+#define KEY_ATTN_WINDOW_SIZE       "clip.vision.window_size"
+#define KEY_MINICPMV_VERSION       "clip.minicpmv_version"
+#define KEY_MINICPMV_QUERY_NUM     "clip.minicpmv_query_num"
+#define KEY_SAM_N_HEAD             "clip.vision.sam.head_count"
+#define KEY_SAM_N_BLOCK            "clip.vision.sam.block_count"
+#define KEY_SAM_N_EMBD             "clip.vision.sam.embedding_length"
 // audio-specific
-#define KEY_A_NUM_MEL_BINS      "clip.audio.num_mel_bins"
-#define KEY_A_PROJ_STACK_FACTOR "clip.audio.projector.stack_factor"
+#define KEY_AUDIO_PROJ_TYPE        "clip.audio.projector_type" // for models with mixed modalities
+#define KEY_A_NUM_MEL_BINS         "clip.audio.num_mel_bins"
+#define KEY_A_PROJ_STACK_FACTOR    "clip.audio.projector.stack_factor"
+#define KEY_A_CHUNK_SIZE           "clip.audio.chunk_size"
+#define KEY_A_CONV_KERNEL_SIZE     "clip.audio.conv_kernel_size"
+#define KEY_A_MAX_POS_EMB          "clip.audio.max_pos_emb"
+#define KEY_A_PROJ_WINDOW_SIZE     "clip.audio.projector.window_size"
+#define KEY_A_PROJ_DOWNSAMPLE_RATE "clip.audio.projector.downsample_rate"
+#define KEY_A_PROJ_HEAD_COUNT      "clip.audio.projector.head_count"
 
 
 //
@@ -58,13 +79,16 @@
 
 #define TN_POS_EMBD        "%s.position_embd.weight"
 #define TN_CLASS_EMBD      "v.class_embd"
-#define TN_PATCH_EMBD      "v.patch_embd.weight"  // not rename tensor with ".0" postfix for backwrad compat
+#define TN_PATCH_EMBD      "v.patch_embd.weight"  // not rename tensor with ".0" postfix for backward compat
 #define TN_PATCH_EMBD_1    "v.patch_embd.weight.1"
 #define TN_PATCH_BIAS      "v.patch_embd.bias"
+#define TN_NORM_EMBD       "v.norm_embd.%s"
+#define TN_ATTN_QKV        "%s.blk.%d.attn_qkv.%s"
 #define TN_ATTN_K          "%s.blk.%d.attn_k.%s"
 #define TN_ATTN_Q          "%s.blk.%d.attn_q.%s"
 #define TN_ATTN_V          "%s.blk.%d.attn_v.%s"
 #define TN_ATTN_OUTPUT     "%s.blk.%d.attn_out.%s"
+#define TN_ATTN_SINKS      "%s.blk.%d.attn_sinks"
 #define TN_ATTN_K_NORM     "%s.blk.%d.attn_k_norm.%s"
 #define TN_ATTN_Q_NORM     "%s.blk.%d.attn_q_norm.%s"
 #define TN_FFN_DOWN        "%s.blk.%d.ffn_down.%s"
@@ -73,24 +97,35 @@
 #define TN_FFN_GATE        "%s.blk.%d.ffn_gate.%s"
 #define TN_LN_1            "%s.blk.%d.ln1.%s" // layer norm
 #define TN_LN_2            "%s.blk.%d.ln2.%s" // layer norm
-#define TN_LS_1            "%s.blk.%d.ls1.%s" // layer scale
-#define TN_LS_2            "%s.blk.%d.ls2.%s" // layer scale
+#define TN_LS_1            "%s.blk.%d.ls1.%s"         // layer scale
+#define TN_LS_2            "%s.blk.%d.ls2.%s"         // layer scale
+#define TN_LS_OUT          "%s.blk.%d.out_scale.%s"      // layer out scale (gemma4)
+#define TN_ATTN_POST_NORM  "%s.blk.%d.attn_post_norm.%s" // post-attn norm (gemma4)
+#define TN_FFN_POST_NORM   "%s.blk.%d.ffn_post_norm.%s"  // post-FFN norm (gemma4)
 #define TN_LN_PRE          "%s.pre_ln.%s"
 #define TN_LN_POST         "%s.post_ln.%s"
 #define TN_LLAVA_PROJ      "mm.%d.%s"
+#define TN_MM_UP           "mm.up.%s"
+#define TN_MM_GATE         "mm.gate.%s"
+#define TN_MM_DOWN         "mm.down.%s"
+#define TN_MM_POST_NORM    "mm.post_norm.%s"
 #define TN_MVLM_PROJ_MLP   "mm.model.mlp.%d.%s"
 #define TN_MVLM_PROJ_BLOCK "mm.model.mb_block.%d.block.%d.%s"
 #define TN_MVLM_PROJ_PEG   "mm.model.peg.%d.%s"
-#define TN_IMAGE_NEWLINE   "model.image_newline"
+#define TN_IMAGE_NEWLINE   "v.image_newline"
+#define TN_IMAGE_SEPERATOR "v.view_seperator"
 #define TN_MM_INP_NORM     "mm.input_norm.weight"
 #define TN_MM_INP_NORM_B   "mm.input_norm.bias"
 #define TN_MM_INP_PROJ     "mm.input_projection.weight" // gemma3
 #define TN_MM_SOFT_EMB_N   "mm.soft_emb_norm.weight"    // gemma3
-#define TN_MM_PROJECTOR    "mm.model.fc.weight"         // idefics3
-#define TN_MM_PATCH_MERGER "mm.patch_merger.weight"     // mistral small 3.1
+#define TN_MM_PROJECTOR    "mm.model.fc.%s"             // idefics3, deepseekocr
+#define TN_MM_PATCH_MERGER "mm.patch_merger.%s"         // mistral small 3.1, glm4v
 #define TN_TOK_IMG_BREAK   "v.token_embd.img_break"     // pixtral
 #define TN_TOK_GLM_BOI     "adapter.boi"                // glm-edge (these embeddings are not in text model)
 #define TN_TOK_GLM_EOI     "adapter.eoi"                // glm-edge (these embeddings are not in text model)
+#define TN_DEEPSTACK_NORM  "v.deepstack.%d.norm.%s"     // qwen3vl deepstack
+#define TN_DEEPSTACK_FC1   "v.deepstack.%d.fc1.%s"      // qwen3vl deepstack
+#define TN_DEEPSTACK_FC2   "v.deepstack.%d.fc2.%s"      // qwen3vl deepstack
 
 // mimicpmv
 #define TN_MINICPMV_POS_EMBD_K "resampler.pos_embed_k"
@@ -99,6 +134,17 @@
 #define TN_MINICPMV_KV_PROJ    "resampler.kv.weight"
 #define TN_MINICPMV_ATTN       "resampler.attn.%s.%s"
 #define TN_MINICPMV_LN         "resampler.ln_%s.%s"
+
+// MiniCPM-V 4.6 ViT merger (window attention + MLP downsample),
+// matching the upstream `vit_merger` module name in transformers.
+#define TN_VIT_MERGER_LN1      "v.vit_merger.ln1.%s"
+#define TN_VIT_MERGER_ATTN_Q   "v.vit_merger.attn_q.%s"
+#define TN_VIT_MERGER_ATTN_K   "v.vit_merger.attn_k.%s"
+#define TN_VIT_MERGER_ATTN_V   "v.vit_merger.attn_v.%s"
+#define TN_VIT_MERGER_ATTN_O   "v.vit_merger.attn_out.%s"
+#define TN_VIT_MERGER_DS_LN    "v.vit_merger.ds_ln.%s"
+#define TN_VIT_MERGER_DS_UP    "v.vit_merger.ds_ffn_up.%s"
+#define TN_VIT_MERGER_DS_DOWN  "v.vit_merger.ds_ffn_down.%s"
 
 #define TN_GLM_ADAPER_CONV      "adapter.conv.%s"
 #define TN_GLM_ADAPTER_LINEAR   "adapter.linear.linear.%s"
@@ -109,13 +155,150 @@
 
 // ultravox
 #define TN_CONV1D       "a.conv1d.%d.%s"
+#define TN_CONV2D       "a.conv2d.%d.%s"
+#define TN_CONV_OUT     "a.conv_out.%s"
 #define TN_MM_AUDIO_MLP "mm.a.mlp.%d.%s"
 #define TN_MM_AUDIO_FC  "mm.a.fc.%s" // fully connected layer
 #define TN_MM_NORM_PRE  "mm.a.norm_pre.%s"
 #define TN_MM_NORM_MID  "mm.a.norm_mid.%s"
 
+// cogvlm
+#define TN_MM_POST_FC_NORM "mm.post_fc_norm.%s"
+#define TN_MM_H_TO_4H      "mm.up.%s"
+#define TN_MM_GATE         "mm.gate.%s"
+#define TN_MM_4H_TO_H      "mm.down.%s"
+#define TN_TOK_BOI         "v.boi"
+#define TN_TOK_EOI         "v.eoi"
+
+// hunyuanvl (shared GGUF tensor names)
+#define TN_MM_PRE_NORM     "mm.pre_norm.%s"
+#define TN_TOK_IMG_BEGIN   "mm.image_begin"
+#define TN_TOK_IMG_END     "mm.image_end"
+
+// deepseek-ocr
+#define TN_SAM_POS_EMBD   "v.sam.pos_embd.%s"
+#define TN_SAM_PATCH_EMBD "v.sam.patch_embd.%s"
+#define TN_SAM_PRE_NORM   "v.sam.blk.%d.pre_ln.%s"
+#define TN_SAM_POST_NORM  "v.sam.blk.%d.post_ln.%s"
+#define TN_SAM_ATTN_POS_H "v.sam.blk.%d.attn.pos_h.%s"
+#define TN_SAM_ATTN_POS_W "v.sam.blk.%d.attn.pos_w.%s"
+#define TN_SAM_ATTN_QKV   "v.sam.blk.%d.attn.qkv.%s"
+#define TN_SAM_ATTN_OUT   "v.sam.blk.%d.attn.out.%s"
+#define TN_SAM_FFN_UP     "v.sam.blk.%d.mlp.lin1.%s"
+#define TN_SAM_FFN_DOWN   "v.sam.blk.%d.mlp.lin2.%s"
+#define TN_SAM_NECK       "v.sam.neck.%d.%s"
+#define TN_SAM_NET        "v.sam.net_%d.%s"
+// (conformer) lfm2
+#define TN_PRE_ENCODE_OUT  "a.pre_encode.out.%s"
+#define TN_FFN_NORM        "%s.blk.%d.ffn_norm.%s"
+#define TN_FFN_NORM_1      "%s.blk.%d.ffn_norm_1.%s"
+#define TN_FFN_UP_1        "%s.blk.%d.ffn_up_1.%s"
+#define TN_FFN_DOWN_1      "%s.blk.%d.ffn_down_1.%s"
+#define TN_POS_BIAS_U      "%s.blk.%d.pos_bias_u"
+#define TN_POS_BIAS_V      "%s.blk.%d.pos_bias_v"
+#define TN_NORM_CONV       "%s.blk.%d.norm_conv.%s"
+#define TN_LINEAR_POS      "%s.blk.%d.linear_pos.%s"
+#define TN_CONV_DW         "%s.blk.%d.conv_dw.%s"
+#define TN_CONV_NORM       "%s.blk.%d.conv_norm.%s"
+#define TN_CONV_PW1        "%s.blk.%d.conv_pw1.%s"
+#define TN_CONV_PW2        "%s.blk.%d.conv_pw2.%s"
+#define TN_INP_PROJ        "a.input_projection.%s"
+#define TN_CTC_OUT         "a.enc_ctc_out.%s"
+#define TN_CTC_OUT_MID     "a.enc_ctc_out_mid.%s"
+#define TN_ATTN_REL_POS_EMB "%s.blk.%d.attn_rel_pos_emb"
+// qformer projector
+#define TN_QF_PROJ_QUERY   "a.proj_query"
+#define TN_QF_PROJ_NORM    "a.proj_norm.%s"
+#define TN_QF_PROJ_LINEAR  "a.proj_linear.%s"
+#define TN_QF_SELF_ATTN_Q  "a.proj_blk.%d.self_attn_q.%s"
+#define TN_QF_SELF_ATTN_K  "a.proj_blk.%d.self_attn_k.%s"
+#define TN_QF_SELF_ATTN_V  "a.proj_blk.%d.self_attn_v.%s"
+#define TN_QF_SELF_ATTN_O  "a.proj_blk.%d.self_attn_out.%s"
+#define TN_QF_SELF_ATTN_N  "a.proj_blk.%d.self_attn_norm.%s"
+#define TN_QF_CROSS_ATTN_Q "a.proj_blk.%d.cross_attn_q.%s"
+#define TN_QF_CROSS_ATTN_K "a.proj_blk.%d.cross_attn_k.%s"
+#define TN_QF_CROSS_ATTN_V "a.proj_blk.%d.cross_attn_v.%s"
+#define TN_QF_CROSS_ATTN_O "a.proj_blk.%d.cross_attn_out.%s"
+#define TN_QF_CROSS_ATTN_N "a.proj_blk.%d.cross_attn_norm.%s"
+#define TN_QF_FFN_UP       "a.proj_blk.%d.ffn_up.%s"
+#define TN_QF_FFN_DOWN     "a.proj_blk.%d.ffn_down.%s"
+#define TN_QF_FFN_NORM     "a.proj_blk.%d.ffn_norm.%s"
+
+// gemma4 audio conformer
+#define TN_A_MM_INP_PROJ     "mm.a.input_projection.%s"
+#define TN_A_MM_SOFT_EMB_N   "mm.a.soft_emb_norm.%s"
+#define TN_A_INP_PROJ        "a.input_projection.%s"
+#define TN_A_CONV1D          "a.conv1d.%d.%s"
+#define TN_A_CONV1D_NORM     "a.conv1d.%d.norm.%s"
+#define TN_A_OUT_PROJ        "a.pre_encode.out.%s"
+#define TN_A_ATTN_PRE_NORM   "%s.blk.%d.attn_pre_norm.%s"
+#define TN_A_ATTN_POST_NORM  "%s.blk.%d.attn_post_norm.%s"
+#define TN_A_ATTN_K_REL      "%s.blk.%d.attn_k_rel.%s"
+#define TN_A_PER_DIM_SCALE   "%s.blk.%d.per_dim_scale.%s"
+#define TN_A_PER_DIM_K_SCALE "%s.blk.%d.per_dim_k_scale.%s"
+#define TN_A_FFN_POST_NORM   "%s.blk.%d.ffn_post_norm.%s"
+#define TN_A_FFN_POST_NORM_1 "%s.blk.%d.ffn_post_norm_1.%s"
+
+// mobilenetv5 (gemma3n) definitions
+#define TN_MNV5_STEM_CONV        "v.conv_stem.conv.weight"
+#define TN_MNV5_STEM_BIAS        "v.conv_stem.conv.bias"
+#define TN_MNV5_STEM_BN          "v.conv_stem.bn.weight"
+
+// Stage 0 Block (Edge Residual)
+#define TN_MNV5_BLK_S0_EXP_W     "v.blk.%d.%d.conv_exp.weight"
+#define TN_MNV5_BLK_S0_BN1_W     "v.blk.%d.%d.bn1.weight"
+#define TN_MNV5_BLK_S0_PWL_W     "v.blk.%d.%d.conv_pwl.weight"
+#define TN_MNV5_BLK_S0_BN2_W     "v.blk.%d.%d.bn2.weight"
+
+// Stage 1+ Block (Universal Inverted Residual)
+#define TN_MNV5_BLK_DW_START_W   "v.blk.%d.%d.dw_start.conv.weight"
+#define TN_MNV5_BLK_DW_START_BN  "v.blk.%d.%d.dw_start.bn.weight"
+#define TN_MNV5_BLK_DW_MID_W     "v.blk.%d.%d.dw_mid.conv.weight"
+#define TN_MNV5_BLK_DW_MID_BN    "v.blk.%d.%d.dw_mid.bn.weight"
+#define TN_MNV5_BLK_PW_EXP_W     "v.blk.%d.%d.pw_exp.conv.weight"
+#define TN_MNV5_BLK_PW_EXP_BN    "v.blk.%d.%d.pw_exp.bn.weight"
+#define TN_MNV5_BLK_PW_PROJ_W    "v.blk.%d.%d.pw_proj.conv.weight"
+#define TN_MNV5_BLK_PW_PROJ_BN   "v.blk.%d.%d.pw_proj.bn.weight"
+#define TN_MNV5_BLK_LAYER_SCALE  "v.blk.%d.%d.layer_scale.gamma"
+
+// Attention Components
+#define TN_MNV5_ATTN_Q_W         "v.blk.%d.%d.attn.query.proj.weight"
+#define TN_MNV5_ATTN_K_W         "v.blk.%d.%d.attn.key.proj.weight"
+#define TN_MNV5_ATTN_V_W         "v.blk.%d.%d.attn.value.proj.weight"
+#define TN_MNV5_ATTN_O_W         "v.blk.%d.%d.attn.output.proj.weight"
+#define TN_MNV5_ATTN_K_DW        "v.blk.%d.%d.attn.key.down_conv.weight"
+#define TN_MNV5_ATTN_K_NORM      "v.blk.%d.%d.attn.key.norm.weight"
+#define TN_MNV5_ATTN_V_DW        "v.blk.%d.%d.attn.value.down_conv.weight"
+#define TN_MNV5_ATTN_V_NORM      "v.blk.%d.%d.attn.value.norm.weight"
+#define TN_MNV5_ATTN_NORM        "v.blk.%d.%d.norm.weight" // Block norm used in attn blocks
+
+// MSFA
+#define TN_MNV5_MSFA_FFN_EXP_W   "v.msfa.ffn.pw_exp.conv.weight"
+#define TN_MNV5_MSFA_FFN_EXP_BN  "v.msfa.ffn.pw_exp.bn.weight"
+#define TN_MNV5_MSFA_FFN_PROJ_W  "v.msfa.ffn.pw_proj.conv.weight"
+#define TN_MNV5_MSFA_FFN_PROJ_BN "v.msfa.ffn.pw_proj.bn.weight"
+#define TN_MNV5_MSFA_NORM        "v.msfa.norm.weight"
+
+// gemma4
+#define TN_STD_BIAS              "v.std_bias"
+#define TN_STD_SCALE             "v.std_scale"
+
+// yasa2
+#define TN_YASA_PATCH_LN_W       "v.patch_ln.weight"
+#define TN_YASA_PATCH_LN_B       "v.patch_ln.bias"
+#define TN_YASA_BACKBONE_LN_W    "v.backbone_ln.weight"
+#define TN_YASA_BACKBONE_LN_B    "v.backbone_ln.bias"
+#define TN_YASA_POS_EMBD         "v.vision_pos_embed"
+#define TN_YASA_STAGE_DOWN_LN    "v.stage.%d.down.ln.%s"
+#define TN_YASA_STAGE_DOWN_CONV  "v.stage.%d.down.conv.%s"
+#define TN_YASA_STAGE_BLK        "v.stage.%d.blk.%d.%s.%s"
+
 // align x to upper multiple of n
 #define CLIP_ALIGN(x, n) ((((x) + (n) - 1) / (n)) * (n))
+
+// forward declaration
+// TODO: improve this later
+struct clip_ctx;
 
 enum projector_type {
     PROJECTOR_TYPE_MLP,
@@ -125,7 +308,14 @@ enum projector_type {
     PROJECTOR_TYPE_MINICPMV,
     PROJECTOR_TYPE_GLM_EDGE,
     PROJECTOR_TYPE_QWEN2VL,
+    PROJECTOR_TYPE_QWEN3VL,
+    PROJECTOR_TYPE_STEP3VL,
     PROJECTOR_TYPE_GEMMA3,
+    PROJECTOR_TYPE_GEMMA3NV,
+    PROJECTOR_TYPE_GEMMA3NA,
+    PROJECTOR_TYPE_GEMMA4V,
+    PROJECTOR_TYPE_GEMMA4A,
+    PROJECTOR_TYPE_PHI4,
     PROJECTOR_TYPE_IDEFICS3,
     PROJECTOR_TYPE_PIXTRAL,
     PROJECTOR_TYPE_QWEN25VL,
@@ -133,10 +323,30 @@ enum projector_type {
     PROJECTOR_TYPE_INTERNVL,
     PROJECTOR_TYPE_LLAMA4,
     PROJECTOR_TYPE_QWEN2A,
+    PROJECTOR_TYPE_QWEN3A,
+    PROJECTOR_TYPE_GLMA,
     PROJECTOR_TYPE_QWEN25O, // will be replaced by QWEN2A or QWEN25VL depending on clip_ctx
     PROJECTOR_TYPE_VOXTRAL,
+    PROJECTOR_TYPE_MERALION,
+    PROJECTOR_TYPE_MUSIC_FLAMINGO,
     PROJECTOR_TYPE_LFM2,
     PROJECTOR_TYPE_KIMIVL,
+    PROJECTOR_TYPE_PADDLEOCR,
+    PROJECTOR_TYPE_LIGHTONOCR,
+    PROJECTOR_TYPE_COGVLM,
+    PROJECTOR_TYPE_JANUS_PRO,
+    PROJECTOR_TYPE_DOTS_OCR,
+    PROJECTOR_TYPE_DEEPSEEKOCR,
+    PROJECTOR_TYPE_LFM2A,
+    PROJECTOR_TYPE_GLM4V,
+    PROJECTOR_TYPE_YOUTUVL,
+    PROJECTOR_TYPE_YASA2,
+    PROJECTOR_TYPE_KIMIK25,
+    PROJECTOR_TYPE_NEMOTRON_V2_VL,
+    PROJECTOR_TYPE_HUNYUANVL,
+    PROJECTOR_TYPE_MINICPMV4_6,
+    PROJECTOR_TYPE_GRANITE_SPEECH,
+    PROJECTOR_TYPE_MIMOVL,
     PROJECTOR_TYPE_UNKNOWN,
 };
 
@@ -148,17 +358,44 @@ static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
     { PROJECTOR_TYPE_GLM_EDGE,  "adapter"},
     { PROJECTOR_TYPE_QWEN2VL,   "qwen2vl_merger"},
     { PROJECTOR_TYPE_QWEN25VL,  "qwen2.5vl_merger"},
+    { PROJECTOR_TYPE_QWEN3VL,   "qwen3vl_merger"},
+    { PROJECTOR_TYPE_STEP3VL,   "step3vl"},
     { PROJECTOR_TYPE_GEMMA3,    "gemma3"},
+    { PROJECTOR_TYPE_GEMMA3NV,  "gemma3nv"},
+    { PROJECTOR_TYPE_GEMMA3NA,  "gemma3na"},
+    { PROJECTOR_TYPE_GEMMA4V,   "gemma4v"},
+    { PROJECTOR_TYPE_GEMMA4A,   "gemma4a"},
+    { PROJECTOR_TYPE_PHI4,      "phi4"},
     { PROJECTOR_TYPE_IDEFICS3,  "idefics3"},
     { PROJECTOR_TYPE_PIXTRAL,   "pixtral"},
     { PROJECTOR_TYPE_ULTRAVOX,  "ultravox"},
     { PROJECTOR_TYPE_INTERNVL,  "internvl"},
     { PROJECTOR_TYPE_LLAMA4,    "llama4"},
     { PROJECTOR_TYPE_QWEN2A,    "qwen2a"},
+    { PROJECTOR_TYPE_QWEN3A,    "qwen3a"},
+    { PROJECTOR_TYPE_GLMA,      "glma"},
     { PROJECTOR_TYPE_QWEN25O,   "qwen2.5o"},
     { PROJECTOR_TYPE_VOXTRAL,   "voxtral"},
+    { PROJECTOR_TYPE_MERALION,  "meralion"},
+    { PROJECTOR_TYPE_MUSIC_FLAMINGO, "musicflamingo"},
     { PROJECTOR_TYPE_LFM2,      "lfm2"},
     { PROJECTOR_TYPE_KIMIVL,    "kimivl"},
+    { PROJECTOR_TYPE_PADDLEOCR, "paddleocr"},
+    { PROJECTOR_TYPE_LIGHTONOCR,"lightonocr"},
+    { PROJECTOR_TYPE_COGVLM,    "cogvlm"},
+    { PROJECTOR_TYPE_JANUS_PRO, "janus_pro"},
+    { PROJECTOR_TYPE_DOTS_OCR,  "dots_ocr"},
+    { PROJECTOR_TYPE_DEEPSEEKOCR,"deepseekocr"},
+    { PROJECTOR_TYPE_LFM2A,     "lfm2a"},
+    { PROJECTOR_TYPE_GLM4V,     "glm4v"},
+    { PROJECTOR_TYPE_YOUTUVL,   "youtuvl"},
+    { PROJECTOR_TYPE_YASA2,     "yasa2"},
+    { PROJECTOR_TYPE_KIMIK25,   "kimik25"},
+    { PROJECTOR_TYPE_NEMOTRON_V2_VL, "nemotron_v2_vl"},
+    { PROJECTOR_TYPE_HUNYUANVL,  "hunyuanvl"},
+    { PROJECTOR_TYPE_MINICPMV4_6, "minicpmv4_6"},
+    { PROJECTOR_TYPE_GRANITE_SPEECH, "granite_speech"},
+    { PROJECTOR_TYPE_MIMOVL,     "mimovl"},
 };
 
 static projector_type clip_projector_type_from_string(const std::string & str) {
@@ -201,7 +438,6 @@ static void clip_log_callback_default(enum ggml_log_level level, const char * te
 }
 
 struct clip_logger_state {
-    ggml_log_level verbosity_thold;
     ggml_log_callback log_callback;
     void * log_callback_user_data;
 };
@@ -235,17 +471,11 @@ static void clip_log_internal(enum ggml_log_level level, const char * format, ..
     va_end(args);
 }
 
-#define LOG_TMPL(level, ...) \
-    do { \
-        if ((level) >= g_logger_state.verbosity_thold) { \
-            clip_log_internal((level), __VA_ARGS__); \
-        } \
-    } while (0)
-#define LOG_INF(...) LOG_TMPL(GGML_LOG_LEVEL_INFO,  __VA_ARGS__)
-#define LOG_WRN(...) LOG_TMPL(GGML_LOG_LEVEL_WARN,  __VA_ARGS__)
-#define LOG_ERR(...) LOG_TMPL(GGML_LOG_LEVEL_ERROR, __VA_ARGS__)
-#define LOG_DBG(...) LOG_TMPL(GGML_LOG_LEVEL_DEBUG, __VA_ARGS__)
-#define LOG_CNT(...) LOG_TMPL(GGML_LOG_LEVEL_CONT,  __VA_ARGS__)
+#define LOG_DBG(...) clip_log_internal(GGML_LOG_LEVEL_DEBUG, __VA_ARGS__)
+#define LOG_INF(...) clip_log_internal(GGML_LOG_LEVEL_INFO,  __VA_ARGS__)
+#define LOG_WRN(...) clip_log_internal(GGML_LOG_LEVEL_WARN,  __VA_ARGS__)
+#define LOG_ERR(...) clip_log_internal(GGML_LOG_LEVEL_ERROR, __VA_ARGS__)
+#define LOG_CNT(...) clip_log_internal(GGML_LOG_LEVEL_CONT,  __VA_ARGS__)
 
 //
 // cpp wrappers
@@ -347,6 +577,18 @@ static std::vector<std::string> string_split_str(std::string s, const std::strin
     return tokens;
 }
 
+// remove when moving to c++20
+inline bool string_starts_with(std::string_view str, std::string_view prefix) {
+    return str.size() >= prefix.size() &&
+           str.compare(0, prefix.size(), prefix) == 0;
+}
+
+// remove when moving to c++20
+inline bool string_ends_with(std::string_view str, std::string_view suffix) {
+    return str.size() >= suffix.size() &&
+           str.compare(str.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
 //
 // gguf utils
 //
@@ -363,7 +605,7 @@ static std::string gguf_data_to_str(enum gguf_type type, const void * data, int 
         case GGUF_TYPE_INT64:   return std::to_string(((const int64_t  *)data)[i]);
         case GGUF_TYPE_FLOAT32: return std::to_string(((const float    *)data)[i]);
         case GGUF_TYPE_FLOAT64: return std::to_string(((const double   *)data)[i]);
-        case GGUF_TYPE_BOOL:    return ((const bool *)data)[i] ? "true" : "false";
+        case GGUF_TYPE_BOOL:    return ((const int8_t *)data)[i] != 0 ? "true" : "false";
         default:                return string_format("unknown type %d", type);
     }
 }
@@ -474,3 +716,4 @@ static void print_tensor_data(ggml_tensor * t, uint8_t * data, int64_t n) {
 //
 
 projector_type clip_get_projector_type(const struct clip_ctx * ctx);
+void clip_set_debug_output_embeddings(struct clip_ctx * ctx, bool debug);
