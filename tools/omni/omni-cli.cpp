@@ -68,6 +68,8 @@ static void show_usage(const char * prog_name) {
         "  --vision-coreml <path>   Path to CoreML model (.mlmodelc), required when backend=coreml\n"
         "  --t2w-coreml <path>  Enable token2wav CoreML backend (DiT on CoreML, encoder on GPU)\n"
         "                        Use 'auto' to auto-discover CoreML model in model dir\n"
+        "  --vision-batch-encode  Enable batched encoding of same-size vision slices\n"
+        "                          (off by default; helps large / high-res / high-refresh images)\n"
         "  --test <prefix> <n> Run test case with data prefix and count\n"
         "  --bench-vision <img> Benchmark serial vs batched vision encoding\n"
         "  -h, --help          Show this help message\n\n"
@@ -218,6 +220,7 @@ int main(int argc, char ** argv) {
     int media_type = 1;     // 1=audio only, 2=omni (audio+vision)
     bool use_tts = true;
     bool run_test = false;
+    bool vision_batch_encode = false;  // 多 slice 批量编码优化（默认关闭）
     std::string test_audio_prefix;
     int test_count = 0;
     
@@ -271,6 +274,9 @@ int main(int argc, char ** argv) {
         }
         else if (arg == "--t2w-coreml" && i + 1 < argc) {
             token2wav_coreml_model_path = argv[++i];
+        }
+        else if (arg == "--vision-batch-encode") {
+            vision_batch_encode = true;
         }
         else if (arg == "--test" && i + 2 < argc) {
             run_test = true;
@@ -359,6 +365,7 @@ int main(int argc, char ** argv) {
         params.vision_coreml_model_path = vision_coreml_model_path;
     }
     params.token2wav_coreml_model_path = token2wav_coreml_model_path;
+    params.vpm_batch_encode = vision_batch_encode;
     params.n_ctx = n_ctx;
     params.n_gpu_layers = n_gpu_layers;
     
@@ -378,6 +385,7 @@ int main(int argc, char ** argv) {
     printf("  Context size: %d\n", n_ctx);
     printf("  GPU layers: %d\n", n_gpu_layers);
     printf("  Vision backend: %s\n", vision_backend.c_str());
+    printf("  Vision batch encode: %s\n", vision_batch_encode ? "enabled" : "disabled");
     if (vision_backend == "coreml") {
         printf("  Vision CoreML: %s\n", vision_coreml_model_path.c_str());
     }

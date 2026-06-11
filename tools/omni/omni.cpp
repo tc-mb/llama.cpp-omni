@@ -465,8 +465,10 @@ static bool encode_image_with_vision_chunks(vision_ctx * ctx_vision, int n_threa
 
     // entry[0] is the overview image; entry[1..n] are slices (all same size)
     // strategy: encode overview separately, batch all slices together
+    // 批量编码优化由 vision_set_batch_encode 控制（默认关闭）。该优化只在
+    // 大图/高清高刷等 slice 数较多时收益明显，并非通用，因此需显式开启。
     const int n_slices = n_total - 1;
-    const bool use_batched = (n_slices > 1);
+    const bool use_batched = vision_get_batch_encode(ctx_vision) && (n_slices > 1);
 
     // 1) encode the overview image (entry 0)
     {
@@ -508,15 +510,19 @@ static bool encode_image_with_vision_chunks(vision_ctx * ctx_vision, int n_threa
 
             LOG_INF("%s: %d slices batch-encoded in %8.2f ms\n", __func__, n_slices, (ggml_time_us() - t_batch_us) / 1000.0);
         } else {
-            // single slice: encode directly
+            // serial path: encode every slice individually (entries[1..n_total-1])
             const int64_t t_step_us = ggml_time_us();
-            vision_chunks[1].resize(n_embd * n_tokens);
-            bool encoded = vision_image_encode(ctx_vision, n_threads, img_res_v.entries[1].get(), vision_chunks[1].data());
-            if (!encoded) {
-                LOG_ERR("Unable to encode slice\n");
-                return false;
+            for (int i = 1; i < n_total; i++) {
+                vision_chunks[i].resize(n_embd * n_tokens);
+                bool encoded = vision_image_encode(ctx_vision, n_threads, img_res_v.entries[i].get(), vision_chunks[i].data());
+                if (!encoded) {
+                    // entries[i] is the i-th slice (entry 0 is the overview), so the
+                    // 1-based slice number equals i, out of n_slices total.
+                    LOG_ERR("Unable to encode slice %d of %d\n", i, n_slices);
+                    return false;
+                }
             }
-            LOG_INF("%s: 1 slice encoded in %8.2f ms\n", __func__, (ggml_time_us() - t_step_us) / 1000.0);
+            LOG_INF("%s: %d slice(s) encoded serially in %8.2f ms\n", __func__, n_slices, (ggml_time_us() - t_step_us) / 1000.0);
         }
     }
 
@@ -530,18 +536,16 @@ static bool encode_image_with_vision_chunks(vision_ctx * ctx_vision, int n_threa
     return true;
 }
 
-bool vision_image_load_from_bytes(const unsigned char * bytes, size_t bytes_length, struct vision_image_u8 * img);
-
 static int query_gpu_memory_used_mb(int device_id = 0) {
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd),
-             "nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i %d 2>/dev/null", device_id);
-    FILE * fp = popen(cmd, "r");
-    if (!fp) return -1;
-    int mb = -1;
-    if (fscanf(fp, "%d", &mb) != 1) mb = -1;
-    pclose(fp);
-    return mb;
+#ifdef GGML_USE_CUDA
+    size_t free_bytes = 0, total_bytes = 0;
+    ggml_backend_cuda_get_device_memory(device_id, &free_bytes, &total_bytes);
+    if (total_bytes == 0) return -1;
+    return (int)((total_bytes - free_bytes) / (1024 * 1024));
+#else
+    (void) device_id;
+    return -1;
+#endif
 }
 
 void omni_bench_vision(struct vision_ctx * ctx_vision, int n_threads, const char * image_path) {
@@ -573,6 +577,8 @@ void omni_bench_vision(struct vision_ctx * ctx_vision, int n_threads, const char
     LOG_INF("Per-slice: %d embd x %d tokens = %d floats (%.1f MB)\n",
             n_embd, n_tokens, per_image_floats, per_image_floats * 4.0f / 1048576.0f);
     LOG_INF("Baseline VRAM: %d MB\n", baseline_vram);
+    LOG_INF("NOTE: VRAM figures are device-wide (cudaMemGetInfo), single-point samples, "
+            "NOT per-process peak; they include other processes on the same GPU.\n");
     LOG_INF("Bench runs per config: %d\n\n", bench_runs);
 
     struct bench_result {
@@ -708,6 +714,7 @@ void omni_bench_vision(struct vision_ctx * ctx_vision, int n_threads, const char
     }
     LOG_INF("================================================================\n");
     LOG_INF("Baseline VRAM (model loaded, no encoding): %d MB\n", baseline_vram);
+    LOG_INF("VRAM_S/VRAM_B are device-wide single-point samples (not per-process peak).\n");
     LOG_INF("================================================================\n\n");
 }
 
@@ -4249,6 +4256,11 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
         const char * vision_path = ctx_omni->params->vpm_model.c_str();
         auto * ctx_vision = vision_init(vision_path, vision_context_params{true, GGML_LOG_LEVEL_INFO, nullptr});
         ctx_omni->ctx_vision = ctx_vision;
+
+        // 🔧 [batch encode 开关] 由 common_params 控制（默认关闭）
+        if (ctx_vision) {
+            vision_set_batch_encode(ctx_vision, ctx_omni->params->vpm_batch_encode);
+        }
 
         // Set CoreML model path if available (for vision ANE acceleration)
         // Note: .mlmodelc is a directory, not a file, so use stat instead of ifstream

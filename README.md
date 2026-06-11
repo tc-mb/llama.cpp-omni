@@ -174,7 +174,40 @@ cmake --build build --target llama-omni-cli -j
 | `-c, --ctx-size <n>` | Context size (default: 4096) |
 | `-ngl <n>` | Number of GPU layers (default: 99) |
 | `--no-tts` | Disable TTS output |
+| `--vision-batch-encode` | Encode same-size image slices in one batched pass (off by default; see below) |
 | `--test <prefix> <n>` | Run test with audio files |
+| `--bench-vision <img>` | Benchmark serial vs batched vision encoding on an image, then exit |
+
+### Vision Batch Encoding (optional optimization)
+
+For high-resolution / high-refresh inputs, an image is split into one overview plus
+many equally-sized slices, and each slice is encoded by the ViT. By default these
+slices are encoded **one at a time** (serial). `--vision-batch-encode` instead packs
+all same-size slices into a **single batched** ViT pass, which is significantly faster
+when there are many slices.
+
+- **When to enable**: large images / high-res / high-refresh modes, i.e. cases that
+  produce many slices. On a 4821×2259 image this gives roughly **1.5–2.3× faster**
+  vision encoding (more slices → larger speedup).
+- **Why it's off by default**: batched cuBLAS GEMM uses a different accumulation order
+  than per-slice GEMM, so the embeddings are *numerically very close but not bit-exact*
+  (avg diff ~1e-2). It also uses somewhat more VRAM. It is therefore opt-in rather than
+  a universal default.
+
+```bash
+# Enable the optimization
+./build/bin/llama-omni-cli \
+    -m /path/to/MiniCPM-o-4_5-gguf/MiniCPM-o-4_5-Q4_K_M.gguf \
+    --omni --vision-batch-encode
+
+# Benchmark serial vs batched (prints a per-slice-count comparison table)
+./build/bin/llama-omni-cli \
+    -m /path/to/MiniCPM-o-4_5-gguf/MiniCPM-o-4_5-Q4_K_M.gguf \
+    --bench-vision /path/to/large_image.png
+```
+
+Programmatically the same switch is exposed via `common_params.vpm_batch_encode`
+(applied in `omni_init`) and `vision_set_batch_encode(ctx_vision, true)`.
 
 ### Output
 

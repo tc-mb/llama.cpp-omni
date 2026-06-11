@@ -577,6 +577,7 @@ struct common_params {
     std::string apm_model                = ""; // audio encoder GGUF
     std::string vpm_model                = ""; // vision encoder GGUF
     std::string projector_model          = ""; // projector GGUF
+    bool vpm_batch_encode                = false; // batch-encode same-size vision slices (off by default; helps large/high-res images)
 
     // Apple Neural Engine (CoreML) support
     std::string vision_coreml_model_path     = ""; // path to CoreML .mlmodelc for vision ANE

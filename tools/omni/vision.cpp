@@ -207,6 +207,11 @@ struct vision_ctx {
     // 🔧 [高清模式] 运行时覆盖 max_slice_nums，-1 表示使用模型默认值
     int max_slice_nums_override = -1;
 
+    // 🔧 [batch encode 开关] 是否对多个尺寸相同的 slice 启用批量编码优化。
+    // 默认 false（关闭）—— 该优化只在大图/高清高刷等 slice 数较多时收益明显，
+    // 并非通用场景，因此需要显式开启。
+    bool batch_encode = false;
+
     // CoreML / ANE model path
     std::string coreml_model_path;
 
@@ -2554,6 +2559,18 @@ void vision_set_max_slice_nums(struct vision_ctx * ctx, int max_slice_nums) {
         ctx->max_slice_nums_override = max_slice_nums;
         LOG_INF("%s: max_slice_nums_override set to %d\n", __func__, max_slice_nums);
     }
+}
+
+// 🔧 [batch encode 开关] 设置/读取多 slice 批量编码优化
+void vision_set_batch_encode(struct vision_ctx * ctx, bool enable) {
+    if (ctx) {
+        ctx->batch_encode = enable;
+        LOG_INF("%s: vision batch encode %s\n", __func__, enable ? "enabled" : "disabled");
+    }
+}
+
+bool vision_get_batch_encode(const struct vision_ctx * ctx) {
+    return ctx ? ctx->batch_encode : false;
 }
 
 //
