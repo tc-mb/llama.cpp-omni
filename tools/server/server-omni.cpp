@@ -64,6 +64,14 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // omni HTTP server is single-session (1:1 duplex), so 1 sequence is enough.
+    // common_params defaults n_parallel to -1 ("auto"); each example resolves it
+    // itself (see tools/server/server.cpp). Without this, n_seq_max overflows
+    // uint32 and trips LLAMA_MAX_SEQ(256) inside llama_context.
+    if (params.n_parallel < 0) {
+        params.n_parallel = 1;
+    }
+
     llama_backend_init();
     llama_numa_init(params.numa);
 
@@ -126,6 +134,26 @@ int main(int argc, char ** argv) {
             }
             return true;
         };
+
+        // Resolve omni model paths from `model_dir` (parity with old feat/web-demo
+        // server.cpp). common_params has no CLI parser for vpm/apm/tts paths,
+        // so they must be filled in here; otherwise omni_init() inside hits
+        // `apm_model.empty()` and returns NULL.
+        std::string model_dir_norm = model_dir;
+        if (!model_dir_norm.empty() &&
+            model_dir_norm.back() != '/' && model_dir_norm.back() != '\\') {
+            model_dir_norm += '/';
+        }
+        params.vpm_model = model_dir_norm + "vision/MiniCPM-o-4_5-vision-F16.gguf";
+        params.apm_model = model_dir_norm + "audio/MiniCPM-o-4_5-audio-F16.gguf";
+        params.tts_model = model_dir_norm + "tts/MiniCPM-o-4_5-tts-F16.gguf";
+
+        if (!check_file("LLM",    params.model.path) ||
+            !check_file("vision", params.vpm_model)  ||
+            !check_file("audio",  params.apm_model)  ||
+            (use_tts && !check_file("tts", params.tts_model))) {
+            return;
+        }
 
         {
             std::lock_guard<std::mutex> lock(state.octx_mutex);

@@ -11,6 +11,7 @@
 
 #include <iostream>
 #include <chrono>
+#include <thread>
 #include <vector>
 #include <limits.h>
 #include <cinttypes>
@@ -382,7 +383,7 @@ int main(int argc, char ** argv) {
         for (int i = 0; i < 1200; ++i) {  // 最多等 120 秒
             FILE * f = fopen(done_flag.c_str(), "r");
             if (f) { fclose(f); fprintf(stderr, "Audio generation completed.\n"); break; }
-            usleep(100000);  // 100ms
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
     }
 
