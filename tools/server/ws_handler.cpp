@@ -714,6 +714,7 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
         // response.done.audio (full_audio_b64) instead of streaming deltas.
         bool accumulate = false;
         std::vector<float> accum;
+        bool emitted_audio = false;
     };
     auto audio_state = std::make_shared<AudioCbState>();
     audio_state->session_id = session_id;
@@ -740,6 +741,7 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
                 std::lock_guard<std::mutex> lk(audio_state->mtx);
                 response_id = audio_state->response_id;
                 response_start = audio_state->response_start;
+                audio_state->emitted_audio = true;
             }
             std::string b64 = float32_pcm_to_b64(samples, n_samples);
             ProtocolMetrics metrics = make_runtime_metrics(
@@ -796,6 +798,7 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
             std::lock_guard<std::mutex> lk(audio_state->mtx);
             audio_state->response_id = response_id; // update for audio callback
             audio_state->response_start = t_request_start;
+            audio_state->emitted_audio = false;
         }
 
         // Branch: full_duplex vs turn_based. The input shape MUST match the
@@ -1207,6 +1210,7 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
             if (decode_thread.joinable()) {
                 decode_thread.join();
             }
+            double generate_ms = elapsed_ms(t_generate_start);
             {
                 const std::string text = sanitize_utf8_stream(utf8_pending, "", true);
                 if (!text.empty()) {
@@ -1218,6 +1222,21 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
                                              elapsed_ms(t_request_start), 0,
                                              turn_vision_slices)));
                 }
+            }
+            bool emitted_audio = false;
+            {
+                std::lock_guard<std::mutex> lk(audio_state->mtx);
+                emitted_audio = audio_state->emitted_audio;
+            }
+            if (!full_text.empty() || emitted_audio) {
+                // Full-duplex speak responses also need an explicit completion
+                // boundary; pure listen steps are represented by listen delta only.
+                send_event(make_response_done(
+                    session_id, response_id, full_text, /*audio_base64*/"",
+                    "turn_end",
+                    make_runtime_metrics(octx, prefill_ms, generate_ms,
+                                         elapsed_ms(t_request_start), 0,
+                                         turn_vision_slices)));
             }
         }
     }

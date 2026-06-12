@@ -52,6 +52,34 @@ static bool server_sent_event(httplib::DataSink & sink, const json & ev) {
     return sink.write(str.data(), str.size());
 }
 
+static std::string parent_dir(const std::string & path) {
+    const size_t pos = path.find_last_of("/\\");
+    return pos == std::string::npos ? "." : path.substr(0, pos);
+}
+
+static bool ensure_omni_model_paths_from_llm(common_params & params) {
+    if (params.model.path.empty()) {
+        return false;
+    }
+    const std::string root = parent_dir(params.model.path);
+    if (root.empty()) {
+        return false;
+    }
+    if (params.vpm_model.empty()) {
+        params.vpm_model = root + "/vision/MiniCPM-o-4_5-vision-F16.gguf";
+    }
+    if (params.apm_model.empty()) {
+        params.apm_model = root + "/audio/MiniCPM-o-4_5-audio-F16.gguf";
+    }
+    if (params.tts_model.empty()) {
+        params.tts_model = root + "/tts/MiniCPM-o-4_5-tts-F16.gguf";
+    }
+    if (params.tts_bin_dir.empty()) {
+        params.tts_bin_dir = root + "/tts";
+    }
+    return true;
+}
+
 struct omni_server_state {
     omni_context * octx = nullptr;    // WS backend uses this as shared_octx
     std::mutex octx_mutex;            // protects omni_context lifecycle + prefill/decode entry
@@ -119,8 +147,6 @@ int main(int argc, char ** argv) {
         int media_type = data.value("msg_type", data.value("media_type", 2));
         bool use_tts   = data.value("use_tts", true);
         bool duplex_mode = data.value("duplex_mode", false);
-        std::string model_dir  = data.value("model_dir", "./tools/omni/convert/gguf/");
-        std::string tts_bin_dir = data.value("tts_bin_dir", model_dir + "/tts");
         int tts_gpu_layers = data.value("tts_gpu_layers", 100);
         std::string token2wav_device = data.value("token2wav_device", "gpu:0");
         std::string output_dir = data.value("output_dir", "./tools/omni/output");
@@ -138,18 +164,12 @@ int main(int argc, char ** argv) {
             return true;
         };
 
-        // Resolve omni model paths from `model_dir` (parity with old feat/web-demo
-        // server.cpp). common_params has no CLI parser for vpm/apm/tts paths,
-        // so they must be filled in here; otherwise omni_init() inside hits
-        // `apm_model.empty()` and returns NULL.
-        std::string model_dir_norm = model_dir;
-        if (!model_dir_norm.empty() &&
-            model_dir_norm.back() != '/' && model_dir_norm.back() != '\\') {
-            model_dir_norm += '/';
+        // Keep legacy HTTP aligned with /backend: the LLM path (-m) anchors the
+        // fixed MiniCPM-o sub-model layout; request model_dir is ignored.
+        if (!ensure_omni_model_paths_from_llm(params)) {
+            res_error(res, format_error_response("LLM model path (-m) is required to derive omni model paths"));
+            return;
         }
-        params.vpm_model = model_dir_norm + "vision/MiniCPM-o-4_5-vision-F16.gguf";
-        params.apm_model = model_dir_norm + "audio/MiniCPM-o-4_5-audio-F16.gguf";
-        params.tts_model = model_dir_norm + "tts/MiniCPM-o-4_5-tts-F16.gguf";
 
         if (!check_file("LLM",    params.model.path) ||
             !check_file("vision", params.vpm_model)  ||
@@ -166,7 +186,7 @@ int main(int argc, char ** argv) {
             }
         }
 
-        omni_context * octx = omni_init(&params, media_type, use_tts, tts_bin_dir, tts_gpu_layers,
+        omni_context * octx = omni_init(&params, media_type, use_tts, params.tts_bin_dir, tts_gpu_layers,
                                          token2wav_device, duplex_mode,
                                          /*existing_model=*/nullptr, /*existing_ctx=*/nullptr, output_dir);
         if (!octx) {
