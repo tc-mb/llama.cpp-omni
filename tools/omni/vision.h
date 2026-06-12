@@ -93,6 +93,9 @@ struct vision_image_u8        * vision_image_u8_init (void);
 struct vision_image_f32       * vision_image_f32_init(void);
 struct vision_image_f32_batch * vision_image_f32_batch_init(void);
 
+// decode an encoded image (PNG/JPEG/...) from memory into a vision_image_u8
+bool vision_image_load_from_bytes(const unsigned char * bytes, size_t bytes_length, struct vision_image_u8 * img);
+
 // vision query
 int vision_n_output_tokens(const struct vision_ctx * ctx);
 int vision_n_mmproj_embd(const struct vision_ctx * ctx);
@@ -103,6 +106,11 @@ bool vision_image_preprocess(struct vision_ctx * ctx, const struct vision_image_
 // vision forward
 bool vision_image_encode      (struct vision_ctx * ctx, int n_threads, struct vision_image_f32 * img, float * vec);
 bool vision_image_batch_encode(struct vision_ctx * ctx, int n_threads, const struct vision_image_f32_batch * imgs, float * vec);
+
+// batch encode 开关：是否对多个尺寸相同的 slice 启用批量编码优化
+// 默认关闭；只有大图/高清高刷等 slice 数较多的场景才建议开启
+void vision_set_batch_encode(struct vision_ctx * ctx, bool enable);
+bool vision_get_batch_encode(const struct vision_ctx * ctx);
 
 // CoreML / ANE support
 void vision_set_coreml_model_path(struct vision_ctx * ctx, const char * coreml_model_path);

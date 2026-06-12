@@ -207,6 +207,11 @@ struct vision_ctx {
     // 🔧 [高清模式] 运行时覆盖 max_slice_nums，-1 表示使用模型默认值
     int max_slice_nums_override = -1;
 
+    // 🔧 [batch encode 开关] 是否对多个尺寸相同的 slice 启用批量编码优化。
+    // 默认 false（关闭）—— 该优化只在大图/高清高刷等 slice 数较多时收益明显，
+    // 并非通用场景，因此需要显式开启。
+    bool batch_encode = false;
+
     // CoreML / ANE model path
     std::string coreml_model_path;
 
@@ -275,8 +280,8 @@ struct vision_graph {
     const vision_model & model;
     const vision_hparams & hparams;
 
-    // we only support single image per batch
-    const vision_image_f32 & img;
+    const vision_image_f32 & img; // reference image (all batched images must share dimensions)
+    const int batch_size;
 
     const int patch_size;
     const int n_patches_x;
@@ -293,11 +298,12 @@ struct vision_graph {
     ggml_context * ctx0;
     ggml_cgraph * gf;
 
-    vision_graph(vision_ctx * ctx, const vision_image_f32 & img) :
+    vision_graph(vision_ctx * ctx, const vision_image_f32 & img, int batch_size = 1) :
             ctx(ctx),
             model(ctx->model),
             hparams(model.hparams),
             img(img),
+            batch_size(batch_size),
             patch_size(hparams.patch_size),
             n_patches_x(img.nx / patch_size),
             n_patches_y(img.ny / patch_size),
@@ -319,13 +325,12 @@ struct vision_graph {
     }
 
     ggml_cgraph * build_minicpmv() {
-        const int batch_size = 1;
-
         const int n_pos = n_patches;
 
         // position embeddings for the projector (not for ViT)
+        // keep as [n_output_dim, n_pos, 1] even for batch>1, ggml_add broadcasts
         int n_output_dim = vision_n_mmproj_embd(ctx);
-        ggml_tensor * pos_embed = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_output_dim, n_pos, batch_size);
+        ggml_tensor * pos_embed = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_output_dim, n_pos, 1);
         ggml_set_name(pos_embed, "pos_embed");
         ggml_set_input(pos_embed);
 
@@ -343,6 +348,7 @@ struct vision_graph {
                                 hparams.ffn_op,
                                 learned_pos_embd,
                                 nullptr);
+        // embeddings shape: [n_embd, n_patches] (batch=1) or [n_embd, n_patches, batch_size] (batch>1)
 
         // resampler projector (it is just another transformer)
 
@@ -353,7 +359,7 @@ struct vision_graph {
         q = build_norm(q, model.mm_model_ln_q_w, model.mm_model_ln_q_b, NORM_TYPE_NORMAL, eps, -1);
         v = build_norm(v, model.mm_model_ln_kv_w, model.mm_model_ln_kv_b, NORM_TYPE_NORMAL, eps, -1);
 
-        // k = v + pos_embed
+        // k = v + pos_embed (pos_embed broadcasts over batch dim)
         ggml_tensor * k = ggml_add(ctx0, v, pos_embed);
 
         // attention
@@ -361,7 +367,6 @@ struct vision_graph {
             int n_embd = vision_n_mmproj_embd(ctx);
             const int d_head = 128;
             int n_head = n_embd/d_head;
-            // Use actual config value if available, otherwise fall back to hardcoded values
             int num_query = ctx->model.hparams.minicpmv_query_num;
             ggml_tensor * Q = ggml_add(ctx0,
                 ggml_mul_mat(ctx0, model.mm_model_attn_q_w, q),
@@ -374,8 +379,16 @@ struct vision_graph {
                 model.mm_model_attn_v_b);
 
             Q = ggml_reshape_3d(ctx0, Q, d_head, n_head, num_query);
-            K = ggml_reshape_3d(ctx0, K, d_head, n_head, n_pos);
-            V = ggml_reshape_3d(ctx0, V, d_head, n_head, n_pos);
+            if (batch_size > 1) {
+                K = ggml_reshape_4d(ctx0, K, d_head, n_head, n_pos, batch_size);
+                V = ggml_reshape_4d(ctx0, V, d_head, n_head, n_pos, batch_size);
+                // Q has no batch dim (shared query), expand via repeat for mul_mat broadcast compatibility
+                ggml_tensor * Q_target = ggml_new_tensor_4d(ctx0, Q->type, d_head, n_head, num_query, batch_size);
+                Q = ggml_repeat(ctx0, Q, Q_target);
+            } else {
+                K = ggml_reshape_3d(ctx0, K, d_head, n_head, n_pos);
+                V = ggml_reshape_3d(ctx0, V, d_head, n_head, n_pos);
+            }
 
             cb(Q, "resampler_Q", -1);
             cb(K, "resampler_K", -1);
@@ -775,9 +788,15 @@ private:
                     cb(Kcur, "Kcur_norm", il);
                 }
 
-                Qcur = ggml_reshape_3d(ctx0, Qcur, d_head, n_head, n_pos);
-                Kcur = ggml_reshape_3d(ctx0, Kcur, d_head, n_head, n_pos);
-                Vcur = ggml_reshape_3d(ctx0, Vcur, d_head, n_head, n_pos);
+                if (batch_size > 1) {
+                    Qcur = ggml_reshape_4d(ctx0, Qcur, d_head, n_head, n_pos, batch_size);
+                    Kcur = ggml_reshape_4d(ctx0, Kcur, d_head, n_head, n_pos, batch_size);
+                    Vcur = ggml_reshape_4d(ctx0, Vcur, d_head, n_head, n_pos, batch_size);
+                } else {
+                    Qcur = ggml_reshape_3d(ctx0, Qcur, d_head, n_head, n_pos);
+                    Kcur = ggml_reshape_3d(ctx0, Kcur, d_head, n_head, n_pos);
+                    Vcur = ggml_reshape_3d(ctx0, Vcur, d_head, n_head, n_pos);
+                }
 
                 cb(Qcur, "Qcur", il);
                 cb(Kcur, "Kcur", il);
@@ -840,11 +859,15 @@ private:
     }
 
     // build the input after conv2d (inp_raw --> patches)
-    // returns tensor with shape [n_embd, n_patches]
+    // returns tensor with shape [n_embd, n_patches] (batch=1) or [n_embd, n_patches, batch_size] (batch>1)
     ggml_tensor * build_inp() {
         ggml_tensor * inp_raw = build_inp_raw();
         ggml_tensor * inp = ggml_conv_2d(ctx0, model.patch_embeddings, inp_raw, patch_size, patch_size, 0, 0, 1, 1);
-        inp = ggml_reshape_2d(ctx0, inp, n_patches, n_embd);
+        if (batch_size > 1) {
+            inp = ggml_reshape_3d(ctx0, inp, n_patches, n_embd, batch_size);
+        } else {
+            inp = ggml_reshape_2d(ctx0, inp, n_patches, n_embd);
+        }
         inp = ggml_cont(ctx0, ggml_transpose(ctx0, inp));
         if (model.patch_bias) {
             inp = ggml_add(ctx0, inp, model.patch_bias);
@@ -854,7 +877,12 @@ private:
     }
 
     ggml_tensor * build_inp_raw(int channels = 3) {
-        ggml_tensor * inp_raw = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, img.nx, img.ny, channels);
+        ggml_tensor * inp_raw;
+        if (batch_size > 1) {
+            inp_raw = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, img.nx, img.ny, channels, batch_size);
+        } else {
+            inp_raw = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, img.nx, img.ny, channels);
+        }
         ggml_set_name(inp_raw, "inp_raw");
         ggml_set_input(inp_raw);
         return inp_raw;
@@ -1003,6 +1031,7 @@ private:
         {
             const auto n_tokens = q->ne[1];
             const auto n_head   = q->ne[2];
+            const auto n_batch  = q->ne[3];
             // const auto n_kv     = k->ne[1]; // for flash attention
 
             ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
@@ -1013,7 +1042,12 @@ private:
 
             ggml_tensor * kqv = ggml_mul_mat(ctx0, v, kq);
             cur = ggml_permute(ctx0, kqv, 0, 2, 1, 3);
-            cur = ggml_cont_2d(ctx0, cur, cur->ne[0]*n_head, n_tokens);
+            if (n_batch > 1) {
+                cur = ggml_cont(ctx0, cur);
+                cur = ggml_reshape_3d(ctx0, cur, cur->ne[0]*n_head, n_tokens, n_batch);
+            } else {
+                cur = ggml_cont_2d(ctx0, cur, cur->ne[0]*n_head, n_tokens);
+            }
         }
 
         cb(cur, "kqv_out", il);
@@ -1032,8 +1066,9 @@ private:
 };
 
 static ggml_cgraph * vision_image_build_graph(vision_ctx * ctx, const vision_image_f32_batch & imgs) {
-    GGML_ASSERT(imgs.entries.size() == 1 && "n_batch > 1 is not supported");
-    vision_graph graph(ctx, *imgs.entries[0]);
+    const int n_batch = (int)imgs.entries.size();
+    GGML_ASSERT(n_batch >= 1);
+    vision_graph graph(ctx, *imgs.entries[0], n_batch);
 
     ggml_cgraph * res;
 
@@ -2257,10 +2292,22 @@ bool vision_image_batch_encode(vision_ctx * ctx, const int n_threads, const visi
     const vision_image_f32_batch & imgs = *imgs_c_ptr;
     int batch_size = imgs.entries.size();
 
-    // TODO @ngxson : implement batch size > 1 as a loop
-    //                we don't need true batching support because the cgraph will gonna be big anyway
-    if (batch_size != 1) {
-        return false; // only support batch size of 1
+    if (batch_size < 1) {
+        return false;
+    }
+
+    // verify all images in batch have the same dimensions
+    if (batch_size > 1) {
+        const int ref_nx = imgs.entries[0]->nx;
+        const int ref_ny = imgs.entries[0]->ny;
+        for (int b = 1; b < batch_size; b++) {
+            if (imgs.entries[b]->nx != ref_nx || imgs.entries[b]->ny != ref_ny) {
+                LOG_ERR("%s: batch image %d has size %dx%d, expected %dx%d\n",
+                        __func__, b, imgs.entries[b]->nx, imgs.entries[b]->ny, ref_nx, ref_ny);
+                return false;
+            }
+        }
+        LOG_INF("%s: batched encoding %d images of size %dx%d\n", __func__, batch_size, ref_nx, ref_ny);
     }
 
     // build the inference graph
@@ -2307,40 +2354,22 @@ bool vision_image_batch_encode(vision_ctx * ctx, const int n_threads, const visi
         ggml_backend_tensor_set(cur, values.data(), 0, ggml_nbytes(cur));
     };
 
-    // set input pixel values
+    // set input pixel values for all images in the batch
     {
-        size_t nelem = 0;
-        for (const auto & img : imgs.entries) {
-            nelem += img->nx * img->ny * 3;
-        }
-        std::vector<float> inp_raw(nelem);
+        const int nx = imgs.entries[0]->nx;
+        const int ny = imgs.entries[0]->ny;
+        const int n = nx * ny;
+        std::vector<float> inp_raw(3 * n * batch_size);
 
-        // layout of data (note: the channel dim is unrolled to better visualize the layout):
-        //
-        // ┌──W──┐
-        // │     H │  channel = R
-        // ├─────┤ │
-        // │     H │  channel = G
-        // ├─────┤ │
-        // │     H │  channel = B
-        // └─────┘ │
-        //   ──────┘ x B
-
-        for (size_t i = 0; i < imgs.entries.size(); i++) {
-            const int nx = imgs.entries[i]->nx;
-            const int ny = imgs.entries[i]->ny;
-            const int n = nx * ny;
-
-            for (int b = 0; b < batch_size; b++) {
-                float * batch_entry = inp_raw.data() + b * (3*n);
-                for (int y = 0; y < ny; y++) {
-                    for (int x = 0; x < nx; x++) {
-                        size_t base_src = 3*(y * nx + x); // idx of the first channel
-                        size_t base_dst =    y * nx + x;  // idx of the first channel
-                        batch_entry[      base_dst] = imgs.entries[b]->buf[base_src    ];
-                        batch_entry[1*n + base_dst] = imgs.entries[b]->buf[base_src + 1];
-                        batch_entry[2*n + base_dst] = imgs.entries[b]->buf[base_src + 2];
-                    }
+        for (int b = 0; b < batch_size; b++) {
+            float * batch_entry = inp_raw.data() + b * (3 * n);
+            for (int y = 0; y < ny; y++) {
+                for (int x = 0; x < nx; x++) {
+                    size_t base_src = 3 * (y * nx + x);
+                    size_t base_dst =      y * nx + x;
+                    batch_entry[          base_dst] = imgs.entries[b]->buf[base_src    ];
+                    batch_entry[1 * n + base_dst]   = imgs.entries[b]->buf[base_src + 1];
+                    batch_entry[2 * n + base_dst]   = imgs.entries[b]->buf[base_src + 2];
                 }
             }
         }
@@ -2351,9 +2380,6 @@ bool vision_image_batch_encode(vision_ctx * ctx, const int n_threads, const visi
     switch (ctx->model.model_type) {
         case MiniCPM_o:
             {
-                // inspired from siglip:
-                //    -> https://huggingface.co/HuggingFaceM4/siglip-so400m-14-980-flash-attn2-navit
-                //    -> https://huggingface.co/HuggingFaceM4/siglip-so400m-14-980-flash-attn2-navit/blob/d66538faeba44480d0bfaa42145eef26f9423199/modeling_siglip.py#L316
                 std::vector<int32_t> positions(pos_h * pos_w);
                 int bucket_coords_h[1024];
                 int bucket_coords_w[1024];
@@ -2370,14 +2396,11 @@ bool vision_image_batch_encode(vision_ctx * ctx, const int n_threads, const visi
                 }
                 set_input_i32("positions", positions);
 
-                // inspired from resampler of Qwen-VL:
-                //    -> https://huggingface.co/Qwen/Qwen-VL/tree/main
-                //    -> https://huggingface.co/Qwen/Qwen-VL/blob/0547ed36a86561e2e42fecec8fd0c4f6953e33c4/visual.py#L23
                 int embed_dim = vision_n_mmproj_embd(ctx);
 
-                // TODO @ngxson : this is very inefficient, can we do this using ggml_sin and ggml_cos?
                 auto pos_embed_t = get_2d_sincos_pos_embed(embed_dim, std::make_pair(pos_w, pos_h));
 
+                // pos_embed is [embed_dim, n_pos, 1] — same for all batch elements (broadcast)
                 std::vector<float> pos_embed(embed_dim * pos_w * pos_h);
                 for(int i = 0; i < pos_w * pos_h; ++i){
                     for(int j = 0; j < embed_dim; ++j){
@@ -2494,15 +2517,13 @@ bool vision_image_batch_encode(vision_ctx * ctx, const int n_threads, const visi
         for (ggml_tensor * t : ctx->debug_print_tensors) {
             std::vector<uint8_t> data(ggml_nbytes(t));
             ggml_backend_tensor_get(t, data.data(), 0, ggml_nbytes(t));
-            // print_tensor_shape(t);
-            // print_tensor_data(t, data.data(), 3);
         }
     }
 
     // the last node is the embedding tensor
     ggml_tensor * embeddings = ggml_graph_node(gf, -1);
 
-    // sanity check (only support batch size of 1 for now)
+    // sanity check: output shape should be [embd_dim, n_tokens, batch_size]
     const int n_tokens_out = embeddings->ne[1];
     const int expected_n_tokens_out = vision_n_output_tokens_for_image(ctx, imgs.entries[0].get());
     if (n_tokens_out != expected_n_tokens_out) {
@@ -2511,6 +2532,7 @@ bool vision_image_batch_encode(vision_ctx * ctx, const int n_threads, const visi
     }
 
     // copy the embeddings to the location passed by the user
+    // for batch>1, output is contiguous: [embd * n_tokens * batch_size]
     ggml_backend_tensor_get(embeddings, vec, 0, ggml_nbytes(embeddings));
 
     return true;
@@ -2537,6 +2559,18 @@ void vision_set_max_slice_nums(struct vision_ctx * ctx, int max_slice_nums) {
         ctx->max_slice_nums_override = max_slice_nums;
         LOG_INF("%s: max_slice_nums_override set to %d\n", __func__, max_slice_nums);
     }
+}
+
+// 🔧 [batch encode 开关] 设置/读取多 slice 批量编码优化
+void vision_set_batch_encode(struct vision_ctx * ctx, bool enable) {
+    if (ctx) {
+        ctx->batch_encode = enable;
+        LOG_INF("%s: vision batch encode %s\n", __func__, enable ? "enabled" : "disabled");
+    }
+}
+
+bool vision_get_batch_encode(const struct vision_ctx * ctx) {
+    return ctx ? ctx->batch_encode : false;
 }
 
 //

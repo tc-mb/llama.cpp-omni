@@ -443,6 +443,7 @@ void omni_embed_free(struct omni_embed * embed) {
 
 // 🔧 [高清模式] 返回分离的 chunk embeds（二维 vector）
 // 返回值: vision_chunks[0] = overview, vision_chunks[1..n] = slices
+// 当 slice 数 > 1 时，使用 batched encoding 加速
 static bool encode_image_with_vision_chunks(vision_ctx * ctx_vision, int n_threads, const vision_image_u8 * img, 
                                             std::vector<std::vector<float>> & vision_chunks) {
     const int64_t t_img_enc_start_us = ggml_time_us();
@@ -457,36 +458,264 @@ static bool encode_image_with_vision_chunks(vision_ctx * ctx_vision, int n_threa
     
     int n_embd = vision_n_mmproj_embd(ctx_vision);
     int n_tokens = vision_n_output_tokens(ctx_vision);
+    const int n_total = (int)img_res_v.entries.size();
     
     vision_chunks.clear();
-    vision_chunks.resize(img_res_v.entries.size());
-    
-    for (size_t i = 0; i < img_res_v.entries.size(); i++) {
-        const int64_t t_img_enc_step_start_us = ggml_time_us();
-        
-        // 为每个 chunk 分配空间
-        vision_chunks[i].resize(n_embd * n_tokens);
-        
-        bool encoded = vision_image_encode(ctx_vision, n_threads, img_res_v.entries[i].get(), vision_chunks[i].data());
+    vision_chunks.resize(n_total);
+
+    // entry[0] is the overview image; entry[1..n] are slices (all same size)
+    // strategy: encode overview separately, batch all slices together
+    // 批量编码优化由 vision_set_batch_encode 控制（默认关闭）。该优化只在
+    // 大图/高清高刷等 slice 数较多时收益明显，并非通用，因此需显式开启。
+    const int n_slices = n_total - 1;
+    const bool use_batched = vision_get_batch_encode(ctx_vision) && (n_slices > 1);
+
+    // 1) encode the overview image (entry 0)
+    {
+        const int64_t t_step_us = ggml_time_us();
+        vision_chunks[0].resize(n_embd * n_tokens);
+        bool encoded = vision_image_encode(ctx_vision, n_threads, img_res_v.entries[0].get(), vision_chunks[0].data());
         if (!encoded) {
-            LOG_ERR("Unable to encode image - spatial_unpad - subimage %d of %d\n", (int) i+1, (int) img_res_v.entries.size());
+            LOG_ERR("Unable to encode overview image\n");
             return false;
         }
-        const int64_t t_img_enc_steop_batch_us = ggml_time_us();
-        LOG_INF("%s: step %d of %d encoded in %8.2f ms\n", __func__, (int)i+1, (int)img_res_v.entries.size(), (t_img_enc_steop_batch_us - t_img_enc_step_start_us) / 1000.0);
+        LOG_INF("%s: overview encoded in %8.2f ms\n", __func__, (ggml_time_us() - t_step_us) / 1000.0);
     }
-    const int64_t t_img_enc_batch_us = ggml_time_us();
-    LOG_INF("%s: all %d chunks encoded in %8.2f ms (grid: %dx%d)\n", __func__, 
-            (int)img_res_v.entries.size(), (t_img_enc_batch_us - t_img_enc_start_us) / 1000.0,
-            img_res_v.grid_x, img_res_v.grid_y);
+
+    // 2) encode slices
+    if (n_slices > 0) {
+        if (use_batched) {
+            // batched encoding: group all slices into a single batch
+            const int64_t t_batch_us = ggml_time_us();
+            vision_image_f32_batch slice_batch;
+            for (int i = 1; i < n_total; i++) {
+                slice_batch.entries.push_back(std::move(img_res_v.entries[i]));
+            }
+
+            std::vector<float> batched_output(n_embd * n_tokens * n_slices);
+            bool encoded = vision_image_batch_encode(ctx_vision, n_threads, &slice_batch, batched_output.data());
+            if (!encoded) {
+                LOG_ERR("Unable to batch-encode %d slices\n", n_slices);
+                return false;
+            }
+
+            // split batched output into individual chunks
+            const int per_image_floats = n_embd * n_tokens;
+            for (int i = 0; i < n_slices; i++) {
+                vision_chunks[1 + i].resize(per_image_floats);
+                std::memcpy(vision_chunks[1 + i].data(),
+                            batched_output.data() + i * per_image_floats,
+                            per_image_floats * sizeof(float));
+            }
+
+            LOG_INF("%s: %d slices batch-encoded in %8.2f ms\n", __func__, n_slices, (ggml_time_us() - t_batch_us) / 1000.0);
+        } else {
+            // serial path: encode every slice individually (entries[1..n_total-1])
+            const int64_t t_step_us = ggml_time_us();
+            for (int i = 1; i < n_total; i++) {
+                vision_chunks[i].resize(n_embd * n_tokens);
+                bool encoded = vision_image_encode(ctx_vision, n_threads, img_res_v.entries[i].get(), vision_chunks[i].data());
+                if (!encoded) {
+                    // entries[i] is the i-th slice (entry 0 is the overview), so the
+                    // 1-based slice number equals i, out of n_slices total.
+                    LOG_ERR("Unable to encode slice %d of %d\n", i, n_slices);
+                    return false;
+                }
+            }
+            LOG_INF("%s: %d slice(s) encoded serially in %8.2f ms\n", __func__, n_slices, (ggml_time_us() - t_step_us) / 1000.0);
+        }
+    }
 
     const int64_t t_img_enc_end_us = ggml_time_us();
     float t_img_enc_ms = (t_img_enc_end_us - t_img_enc_start_us) / 1000.0;
-    int total_tokens = (int)vision_chunks.size() * n_tokens;
-    LOG_INF("\n%s: image encoded in %8.2f ms by vision (%8.2f ms per chunk, %d total tokens)\n", 
-            __func__, t_img_enc_ms, t_img_enc_ms / vision_chunks.size(), total_tokens);
+    int total_tokens = n_total * n_tokens;
+    LOG_INF("\n%s: image encoded in %8.2f ms by vision (%d chunks, %d total tokens, grid: %dx%d)\n", 
+            __func__, t_img_enc_ms, n_total, total_tokens,
+            img_res_v.grid_x, img_res_v.grid_y);
 
     return true;
+}
+
+static int query_gpu_memory_used_mb(int device_id = 0) {
+#ifdef GGML_USE_CUDA
+    size_t free_bytes = 0, total_bytes = 0;
+    ggml_backend_cuda_get_device_memory(device_id, &free_bytes, &total_bytes);
+    if (total_bytes == 0) return -1;
+    return (int)((total_bytes - free_bytes) / (1024 * 1024));
+#else
+    (void) device_id;
+    return -1;
+#endif
+}
+
+void omni_bench_vision(struct vision_ctx * ctx_vision, int n_threads, const char * image_path) {
+    unsigned char* image_bytes;
+    long image_bytes_length;
+    if (!load_file_to_bytes(image_path, &image_bytes, &image_bytes_length)) {
+        LOG_ERR("bench: failed to load %s\n", image_path);
+        return;
+    }
+    vision_image_u8 * img = vision_image_u8_init();
+    if (!vision_image_load_from_bytes(image_bytes, image_bytes_length, img)) {
+        vision_image_u8_free(img);
+        free(image_bytes);
+        LOG_ERR("bench: can't load image\n");
+        return;
+    }
+    free(image_bytes);
+
+    int n_embd = vision_n_mmproj_embd(ctx_vision);
+    int n_tokens = vision_n_output_tokens(ctx_vision);
+    const int per_image_floats = n_embd * n_tokens;
+    const int bench_runs = 3;
+
+    const int baseline_vram = query_gpu_memory_used_mb();
+    LOG_INF("\n================================================================\n");
+    LOG_INF("  Vision Encoding Benchmark: Serial vs Batched (GPU %d)\n", 0);
+    LOG_INF("================================================================\n");
+    LOG_INF("Image: %s\n", image_path);
+    LOG_INF("Per-slice: %d embd x %d tokens = %d floats (%.1f MB)\n",
+            n_embd, n_tokens, per_image_floats, per_image_floats * 4.0f / 1048576.0f);
+    LOG_INF("Baseline VRAM: %d MB\n", baseline_vram);
+    LOG_INF("NOTE: VRAM figures are device-wide (cudaMemGetInfo), single-point samples, "
+            "NOT per-process peak; they include other processes on the same GPU.\n");
+    LOG_INF("Bench runs per config: %d\n\n", bench_runs);
+
+    struct bench_result {
+        int max_slice_cfg;
+        int actual_slices;
+        int grid_x, grid_y;
+        double serial_ms;
+        double batch_ms;
+        double speedup;
+        int vram_serial_mb;
+        int vram_batch_mb;
+        double max_diff;
+        double avg_diff;
+    };
+    std::vector<bench_result> results;
+
+    const int slice_configs[] = {1, 2, 3, 4, 6, 8, 9, 12, 16, 20, 25, 30, 36};
+    const int n_configs = sizeof(slice_configs) / sizeof(slice_configs[0]);
+
+    // warmup with 1 slice
+    vision_set_max_slice_nums(ctx_vision, 1);
+    {
+        vision_image_f32_batch warmup_batch;
+        vision_image_preprocess(ctx_vision, img, &warmup_batch);
+        if (!warmup_batch.entries.empty()) {
+            std::vector<float> tmp(per_image_floats);
+            vision_image_encode(ctx_vision, n_threads, warmup_batch.entries[0].get(), tmp.data());
+        }
+    }
+
+    for (int ci = 0; ci < n_configs; ci++) {
+        int max_s = slice_configs[ci];
+        vision_set_max_slice_nums(ctx_vision, max_s);
+
+        vision_image_f32_batch img_res_v;
+        if (!vision_image_preprocess(ctx_vision, img, &img_res_v)) {
+            LOG_ERR("bench: preprocess failed for max_slice=%d\n", max_s);
+            continue;
+        }
+
+        const int n_total = (int)img_res_v.entries.size();
+        const int n_slices = n_total - 1;
+
+        if (n_slices < 2) {
+            LOG_INF("[max_slice=%2d] grid=%dx%d => %d slice(s), skipping (need >=2)\n",
+                    max_s, img_res_v.grid_x, img_res_v.grid_y, n_slices);
+            continue;
+        }
+
+        LOG_INF("\n--- max_slice_nums=%2d => grid=%dx%d, %d slices ---\n",
+                max_s, img_res_v.grid_x, img_res_v.grid_y, n_slices);
+
+        bench_result br;
+        br.max_slice_cfg = max_s;
+        br.actual_slices = n_slices;
+        br.grid_x = img_res_v.grid_x;
+        br.grid_y = img_res_v.grid_y;
+
+        // --- serial encoding ---
+        std::vector<std::vector<float>> serial_out(n_slices);
+        double serial_total = 0;
+        for (int r = 0; r < bench_runs; r++) {
+            const int64_t t0 = ggml_time_us();
+            for (int i = 0; i < n_slices; i++) {
+                serial_out[i].resize(per_image_floats);
+                vision_image_encode(ctx_vision, n_threads, img_res_v.entries[1 + i].get(), serial_out[i].data());
+            }
+            double ms = (ggml_time_us() - t0) / 1000.0;
+            serial_total += ms;
+            LOG_INF("  serial  run %d: %8.2f ms\n", r, ms);
+        }
+        br.serial_ms = serial_total / bench_runs;
+        br.vram_serial_mb = query_gpu_memory_used_mb();
+
+        // --- batched encoding ---
+        std::vector<float> batch_out(per_image_floats * n_slices);
+        double batch_total = 0;
+        for (int r = 0; r < bench_runs; r++) {
+            vision_image_f32_batch slice_batch;
+            for (int i = 0; i < n_slices; i++) {
+                vision_image_f32_ptr cp(new vision_image_f32(*img_res_v.entries[1 + i]));
+                slice_batch.entries.push_back(std::move(cp));
+            }
+            const int64_t t0 = ggml_time_us();
+            vision_image_batch_encode(ctx_vision, n_threads, &slice_batch, batch_out.data());
+            double ms = (ggml_time_us() - t0) / 1000.0;
+            batch_total += ms;
+            LOG_INF("  batched run %d: %8.2f ms\n", r, ms);
+        }
+        br.batch_ms = batch_total / bench_runs;
+        br.vram_batch_mb = query_gpu_memory_used_mb();
+        br.speedup = br.serial_ms / br.batch_ms;
+
+        // --- correctness ---
+        double max_d = 0, sum_d = 0;
+        int n_vals = per_image_floats * n_slices;
+        for (int i = 0; i < n_slices; i++) {
+            for (int j = 0; j < per_image_floats; j++) {
+                double d = std::abs((double)serial_out[i][j] - (double)batch_out[i * per_image_floats + j]);
+                if (d > max_d) max_d = d;
+                sum_d += d;
+            }
+        }
+        br.max_diff = max_d;
+        br.avg_diff = sum_d / n_vals;
+
+        LOG_INF("  => serial=%7.1f ms  batch=%7.1f ms  speedup=%.2fx  vram_s=%dMB vram_b=%dMB  max_diff=%.3e avg_diff=%.3e\n",
+                br.serial_ms, br.batch_ms, br.speedup,
+                br.vram_serial_mb, br.vram_batch_mb, br.max_diff, br.avg_diff);
+
+        results.push_back(br);
+    }
+    vision_image_u8_free(img);
+
+    // === summary table ===
+    LOG_INF("\n\n================================================================\n");
+    LOG_INF("                      SUMMARY TABLE\n");
+    LOG_INF("================================================================\n");
+    LOG_INF("%-6s %-6s %-8s %-10s %-10s %-8s %-10s %-10s %-10s %-10s\n",
+            "MaxS", "Grid", "Slices", "Serial(ms)", "Batch(ms)", "Speedup",
+            "VRAM_S(MB)", "VRAM_B(MB)", "MaxDiff", "AvgDiff");
+    LOG_INF("%-6s %-6s %-8s %-10s %-10s %-8s %-10s %-10s %-10s %-10s\n",
+            "------", "------", "--------", "----------", "----------", "--------",
+            "----------", "----------", "----------", "----------");
+    for (auto & r : results) {
+        char grid_str[16];
+        snprintf(grid_str, sizeof(grid_str), "%dx%d", r.grid_x, r.grid_y);
+        LOG_INF("%-6d %-6s %-8d %-10.1f %-10.1f %-8.2f %-10d %-10d %-10.3e %-10.3e\n",
+                r.max_slice_cfg, grid_str, r.actual_slices,
+                r.serial_ms, r.batch_ms, r.speedup,
+                r.vram_serial_mb, r.vram_batch_mb,
+                r.max_diff, r.avg_diff);
+    }
+    LOG_INF("================================================================\n");
+    LOG_INF("Baseline VRAM (model loaded, no encoding): %d MB\n", baseline_vram);
+    LOG_INF("VRAM_S/VRAM_B are device-wide single-point samples (not per-process peak).\n");
+    LOG_INF("================================================================\n\n");
 }
 
 // 保留原有函数用于兼容（将所有 chunk 拼成一个 flat buffer）
@@ -4027,6 +4256,11 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
         const char * vision_path = ctx_omni->params->vpm_model.c_str();
         auto * ctx_vision = vision_init(vision_path, vision_context_params{true, GGML_LOG_LEVEL_INFO, nullptr});
         ctx_omni->ctx_vision = ctx_vision;
+
+        // 🔧 [batch encode 开关] 由 common_params 控制（默认关闭）
+        if (ctx_vision) {
+            vision_set_batch_encode(ctx_vision, ctx_omni->params->vpm_batch_encode);
+        }
 
         // Set CoreML model path if available (for vision ANE acceleration)
         // Note: .mlmodelc is a directory, not a file, so use stat instead of ifstream

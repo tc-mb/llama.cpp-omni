@@ -611,3 +611,6 @@ void sliding_window_reset(struct omni_context * ctx_omni);
 // ==================== 高清模式函数声明 ====================
 // 设置 vision max_slice_nums 覆盖值，用于高清模式
 void vision_set_max_slice_nums(struct vision_ctx * ctx_vision, int max_slice_nums);
+
+// benchmark: serial vs batched vision encoding
+void omni_bench_vision(struct vision_ctx * ctx_vision, int n_threads, const char * image_path);

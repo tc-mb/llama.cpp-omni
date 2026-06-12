@@ -138,7 +138,7 @@ MiniCPM-o-4_5-gguf/
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 
 # Build
-cmake --build build --target llama-omni-cli -j
+cmake --build build --target llama-omni-server --target llama-omni-cli -j
 ```
 
 > CMake will auto-detect and enable Metal (macOS) or CUDA (Linux with NVIDIA GPU).
@@ -174,7 +174,40 @@ cmake --build build --target llama-omni-cli -j
 | `-c, --ctx-size <n>` | Context size (default: 4096) |
 | `-ngl <n>` | Number of GPU layers (default: 99) |
 | `--no-tts` | Disable TTS output |
+| `--vision-batch-encode` | Encode same-size image slices in one batched pass (off by default; see below) |
 | `--test <prefix> <n>` | Run test with audio files |
+| `--bench-vision <img>` | Benchmark serial vs batched vision encoding on an image, then exit |
+
+### Vision Batch Encoding (optional optimization)
+
+For high-resolution / high-refresh inputs, an image is split into one overview plus
+many equally-sized slices, and each slice is encoded by the ViT. By default these
+slices are encoded **one at a time** (serial). `--vision-batch-encode` instead packs
+all same-size slices into a **single batched** ViT pass, which is significantly faster
+when there are many slices.
+
+- **When to enable**: large images / high-res / high-refresh modes, i.e. cases that
+  produce many slices. On a 4821×2259 image this gives roughly **1.5–2.3× faster**
+  vision encoding (more slices → larger speedup).
+- **Why it's off by default**: batched cuBLAS GEMM uses a different accumulation order
+  than per-slice GEMM, so the embeddings are *numerically very close but not bit-exact*
+  (avg diff ~1e-2). It also uses somewhat more VRAM. It is therefore opt-in rather than
+  a universal default.
+
+```bash
+# Enable the optimization
+./build/bin/llama-omni-cli \
+    -m /path/to/MiniCPM-o-4_5-gguf/MiniCPM-o-4_5-Q4_K_M.gguf \
+    --omni --vision-batch-encode
+
+# Benchmark serial vs batched (prints a per-slice-count comparison table)
+./build/bin/llama-omni-cli \
+    -m /path/to/MiniCPM-o-4_5-gguf/MiniCPM-o-4_5-Q4_K_M.gguf \
+    --bench-vision /path/to/large_image.png
+```
+
+Programmatically the same switch is exposed via `common_params.vpm_batch_encode`
+(applied in `omni_init`) and `vision_set_batch_encode(ctx_vision, true)`.
 
 ### Output
 
@@ -196,11 +229,11 @@ tools/omni/output/
 
 ## 🌐 Recommended Companion Demo — MiniCPM-o-Demo (Comni)
 
-For an out-of-the-box, end-to-end omni video-call experience built on top of `llama-server`, we recommend the **Comni** branch of the official demo:
+For an out-of-the-box, end-to-end omni video-call experience built on top of `llama-omni-server`, we recommend the **Comni** branch of the official demo:
 
 🔗 **[OpenBMB/MiniCPM-o-Demo @ Comni](https://github.com/OpenBMB/MiniCPM-o-Demo/tree/Comni)**
 
-It bundles a Python gateway + worker (which spawns and orchestrates `llama-server`) and a desktop + mobile React frontend, supporting **macOS (Metal)**, **Linux (CUDA)**, and **Windows (CUDA)**. Use it when you want a turnkey video-call demo without writing your own HTTP integration.
+It bundles a Python gateway + worker (which spawns and orchestrates `llama-omni-server`) and a desktop + mobile React frontend, supporting **macOS (Metal)**, **Linux (CUDA)**, and **Windows (CUDA)**. Use it when you want a turnkey video-call demo without writing your own HTTP integration.
 
 > 💡 **Don't want to compile?** Pre-built one-click installers (**Comni for Windows / macOS**) are available on the [llama.cpp-omni Releases page](https://github.com/tc-mb/llama.cpp-omni/releases).
 
@@ -213,7 +246,7 @@ If you already have the GGUF weights from [Prerequisites](#prerequisites):
 git clone https://github.com/tc-mb/llama.cpp-omni.git
 cd llama.cpp-omni && git checkout feat/web-demo \
     && cmake -B build -DCMAKE_BUILD_TYPE=Release \
-    && cmake --build build --target llama-server -j
+    && cmake --build build --target llama-omni-server --target llama-omni-cli -j
 cd ..
 
 # 2. Set up the demo (Python venv + mobile frontend)
@@ -249,7 +282,7 @@ gateway.py        :8040 (HTTPS)        ─┐
 worker.py         :22440 + i  GPU i    ─┘
     │  spawns + HTTP-calls
     ▼
-llama-server      :19080 + i  GPU i
+llama-omni-server      :19080 + i  GPU i
     /v1/stream/omni_init
     /v1/stream/update_session_config
     /v1/stream/prefill
@@ -259,17 +292,17 @@ llama-server      :19080 + i  GPU i
 
 ### Step-by-Step
 
-**1. Build `llama-server` from this repo**
+**1. Build `llama-omni-server` from this repo**
 
 ```bash
 git clone https://github.com/tc-mb/llama.cpp-omni.git
 cd llama.cpp-omni
 git checkout feat/web-demo
 cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build --target llama-server -j
+cmake --build build --target llama-omni-server --target llama-omni-cli -j
 ```
 
-CMake auto-detects CUDA (Linux + NVIDIA) and Metal (macOS). After the build, `build/bin/llama-server` is the binary `worker.py` will spawn — you do **not** need to start `llama-server` yourself.
+CMake auto-detects CUDA (Linux + NVIDIA) and Metal (macOS). After the build, `build/bin/llama-omni-server` is the binary `worker.py` will spawn — you do **not** need to start `llama-omni-server` yourself.
 
 **2. Install Python dependencies**
 
@@ -318,11 +351,11 @@ cp config.example.json config.json
 
 | Field | Purpose |
 |-------|---------|
-| `cpp_backend.llamacpp_root` | Absolute path to your `llama.cpp-omni` checkout. `worker.py` runs `${llamacpp_root}/build/bin/llama-server` and uses `${llamacpp_root}/tools/omni/output_<port>/` as the TTS WAV output dir |
+| `cpp_backend.llamacpp_root` | Absolute path to your `llama.cpp-omni` checkout. `worker.py` runs `${llamacpp_root}/build/bin/llama-omni-server` and uses `${llamacpp_root}/tools/omni/output_<port>/` as the TTS WAV output dir |
 | `cpp_backend.model_dir` | Absolute path to the GGUF directory (LLM + `audio/` + `tts/` + `vision/` + `token2wav-gguf/`) |
 | `cpp_backend.llm_model` | LLM filename inside `model_dir`. Pick the quantization you downloaded (`Q4_K_M` / `Q8_0` / `F16`) |
-| `cpp_backend.cpp_server_port` | HTTP port `worker.py` will start `llama-server` on. Worker `i` uses `cpp_server_port + i` |
-| `cpp_backend.ctx_size` / `n_gpu_layers` | Forwarded to `llama-server` as `--ctx-size` / `--n-gpu-layers` |
+| `cpp_backend.cpp_server_port` | HTTP port `worker.py` will start `llama-omni-server` on. Worker `i` uses `cpp_server_port + i` |
+| `cpp_backend.ctx_size` / `n_gpu_layers` | Forwarded to `llama-omni-server` as `--ctx-size` / `--n-gpu-layers` |
 
 **4. Build the mobile frontend (one-time)**
 
@@ -356,10 +389,10 @@ Then open:
 ### Stop
 
 ```bash
-pkill -f "gateway.py|worker.py|llama-server"
+pkill -f "gateway.py|worker.py|llama-omni-server"
 ```
 
-`worker.py` automatically restarts `llama-server` after each session (`full_reinit`) to keep KV cache state clean across runs.
+`worker.py` automatically restarts `llama-omni-server` after each session (`full_reinit`) to keep KV cache state clean across runs.
 
 ### Multi-GPU
 
@@ -369,13 +402,13 @@ Set `service.num_workers > 1` in `config.json` and pass the visible devices:
 CUDA_VISIBLE_DEVICES=0,1 bash start_all.sh
 ```
 
-Each worker is bound to its own GPU (via `CUDA_VISIBLE_DEVICES`) and spawns its own `llama-server` on `cpp_server_port + worker_index`.
+Each worker is bound to its own GPU (via `CUDA_VISIBLE_DEVICES`) and spawns its own `llama-omni-server` on `cpp_server_port + worker_index`.
 
 ### Troubleshooting
 
 | Symptom | Likely cause |
 |---------|--------------|
-| Worker log: `llama-server not found` | `cpp_backend.llamacpp_root` is wrong, or `cmake --build … --target llama-server` was not run |
+| Worker log: `llama-omni-server not found` | `cpp_backend.llamacpp_root` is wrong, or `cmake --build … --target llama-omni-server` was not run |
 | Worker `/health` stays at `worker_status: "loading"` for a long time | `omni_init` is still loading GGUF modules. Check `tmp/worker_<i>.log` for lines tagged `[CPP]` |
 | WAV files appear under `${llamacpp_root}/tools/omni/output_<port>/round_XXX/` but the browser plays nothing | The gateway is HTTP — many browsers block `Audio` / `MediaDevices` on insecure origins. Use the default HTTPS mode |
 | `kv_cache_length` keeps shrinking mid-conversation | C++ side sliding-window pruning is kicking in. The desktop and mobile UIs expose a "Stop on KV pruning" toggle (default on) that ends the session cleanly when this happens |
@@ -389,16 +422,16 @@ For more details and Chinese documentation, see the demo repo: [`README.md`](htt
 ## HTTP API & Integration Guide
 > 📝 This section is based on community integration experience.
 
-This section documents the HTTP API call sequence for integrating llama-server into your own application (e.g. a Tauri/Electron desktop app). The official CLI is a black box — if you want programmatic control, you need to call these endpoints directly.
+This section documents the HTTP API call sequence for integrating llama-omni-server into your own application (e.g. a Tauri/Electron desktop app). The official CLI is a black box — if you want programmatic control, you need to call these endpoints directly.
 
 > This guide is based on real-world integration experience. Several critical details are **not documented elsewhere**.
 
 ---
 
-### 1. Start llama-server
+### 1. Start llama-omni-server
 
 ```bash
-./llama-server \
+./llama-omni-server \
   --host 0.0.0.0 \
   --port 9060 \
   --model /path/to/MiniCPM-o-4_5-Q4_K_M.gguf \
@@ -536,7 +569,7 @@ output_dir/
 ### Full Call Sequence Summary
 
 ```
-start llama-server
+start llama-omni-server
     ↓
 GET /health  (poll until 200)
     ↓

@@ -2347,6 +2347,7 @@ static void ggml_cuda_mul_mat_batched_cublas_impl(ggml_backend_cuda_context & ct
                 nbd2, nbd3,
                 r2, r3);
         }
+
         CUDA_CHECK(cudaGetLastError());
 
         CUBLAS_CHECK(
