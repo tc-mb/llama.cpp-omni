@@ -33,7 +33,7 @@ Current GGUF files use the `voxcpm.*` metadata namespace. Old acoustic GGUF file
 
 ## Model Conversion
 
-Convert official PyTorch weights to GGUF format. The converter accepts either a direct model file or a model directory containing `model.safetensors` / `pytorch_model.bin`:
+Convert official PyTorch weights to GGUF format. The converter accepts a model file, a model directory containing `model.safetensors` / `pytorch_model.bin`, or a HuggingFace-style directory with `*.safetensors` files:
 
 ```bash
 cd tools/omni/voxcpm2
@@ -43,8 +43,21 @@ python convert_voxcpm2_to_gguf.py \
     --model /path/to/model.safetensors_or_pytorch_model.bin \
     --vae /path/to/audiovae.pth \
     --config /path/to/config.json \
-    --output /path/to/output
+    --output /path/to/output \
+    [--tokenizer-dir /path/to/tokenizer_dir] \
+    [--dtype f16|f32]
 ```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--model` | (required) | Model file (`model.safetensors`, `pytorch_model.bin`) or directory |
+| `--vae` | (required) | Path to `audiovae.pth` |
+| `--config` | (required) | Path to `config.json` |
+| `--output` | `./` | Output directory for GGUF files |
+| `--tokenizer-dir` | same as `--config` dir | Directory containing `tokenizer.json` / `tokenizer_config.json` |
+| `--dtype` | `f16` | Output weight dtype: `f16` or `f32` (use `f32` for quantization input) |
+
+The converter auto-detects model version from `config.json`'s `architecture` field and names output files accordingly.
 
 By default, this produces F16 GGUF files:
 
@@ -213,3 +226,129 @@ RTX 4090, F16 weights:
 | Short | 8 | 1.28s | 0.49s | 0.38 |
 | Short | 30 | 4.80s | 1.24s | 0.26 |
 | Long | ~100+ | ~16s+ | — | ~0.25–0.35 |
+
+## Online Serving (OpenAI-compatible API)
+
+The `llama-tts-server` provides a standalone OpenAI-compatible TTS endpoint at `/v1/audio/speech`, similar to vLLM-Omni. It runs independently without requiring an LLM model.
+
+### Build
+
+```bash
+cmake --build build -j$(nproc) --target llama-tts-server
+```
+
+### Start Server
+
+```bash
+./build/bin/llama-tts-server \
+    --voxcpm2-base-lm /path/to/VoxCPM2-BaseLM-F16.gguf \
+    --voxcpm2-acoustic /path/to/VoxCPM2-Acoustic-F16.gguf \
+    --port 8080
+```
+
+### Dynamic Loading (without restart)
+
+```bash
+curl -X POST http://localhost:8080/v1/voxcpm2/init \
+  -H "Content-Type: application/json" \
+  -d '{
+    "base_lm": "/path/to/VoxCPM2-BaseLM-F16.gguf",
+    "acoustic": "/path/to/VoxCPM2-Acoustic-F16.gguf",
+    "n_gpu_layers": -1
+  }'
+```
+
+### Basic TTS
+
+```bash
+curl http://localhost:8080/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "voxcpm",
+    "input": "Hello, welcome to VoxCPM2!",
+    "voice": "default"
+  }' \
+  --output out.wav
+```
+
+### Voice Design
+
+```bash
+curl http://localhost:8080/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "voxcpm",
+    "input": "(A young woman, gentle and sweet voice)Hello, welcome to VoxCPM2!",
+    "voice": "default"
+  }' \
+  --output voice_design.wav
+```
+
+### Voice Cloning
+
+Provide a base64-encoded reference WAV:
+
+```bash
+REF_B64=$(base64 -w0 speaker.wav)
+curl http://localhost:8080/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"model\": \"voxcpm2\",
+    \"input\": \"This is a cloned voice.\",
+    \"voice\": \"default\",
+    \"reference_audio\": \"$REF_B64\"
+  }" \
+  --output clone.wav
+```
+
+### Streaming
+
+```bash
+curl http://localhost:8080/v1/audio/speech/stream \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "voxcpm",
+    "input": "Streaming test with VoxCPM2.",
+    "voice": "default"
+  }' \
+  --output streaming.wav
+```
+
+### API Reference
+
+The `model` parameter accepts `"voxcpm"` (also accepts `"voxcpm2"` for backward compatibility). A single server instance loads one VoxCPM model at a time — the loaded version (0.5B, 1.5, or 2) depends on which GGUF files are provided at model loading or via `/v1/voxcpm2/init`.
+
+#### `POST /v1/audio/speech`
+
+OpenAI-compatible TTS endpoint.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `model` | string | — | Model identifier. Use `"voxcpm"` (supports VoxCPM-0.5B, VoxCPM-1.5, and VoxCPM2) |
+| `input` | string | (required) | Text to synthesize |
+| `voice` | string | `"default"` | Voice identifier (reserved) |
+| `response_format` | string | `"wav"` | Output format: `wav` or `pcm` |
+| `reference_audio` | string | — | Base64-encoded WAV for voice cloning |
+| `seed` | int | `42` | Random seed |
+| `cfg_value` | float | `2.0` | CFG guidance scale |
+| `inference_timesteps` | int | `10` | CFM inference timesteps |
+| `max_steps` | int | `200` | Max decode steps |
+| `temperature` | float | `1.0` | Noise temperature |
+
+#### `POST /v1/audio/speech/stream`
+
+Streaming variant. Returns chunked WAV audio as it's generated.
+
+#### `POST /v1/voxcpm2/init`
+
+Load or reload VoxCPM2 runtime dynamically.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `base_lm` | string | (required) | BaseLM GGUF path |
+| `acoustic` | string | (required) | Acoustic GGUF path |
+| `n_gpu_layers` | int | `-1` | GPU layers (-1 = all) |
+
+#### `GET /v1/audio/speech/models`
+
+List loaded VoxCPM2 model info.

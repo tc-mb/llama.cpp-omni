@@ -2642,6 +2642,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_HF_FILE_V"));
     add_opt(common_arg(
+        {"--voxcpm2-base-lm"}, "FNAME",
+        "VoxCPM2 BaseLM GGUF path for TTS serving (default: unused)",
+        [](common_params & params, const std::string & value) {
+            params.voxcpm2_base_lm = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_VOXCPM2_BASE_LM"));
+    add_opt(common_arg(
+        {"--voxcpm2-acoustic"}, "FNAME",
+        "VoxCPM2 Acoustic GGUF path for TTS serving (default: unused)",
+        [](common_params & params, const std::string & value) {
+            params.voxcpm2_acoustic = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_VOXCPM2_ACOUSTIC"));
+    add_opt(common_arg(
+        {"--voxcpm2-n-gpu-layers"}, "N",
+        "number of layers to offload to GPU for VoxCPM2 (default: -1, all)",
+        [](common_params & params, int value) {
+            params.voxcpm2_n_gpu_layers = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_VOXCPM2_N_GPU_LAYERS"));
+    add_opt(common_arg(
         {"-hft", "--hf-token"}, "TOKEN",
         "Hugging Face access token (default: value from HF_TOKEN environment variable)",
         [](common_params & params, const std::string & value) {
