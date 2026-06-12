@@ -2,6 +2,8 @@
 
 #include "log.h"
 
+#define GGML_KQ_MASK_PAD 256
+
 #include <algorithm>
 #include <cinttypes>
 #include <cmath>
@@ -540,7 +542,7 @@ ggml_tensor * voxcpm2_build_cfg_pair_positions(ggml_context * ctx, int branch_le
     const int     total_len = branch_len * 2;
     ggml_tensor * ids       = ggml_arange(ctx, 0.0f, static_cast<float>(total_len), 1.0f);
 
-    ggml_tensor * second_branch = ggml_add1(
+    ggml_tensor * second_branch = ggml_add(
         ctx, ids, ggml_arange(ctx, 0.5f - static_cast<float>(branch_len), 1.5f - static_cast<float>(branch_len), 1.0f));
     second_branch = ggml_scale(ctx, ggml_step(ctx, second_branch), static_cast<float>(branch_len));
     return ggml_cast(ctx, ggml_sub(ctx, ids, second_branch), GGML_TYPE_I32);
@@ -561,11 +563,11 @@ ggml_tensor * voxcpm2_build_cfg_pair_attention_mask(ggml_context * ctx, int bran
         ggml_sub(ctx, ggml_arange(ctx, 0.0f, static_cast<float>(padded_total_len), 1.0f), query_token_ids);
 
     ggml_tensor * key_branch_ids =
-        ggml_add1(ctx, key_token_ids, ggml_arange(ctx, branch_boundary, branch_boundary + 1.0f, 1.0f));
+        ggml_add(ctx, key_token_ids, ggml_arange(ctx, branch_boundary, branch_boundary + 1.0f, 1.0f));
     key_branch_ids = ggml_step(ctx, key_branch_ids);
 
     ggml_tensor * branch_ids =
-        ggml_add1(ctx, query_token_ids, ggml_arange(ctx, branch_boundary, branch_boundary + 1.0f, 1.0f));
+        ggml_add(ctx, query_token_ids, ggml_arange(ctx, branch_boundary, branch_boundary + 1.0f, 1.0f));
     branch_ids = ggml_step(ctx, branch_ids);
 
     ggml_tensor * key_ids   = ggml_reshape_2d(ctx, key_branch_ids, total_len, 1);

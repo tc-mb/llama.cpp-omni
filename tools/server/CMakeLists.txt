@@ -80,3 +80,20 @@ target_compile_features(${TARGET_OMNI} PRIVATE cxx_std_17)
 target_include_directories(${TARGET_OMNI} PRIVATE ${CMAKE_SOURCE_DIR})
 target_include_directories(${TARGET_OMNI} PRIVATE ${CMAKE_SOURCE_DIR}/vendor/cpp-httplib)
 target_include_directories(${TARGET_OMNI} PRIVATE ${CMAKE_SOURCE_DIR}/vendor)
+
+# llama-tts-server executable (standalone VoxCPM2 TTS HTTP API)
+
+set(TARGET_VOXCPM2 llama-tts-server)
+
+add_executable(${TARGET_VOXCPM2} server-voxcpm2.cpp)
+install(TARGETS ${TARGET_VOXCPM2} RUNTIME)
+
+target_link_libraries(${TARGET_VOXCPM2} PRIVATE voxcpm2_runtime llama-common cpp-httplib ${CMAKE_THREAD_LIBS_INIT})
+if (LLAMA_OPENSSL AND OpenSSL_FOUND)
+    target_link_libraries(${TARGET_VOXCPM2} PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+    target_compile_definitions(${TARGET_VOXCPM2} PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
+endif()
+target_compile_features(${TARGET_VOXCPM2} PRIVATE cxx_std_17)
+target_include_directories(${TARGET_VOXCPM2} PRIVATE ${CMAKE_SOURCE_DIR})
+target_include_directories(${TARGET_VOXCPM2} PRIVATE ${CMAKE_SOURCE_DIR}/vendor/cpp-httplib)
+target_include_directories(${TARGET_VOXCPM2} PRIVATE ${CMAKE_SOURCE_DIR}/vendor)

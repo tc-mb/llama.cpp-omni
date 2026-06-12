@@ -220,6 +220,7 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
         case LLM_ARCH_GRANITE_MOE:
             return new llama_model_granite_moe(params);
         case LLM_ARCH_MINICPM:
+        case LLM_ARCH_MINICPM4:
             return new llama_model_minicpm(params);
         case LLM_ARCH_GRANITE_HYBRID:
             return new llama_model_granite_hybrid(params);
@@ -1796,6 +1797,7 @@ void llama_model::print_info() const {
         }
 
         if (arch == LLM_ARCH_MINICPM ||
+                arch == LLM_ARCH_MINICPM4 ||
                 arch == LLM_ARCH_GRANITE ||
                 arch == LLM_ARCH_GRANITE_MOE ||
                 arch == LLM_ARCH_GRANITE_HYBRID ||
@@ -2359,6 +2361,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_EXAONE:
         case LLM_ARCH_EXAONE4:
         case LLM_ARCH_EXAONE_MOE:
+        case LLM_ARCH_MINICPM4:
         case LLM_ARCH_MINICPM3:
         case LLM_ARCH_BAILINGMOE2:
         case LLM_ARCH_DOTS1:

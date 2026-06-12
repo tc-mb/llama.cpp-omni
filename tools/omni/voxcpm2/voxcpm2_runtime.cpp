@@ -4,6 +4,8 @@
 #include "gguf.h"
 #include "log.h"
 
+#define GGML_KQ_MASK_PAD 256
+
 #include <algorithm>
 #include <cmath>
 #include <cstring>

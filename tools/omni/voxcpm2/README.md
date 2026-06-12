@@ -33,7 +33,7 @@ Current GGUF files use the `voxcpm.*` metadata namespace. Old acoustic GGUF file
 
 ## Model Conversion
 
-Convert official PyTorch weights to GGUF format. The converter accepts either a direct model file or a model directory containing `model.safetensors` / `pytorch_model.bin`:
+Convert official PyTorch weights to GGUF format. The converter accepts a model file, a model directory containing `model.safetensors` / `pytorch_model.bin`, or a HuggingFace-style directory with `*.safetensors` files:
 
 ```bash
 cd tools/omni/voxcpm2
@@ -43,8 +43,21 @@ python convert_voxcpm2_to_gguf.py \
     --model /path/to/model.safetensors_or_pytorch_model.bin \
     --vae /path/to/audiovae.pth \
     --config /path/to/config.json \
-    --output /path/to/output
+    --output /path/to/output \
+    [--tokenizer-dir /path/to/tokenizer_dir] \
+    [--dtype f16|f32]
 ```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--model` | (required) | Model file (`model.safetensors`, `pytorch_model.bin`) or directory |
+| `--vae` | (required) | Path to `audiovae.pth` |
+| `--config` | (required) | Path to `config.json` |
+| `--output` | `./` | Output directory for GGUF files |
+| `--tokenizer-dir` | same as `--config` dir | Directory containing `tokenizer.json` / `tokenizer_config.json` |
+| `--dtype` | `f16` | Output weight dtype: `f16` or `f32` (use `f32` for quantization input) |
+
+The converter auto-detects model version from `config.json`'s `architecture` field and names output files accordingly.
 
 By default, this produces F16 GGUF files:
 
@@ -216,28 +229,18 @@ RTX 4090, F16 weights:
 
 ## Online Serving (OpenAI-compatible API)
 
-The `llama-server` provides an OpenAI-compatible TTS endpoint at `/v1/audio/speech`, similar to vLLM-Omni.
+The `llama-tts-server` provides a standalone OpenAI-compatible TTS endpoint at `/v1/audio/speech`, similar to vLLM-Omni. It runs independently without requiring an LLM model.
 
 ### Build
 
 ```bash
-cmake --build build -j$(nproc) --target llama-server
+cmake --build build -j$(nproc) --target llama-tts-server
 ```
 
-### Start Server (VoxCPM2-only mode)
+### Start Server
 
 ```bash
-./build/bin/llama-server \
-    --voxcpm2-base-lm /path/to/VoxCPM2-BaseLM-F16.gguf \
-    --voxcpm2-acoustic /path/to/VoxCPM2-Acoustic-F16.gguf \
-    --port 8080
-```
-
-Or start with both a main LLM and VoxCPM2:
-
-```bash
-./build/bin/llama-server \
-    -m /path/to/llm.gguf \
+./build/bin/llama-tts-server \
     --voxcpm2-base-lm /path/to/VoxCPM2-BaseLM-F16.gguf \
     --voxcpm2-acoustic /path/to/VoxCPM2-Acoustic-F16.gguf \
     --port 8080
@@ -246,7 +249,7 @@ Or start with both a main LLM and VoxCPM2:
 ### Dynamic Loading (without restart)
 
 ```bash
-curl http://localhost:8080/v1/voxcpm2/init \
+curl -X POST http://localhost:8080/v1/voxcpm2/init \
   -H "Content-Type: application/json" \
   -d '{
     "base_lm": "/path/to/VoxCPM2-BaseLM-F16.gguf",

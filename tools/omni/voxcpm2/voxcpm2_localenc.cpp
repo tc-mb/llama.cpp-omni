@@ -174,5 +174,5 @@ ggml_tensor * LocEncModel::forward_sequence(ggml_context * ctx, ggml_tensor * in
     }
 
     sync = ggml_scale(ctx, sync, 0.0f);
-    return ggml_add1(ctx, output, sync);
+    return ggml_add(ctx, output, sync);
 }

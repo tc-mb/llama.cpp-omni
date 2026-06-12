@@ -52,6 +52,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_INTERNLM2,        "internlm2"        },
     { LLM_ARCH_MINICPM,          "minicpm"          },
     { LLM_ARCH_MINICPM3,         "minicpm3"         },
+    { LLM_ARCH_MINICPM4,         "minicpm4"         },
     { LLM_ARCH_GEMMA,            "gemma"            },
     { LLM_ARCH_GEMMA2,           "gemma2"           },
     { LLM_ARCH_GEMMA3,           "gemma3"           },
