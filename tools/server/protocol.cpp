@@ -278,6 +278,9 @@ ParsedSessionInit parse_session_init(const json & msg) {
     }
     out.mode = mode;
 
+    // use_tts — session-level TTS toggle (same name as server init /omni_init)
+    out.use_tts = json_bool(p, "use_tts", true);
+
     // voice (reference audio)
     if (p.contains("voice") && p.at("voice").is_object()) {
         const json & v = p.at("voice");

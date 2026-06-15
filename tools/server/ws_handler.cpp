@@ -523,9 +523,7 @@ static omni_context * create_session_octx(common_params & params, const ParsedSe
                                           const std::string & output_dir) {
     int media_type = 2; // omni
     bool duplex_mode = (init.mode == "full_duplex");
-    // Turn-based sessions may request TTS per input.append. Load the TTS-capable
-    // context up front, then toggle octx->use_tts per request.
-    bool use_tts = true;
+    bool use_tts = init.use_tts;
 
     // Build params for omni_init
     auto & p = params;
