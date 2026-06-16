@@ -1611,7 +1611,13 @@ std::vector<float> projector_forward(projector_model & model, const float * inpu
 
 // Load TTS weights from GGUF file
 bool load_tts_weights_from_gguf(struct omni_context * ctx_omni, const char * tts_model_path) {
-    
+
+    // 解量化到 F32: 等同 ggml_get_type_traits(type)->to_float，F32 走 memcpy 快路径
+    auto ggml_tensor_to_f32 = [](const ggml_tensor * t, float * dst, int64_t n) {
+        if (t->type == GGML_TYPE_F32) { memcpy(dst, t->data, n * sizeof(float)); return; }
+        ggml_get_type_traits(t->type)->to_float(t->data, dst, n);
+    };
+
     // Initialize GGUF context
     struct ggml_context * ctx_meta = NULL;
     struct gguf_init_params params = {
@@ -1670,23 +1676,7 @@ bool load_tts_weights_from_gguf(struct omni_context * ctx_omni, const char * tts
             enum ggml_type emb_code_type = emb_code_tensor->type;
             int64_t emb_code_elements = dim0 * dim1;
             
-            if (emb_code_type == GGML_TYPE_F32) {
-                // F32: direct copy
-                memcpy(ctx_omni->emb_code_weight, emb_code_tensor->data, emb_code_size);
-            } else if (emb_code_type == GGML_TYPE_F16) {
-                // F16: convert to F32
-                const ggml_fp16_t * src_f16 = (const ggml_fp16_t *)emb_code_tensor->data;
-                for (int64_t i = 0; i < emb_code_elements; ++i) {
-                    ctx_omni->emb_code_weight[i] = ggml_fp16_to_fp32(src_f16[i]);
-                }
-            } else {
-                LOG_ERR("TTS: emb_code.0.weight has unsupported type: %d\n", emb_code_type);
-                free(ctx_omni->emb_code_weight);
-                ctx_omni->emb_code_weight = nullptr;
-                ggml_free(ctx_meta);
-                gguf_free(ctx_gguf);
-                return false;
-            }
+            ggml_tensor_to_f32(emb_code_tensor, ctx_omni->emb_code_weight, dim0 * dim1);
             
             ctx_omni->emb_code_vocab_size = num_audio_tokens;  // 6562
             ctx_omni->emb_code_hidden_size = hidden_size;     // 768
@@ -1768,23 +1758,7 @@ bool load_tts_weights_from_gguf(struct omni_context * ctx_omni, const char * tts
             enum ggml_type emb_text_type = emb_text_tensor->type;
             int64_t emb_text_elements = vocab_size * hidden_size;
             
-            if (emb_text_type == GGML_TYPE_F32) {
-                // F32: direct copy
-                memcpy(ctx_omni->emb_text_weight, emb_text_tensor->data, emb_text_size);
-            } else if (emb_text_type == GGML_TYPE_F16) {
-                // F16: convert to F32
-                const ggml_fp16_t * src_f16 = (const ggml_fp16_t *)emb_text_tensor->data;
-                for (int64_t i = 0; i < emb_text_elements; ++i) {
-                    ctx_omni->emb_text_weight[i] = ggml_fp16_to_fp32(src_f16[i]);
-                }
-            } else {
-                LOG_ERR("TTS: emb_text.weight has unsupported type: %d\n", emb_text_type);
-                free(ctx_omni->emb_text_weight);
-                ctx_omni->emb_text_weight = nullptr;
-                ggml_free(ctx_meta);
-                gguf_free(ctx_gguf);
-                return false;
-            }
+            ggml_tensor_to_f32(emb_text_tensor, ctx_omni->emb_text_weight, vocab_size * hidden_size);
             
             ctx_omni->emb_text_vocab_size = vocab_size;   // 152064
             ctx_omni->emb_text_hidden_size = hidden_size;  // 768
@@ -1897,64 +1871,24 @@ bool load_tts_weights_from_gguf(struct omni_context * ctx_omni, const char * tts
                     
                     // Transpose: src[out_dim][in_dim] -> dst[in_dim][out_dim], handling F16 if needed
                     float * dst_data = *projector_ptrs[i];
-                    if (proj_tensor_type == GGML_TYPE_F32) {
-                        const float * src_data = (const float *)tensor->data;
-                        for (int64_t out = 0; out < out_dim; out++) {
-                            for (int64_t in = 0; in < in_dim; in++) {
-                                dst_data[in * out_dim + out] = src_data[out * in_dim + in];
-                            }
+                    // 解量化到临时 buffer，再转置
+                    std::vector<float> tmp(dim0 * dim1);
+                    ggml_tensor_to_f32(tensor, tmp.data(), dim0 * dim1);
+                    for (int64_t out = 0; out < out_dim; out++) {
+                        for (int64_t in = 0; in < in_dim; in++) {
+                            dst_data[in * out_dim + out] = tmp[out * in_dim + in];
                         }
-                    } else if (proj_tensor_type == GGML_TYPE_F16) {
-                        const ggml_fp16_t * src_data = (const ggml_fp16_t *)tensor->data;
-                        for (int64_t out = 0; out < out_dim; out++) {
-                            for (int64_t in = 0; in < in_dim; in++) {
-                                dst_data[in * out_dim + out] = ggml_fp16_to_fp32(src_data[out * in_dim + in]);
-                            }
-                        }
-                    } else {
-                        LOG_ERR("TTS: %s has unsupported type: %d\n", projector_names[i], proj_tensor_type);
-                        free(*projector_ptrs[i]);
-                        *projector_ptrs[i] = nullptr;
-                        ggml_free(ctx_meta);
-                        gguf_free(ctx_gguf);
-                        return false;
                     }
                 } else {
-                    // Direct copy (bias or already transposed weight), handle F16
                     int64_t num_elements = (dim1 > 0) ? dim0 * dim1 : dim0;
                     size_t output_size = num_elements * sizeof(float);
                     *projector_ptrs[i] = (float *)malloc(output_size);
                     if (!*projector_ptrs[i]) {
                         LOG_ERR("TTS: Failed to allocate memory for %s\n", projector_names[i]);
-                        // Clean up
-                        for (int j = 0; j < i; j++) {
-                            if (*projector_ptrs[j]) {
-                                free(*projector_ptrs[j]);
-                                *projector_ptrs[j] = nullptr;
-                            }
-                        }
-                        ggml_free(ctx_meta);
-                        gguf_free(ctx_gguf);
-                        return false;
+                        for (int j = 0; j < i; j++) { free(*projector_ptrs[j]); *projector_ptrs[j] = nullptr; }
+                        ggml_free(ctx_meta); gguf_free(ctx_gguf); return false;
                     }
-                    
-                    if (proj_tensor_type == GGML_TYPE_F32) {
-                        memcpy(*projector_ptrs[i], tensor->data, output_size);
-                    } else if (proj_tensor_type == GGML_TYPE_F16) {
-                        const ggml_fp16_t * src_f16 = (const ggml_fp16_t *)tensor->data;
-                        for (int64_t k = 0; k < num_elements; ++k) {
-                            (*projector_ptrs[i])[k] = ggml_fp16_to_fp32(src_f16[k]);
-                        }
-                    } else {
-                        LOG_ERR("TTS: %s has unsupported type: %d\n", projector_names[i], proj_tensor_type);
-                        free(*projector_ptrs[i]);
-                        *projector_ptrs[i] = nullptr;
-                        ggml_free(ctx_meta);
-                        gguf_free(ctx_gguf);
-                        return false;
-                    }
-                    if (dim1 > 0) {
-                    }
+                    ggml_tensor_to_f32(tensor, *projector_ptrs[i], num_elements);
                 }
             } else {
                 LOG_ERR("TTS: Failed to get tensor %s from GGUF context\n", projector_names[i]);
@@ -2094,30 +2028,13 @@ bool load_tts_weights_from_gguf(struct omni_context * ctx_omni, const char * tts
             print_with_timestamp("TTS: head_code shape: dim0=%ld, dim1=%ld, will transpose to [%ld, %ld]\n", 
                                 dim0, dim1, expected_num_audio_tokens, expected_hidden_size);
             
-            if (tensor_type == GGML_TYPE_F32) {
-                // F32: copy with transpose from [768, 6562] to [6562, 768]
-                for (int64_t i = 0; i < expected_num_audio_tokens; ++i) {
-                    for (int64_t j = 0; j < expected_hidden_size; ++j) {
-                        // src: [j * 6562 + i], dst: [i * 768 + j]
-                        ctx_omni->head_code_weight[i * expected_hidden_size + j] = src_data[j * expected_num_audio_tokens + i];
-                    }
+            // 解量化 + 转置: [hidden, audio_tokens] -> [audio_tokens, hidden]
+            std::vector<float> tmp(expected_hidden_size * expected_num_audio_tokens);
+            ggml_tensor_to_f32(head_code_tensor, tmp.data(), expected_hidden_size * expected_num_audio_tokens);
+            for (int64_t i = 0; i < expected_num_audio_tokens; ++i) {
+                for (int64_t j = 0; j < expected_hidden_size; ++j) {
+                    ctx_omni->head_code_weight[i * expected_hidden_size + j] = tmp[j * expected_num_audio_tokens + i];
                 }
-            } else if (tensor_type == GGML_TYPE_F16) {
-                // F16: convert to F32 with transpose
-                const ggml_fp16_t * src_f16 = (const ggml_fp16_t *)src_data;
-                for (int64_t i = 0; i < expected_num_audio_tokens; ++i) {
-                    for (int64_t j = 0; j < expected_hidden_size; ++j) {
-                        ctx_omni->head_code_weight[i * expected_hidden_size + j] = 
-                            ggml_fp16_to_fp32(src_f16[j * expected_num_audio_tokens + i]);
-                    }
-                }
-            } else {
-                LOG_ERR("TTS: head_code.0.weight has unsupported type: %d\n", tensor_type);
-                free(ctx_omni->head_code_weight);
-                ctx_omni->head_code_weight = nullptr;
-                ggml_free(ctx_meta);
-                gguf_free(ctx_gguf);
-                return false;
             }
             
             ctx_omni->head_code_hidden_size = expected_hidden_size;
