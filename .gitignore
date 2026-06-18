@@ -174,3 +174,6 @@ apps/
 # PyTorch checkpoint directories
 pt/
 tools/omni/**/pt/
+*.onnx
+*.plan
+MiniCPM-o/

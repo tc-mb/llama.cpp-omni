@@ -9678,6 +9678,20 @@ bool Token2Wav::load_models(const std::string & encoder_gguf,
 
     voc_runner_.model = &voc_model_;
     models_loaded_    = true;
+
+#ifdef USE_TRT_VOCODER
+    const char * trt_engine = std::getenv("OMNI_TRT_VOCODER_ENGINE");
+    if (trt_engine && trt_engine[0]) {
+        omni::vocoder::TRTVocoderConfig cfg;
+        cfg.engine_path = trt_engine;
+        cfg.T_mel       = 100;
+        if (trt_vocoder_.init(cfg)) {
+            use_trt_vocoder_ = true;
+            fprintf(stderr, "[TRT] TRT vocoder enabled: %s\n", trt_engine);
+        }
+    }
+#endif
+
     return true;
 }
 
@@ -9782,9 +9796,19 @@ bool Token2Wav::push_tokens_window(const int32_t *      tokens,
     std::vector<float> out_source_bt1;
     int64_t            out_T_source = 0;
     const auto t_voc0 = clock::now();
-    if (!voc_runner_.voc_hg2_runner_eval_stream(mel_in_bct, T_mel, voc_cache_source_bt1_, voc_Tc_, wave_bt_out,
-                                                out_T_audio, out_source_bt1, out_T_source)) {
-        LOG_ERROR( "Token2Wav.push_tokens_window: voc_hg2_runner_eval_stream failed\n");
+
+    bool voc_ok = false;
+#ifdef USE_TRT_VOCODER
+    if (use_trt_vocoder_) {
+        voc_ok = trt_vocoder_.infer(mel_in_bct.data(), (int)T_mel, wave_bt_out, out_T_audio);
+    } else
+#endif
+    {
+        voc_ok = voc_runner_.voc_hg2_runner_eval_stream(mel_in_bct, T_mel, voc_cache_source_bt1_, voc_Tc_, wave_bt_out,
+                                                         out_T_audio, out_source_bt1, out_T_source);
+    }
+    if (!voc_ok) {
+        LOG_ERROR( "Token2Wav.push_tokens_window: vocoder failed\n");
         return false;
     }
     const auto t_voc1 = clock::now();

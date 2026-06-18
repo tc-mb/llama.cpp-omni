@@ -2,6 +2,24 @@
 
 find_package(Threads REQUIRED)
 
+# TensorRT for TRT-accelerated vocoder
+option(USE_TRT_VOCODER "Use TensorRT for HiFi-GAN vocoder" OFF)
+if(USE_TRT_VOCODER)
+    find_path(TRT_INCLUDE_DIR NvInfer.h
+              PATHS /usr/include/aarch64-linux-gnu /usr/local/tensorrt/include)
+    find_library(TRT_NVINFER_LIB nvinfer
+                 PATHS /usr/lib/aarch64-linux-gnu /usr/local/tensorrt/lib)
+    find_library(TRT_CUDA_LIB cudart
+                 PATHS /usr/local/cuda/lib64 /usr/local/cuda/targets/aarch64-linux/lib)
+    if(TRT_INCLUDE_DIR AND TRT_NVINFER_LIB AND TRT_CUDA_LIB)
+        message(STATUS "TensorRT found: ${TRT_INCLUDE_DIR}")
+        set(TRT_FOUND TRUE)
+    else()
+        message(WARNING "TensorRT not found — TRT vocoder disabled")
+        set(USE_TRT_VOCODER OFF)
+    endif()
+endif()
+
 # CoreML / ANE support option：在 macOS 上默认开，其它平台默认关
 if(APPLE)
     option(ENABLE_COREML "Enable CoreML/ANE support for vision encoder" ON)
@@ -47,6 +65,15 @@ endif()
 
 target_link_libraries     (omni PUBLIC ggml llama llama-common)
 target_link_libraries     (omni PRIVATE Threads::Threads)
+
+# TRT vocoder
+if(USE_TRT_VOCODER)
+    target_sources(omni PRIVATE trt_vocoder.cpp trt_vocoder.h)
+    target_include_directories(omni PRIVATE ${TRT_INCLUDE_DIR})
+    target_include_directories(omni PRIVATE /usr/local/cuda/targets/aarch64-linux/include)
+    target_link_libraries(omni PRIVATE ${TRT_NVINFER_LIB} ${TRT_CUDA_LIB})
+    target_compile_definitions(omni PRIVATE USE_TRT_VOCODER)
+endif()
 target_include_directories(omni PUBLIC  .)
 target_include_directories(omni PRIVATE ../..)
 target_include_directories(omni PRIVATE ../../vendor)
