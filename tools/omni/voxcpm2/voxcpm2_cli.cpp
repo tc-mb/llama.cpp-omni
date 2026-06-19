@@ -259,7 +259,26 @@ int main(int argc, char ** argv) {
     std::vector<float> wav;
     auto t_start = std::chrono::steady_clock::now();
 
-    if (!cfg.reference_wav_path.empty()) {
+    if (!cfg.prompt_wav_path.empty() && !cfg.prompt_text.empty()) {
+        // Continuation-mode voice cloning (reference transcript + prompt audio).
+        LOG_INF("Loading prompt WAV: %s\n", cfg.prompt_wav_path.c_str());
+        LOG_INF("  Prompt text: \"%s\"\n", cfg.prompt_text.c_str());
+        int                prompt_sr = 0;
+        std::vector<float> prompt_wav = load_wav_mono(cfg.prompt_wav_path, prompt_sr);
+        if (prompt_wav.empty()) {
+            LOG_ERR("Failed to load prompt WAV\n");
+            return 1;
+        }
+        LOG_INF("  Prompt: %.2fs, %d Hz\n",
+                static_cast<double>(prompt_wav.size()) / prompt_sr, prompt_sr);
+
+        params.reference_sample_rate = prompt_sr;
+        wav = runtime.generate_with_continuation(cfg.text, cfg.prompt_text, prompt_wav, params);
+        if (wav.empty()) {
+            LOG_ERR("Continuation cloning failed: %s\n", runtime.last_error().c_str());
+            return 1;
+        }
+    } else if (!cfg.reference_wav_path.empty()) {
         // Voice cloning mode
         LOG_INF("Loading reference WAV: %s\n", cfg.reference_wav_path.c_str());
         int ref_sr = 0;

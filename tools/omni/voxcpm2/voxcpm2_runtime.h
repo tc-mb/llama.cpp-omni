@@ -147,6 +147,10 @@ struct VoxCPM2Runtime {
     std::vector<float>   generate_with_clone(const std::string &           text,
                                              const std::vector<float> &    reference_wav,
                                              const VoxCPM2GenerateParams & params = {});
+    std::vector<float>   generate_with_continuation(const std::string &           target_text,
+                                                    const std::string &           prompt_text,
+                                                    const std::vector<float> &    prompt_wav,
+                                                    const VoxCPM2GenerateParams & params = {});
     bool                 generate_tokens_streaming(const std::vector<int32_t> &      token_ids,
                                                    const VoxCPM2AudioChunkCallback & callback,
                                                    const VoxCPM2GenerateParams &     params = {});
@@ -228,6 +232,10 @@ struct VoxCPM2Runtime {
                                                         const std::vector<float> &   reference_feat,
                                                         bool                         append_audio_start,
                                                         VoxCPM2PrefillInputs &       inputs);
+    bool                 build_continuation_prefill_inputs(const std::vector<int32_t> & text_token_ids,
+                                                           const std::vector<float> &   prompt_feat,
+                                                           bool                         append_audio_start,
+                                                           VoxCPM2PrefillInputs &       inputs);
     bool                 decode_streaming_from_ready_state(const VoxCPM2GenerateParams &     params,
                                                            const VoxCPM2AudioChunkCallback & callback);
     std::vector<int32_t> expand_multichar_cjk_tokens(const std::vector<int32_t> & ids) const;

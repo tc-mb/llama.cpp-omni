@@ -1560,6 +1560,74 @@ bool VoxCPM2Runtime::build_reference_prefill_inputs(const std::vector<int32_t> &
     return true;
 }
 
+bool VoxCPM2Runtime::build_continuation_prefill_inputs(const std::vector<int32_t> & text_token_ids,
+                                                       const std::vector<float> &   prompt_feat,
+                                                       bool                         append_audio_start,
+                                                       VoxCPM2PrefillInputs &       inputs) {
+    // Mirrors Python continuation mode (voxcpm2.py:589-623). The text segment
+    // (already the tokenized prompt_text + target_text concatenation) is laid on
+    // the text track, followed by audio_start, then the prompt-audio VAE features
+    // on the audio track. audio_start (token 101) marks the text/audio boundary.
+    inputs = {};
+    if (text_token_ids.empty()) {
+        return fail("text tokenization produced no tokens");
+    }
+
+    const int    patch_elems = feat_dim() * patch_size();
+    const size_t stride      = static_cast<size_t>(patch_elems);
+    if (patch_elems <= 0) {
+        return fail("invalid feat_dim or patch_size");
+    }
+    if (prompt_feat.empty() || (prompt_feat.size() % stride) != 0) {
+        return fail("prompt features must contain whole VoxCPM2 latent patches");
+    }
+
+    const int prompt_frames = static_cast<int>(prompt_feat.size() / stride);
+    if (prompt_frames <= 0) {
+        return fail("prompt features are empty");
+    }
+
+    // text region = [tokens..., audio_start]; matches Python text_length, which
+    // includes audio_start (text_token cat audio_start_token before text_length).
+    std::vector<int32_t> text_segment = text_token_ids;
+    if (append_audio_start && (text_segment.empty() || text_segment.back() != kAudioStartToken)) {
+        text_segment.push_back(kAudioStartToken);
+    }
+
+    const int text_length = static_cast<int>(text_segment.size());
+    const int seq_len      = text_length + prompt_frames;
+    inputs.token_ids.reserve(static_cast<size_t>(seq_len));
+    inputs.text_mask.reserve(static_cast<size_t>(seq_len));
+    inputs.feat_mask.reserve(static_cast<size_t>(seq_len));
+    inputs.audio_feat.reserve(static_cast<size_t>(seq_len) * stride);
+
+    const auto append_zero_patch = [&]() {
+        inputs.audio_feat.insert(inputs.audio_feat.end(), stride, 0.0f);
+    };
+
+    // Text region: text tokens (incl. audio_start), text_mask=1, feat_mask=0,
+    // zero audio patches (text_pad_feat in Python).
+    for (const int32_t token : text_segment) {
+        inputs.token_ids.push_back(token);
+        inputs.text_mask.push_back(1);
+        inputs.feat_mask.push_back(0);
+        append_zero_patch();
+    }
+
+    // Prompt-audio region: pad token 0 (prompt_pad_token), text_mask=0, feat_mask=1,
+    // carrying the prompt VAE features (prompt_feat) on the audio track.
+    for (int i = 0; i < prompt_frames; ++i) {
+        inputs.token_ids.push_back(0);
+        inputs.text_mask.push_back(0);
+        inputs.feat_mask.push_back(1);
+        const size_t offset = static_cast<size_t>(i) * stride;
+        inputs.audio_feat.insert(inputs.audio_feat.end(), prompt_feat.begin() + static_cast<std::ptrdiff_t>(offset),
+                                 prompt_feat.begin() + static_cast<std::ptrdiff_t>(offset + stride));
+    }
+
+    return true;
+}
+
 std::vector<float> VoxCPM2Runtime::generate_tokens(const std::vector<int32_t> &  token_ids,
                                                    const VoxCPM2GenerateParams & params) {
     clear_error();
@@ -1633,6 +1701,60 @@ std::vector<float> VoxCPM2Runtime::generate_with_clone(const std::string &      
     if (!last_error_msg.empty()) {
         return {};
     }
+    return decode_to_waveform(params.target_sr);
+}
+
+std::vector<float> VoxCPM2Runtime::generate_with_continuation(const std::string &           target_text,
+                                                             const std::string &           prompt_text,
+                                                             const std::vector<float> &    prompt_wav,
+                                                             const VoxCPM2GenerateParams & params) {
+    // Continuation-mode voice cloning (Python voxcpm2.py:589-623 / 668-676).
+    // Tokenize the CONCATENATED string (prompt_text + target_text) ONCE so that
+    // CJK multi-char expansion applies to the joined string — do NOT tokenize the
+    // two strings separately and concatenate token ids.
+    const std::string    joined_text = prompt_text + target_text;
+    std::vector<int32_t> token_ids   = tokenize_text(joined_text, false, true);
+    if (token_ids.empty()) {
+        if (last_error_msg.empty()) {
+            fail("text tokenization produced no tokens");
+        }
+        return {};
+    }
+
+    // VAE-encode the prompt audio with the existing reference-audio encoder.
+    std::vector<float> prompt_feat = encode_reference_audio(prompt_wav, params.reference_sample_rate);
+    if (prompt_feat.empty()) {
+        return {};
+    }
+
+    VoxCPM2PrefillInputs inputs;
+    if (!build_continuation_prefill_inputs(token_ids, prompt_feat, params.append_audio_start, inputs)) {
+        return {};
+    }
+
+    if (params.seed != 0) {
+        rng.seed(params.seed);
+    }
+    if (!prefill(inputs)) {
+        return {};
+    }
+    decode_loop(params, nullptr);
+    if (!last_error_msg.empty()) {
+        return {};
+    }
+
+    // Head-trim note (Python voxcpm2.py:947-948 / 668-676):
+    //   Python pre-seeds pred_feat_seq with the last (streaming_prefix_len - 1)
+    //   PROMPT audio patches (voxcpm2.py:1016-1020), decodes the whole sequence,
+    //   then trims patch_len*(streaming_prefix_len - 1) leading samples to drop
+    //   that regenerated prompt region.
+    //   This C++ runtime does NOT pre-seed output_pool: prefill() seeds only
+    //   prefix_feat_cond from the last prompt-audio patch (voxcpm2_runtime.cpp
+    //   ~930-936) while output_pool starts empty, and the decode loop appends
+    //   ONLY generated patches. decode_to_waveform() therefore already produces
+    //   exactly the generated region — equivalent to Python's POST-trim output.
+    //   So no explicit head-trim is applied here (same as the reference/clone
+    //   path, which also never pre-seeds nor trims).
     return decode_to_waveform(params.target_sr);
 }
 
