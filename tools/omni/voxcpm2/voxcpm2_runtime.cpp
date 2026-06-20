@@ -86,19 +86,6 @@ static std::vector<float> make_causal_mask(int n_tokens) {
     return mask;
 }
 
-static std::vector<float> make_kv_prefill_causal_mask(int total_len, int n_tokens, int n_past) {
-    const float neg_inf = -std::numeric_limits<float>::infinity();
-
-    std::vector<float> mask(static_cast<size_t>(total_len) * static_cast<size_t>(n_tokens), neg_inf);
-    for (int q = 0; q < n_tokens; ++q) {
-        const int max_key = std::min(total_len - 1, n_past + q);
-        for (int k = 0; k <= max_key; ++k) {
-            mask[static_cast<size_t>(k) + static_cast<size_t>(q) * static_cast<size_t>(total_len)] = 0.0f;
-        }
-    }
-    return mask;
-}
-
 static void copy_token(const std::vector<float> & src, int hidden, int token_idx, std::vector<float> & dst) {
     dst.resize(static_cast<size_t>(hidden));
     std::copy_n(src.data() + static_cast<size_t>(token_idx) * static_cast<size_t>(hidden), static_cast<size_t>(hidden),
@@ -495,15 +482,29 @@ std::vector<float> VoxCPM2ResidualLM::prefill_kv(const std::vector<float> & inpu
     ggml_tensor * input_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, config.hidden_size, seq_len);
     ggml_set_input(input_t);
 
-    ggml_tensor * output = voxcpm2_transformer_forward_prefill(ctx, config, weights, input_t, seq_len, kv_cache);
+    // Build the prefill causal mask explicitly and pass it in. (Previously the
+    // mask was created as a leaf input *inside* attention_forward_kv and the
+    // runtime tried to locate it by scanning graph op-nodes — but leaf inputs
+    // are not op-nodes, so the scan matched 0 tensors and the softmax ran with
+    // an uninitialized mask, corrupting the prefill output and the cached K/V.)
+    ggml_tensor * mask_t = nullptr;
+    if (seq_len > 1) {
+        mask_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, seq_len, GGML_PAD(seq_len, GGML_KQ_MASK_PAD));
+        ggml_set_input(mask_t);
+    }
 
-    // Build causal mask for the prefill attention (needed by attention_forward_kv when n_tokens > 1)
-    // The mask tensor is created inside attention_forward_kv, we need to find and fill it.
-    // Actually, the mask is created as an input tensor inside the graph — we need to set it after allocation.
+    std::vector<ggml_tensor *> cache_writes;
+    ggml_tensor * output =
+        voxcpm2_transformer_forward_prefill(ctx, config, weights, input_t, seq_len, kv_cache, mask_t, &cache_writes);
 
     ggml_cgraph * graph = ggml_new_graph_custom(ctx, kMediumGraphNodes, false);
     ggml_set_output(output);
     ggml_build_forward_expand(graph, output);
+    // Add KV cache writes as independent graph roots so they execute without
+    // feeding into (and thus perturbing) the attention output value.
+    for (ggml_tensor * w : cache_writes) {
+        ggml_build_forward_expand(graph, w);
+    }
 
     BackendBufferGuard buffer(ggml_backend_alloc_ctx_tensors(ctx, backend));
     if (!buffer.buffer) {
@@ -511,15 +512,9 @@ std::vector<float> VoxCPM2ResidualLM::prefill_kv(const std::vector<float> & inpu
     }
 
     ggml_backend_tensor_set(input_t, input.data(), 0, input.size() * sizeof(float));
-
-    // Find and set causal mask tensors created by attention_forward_kv
-    const std::vector<float> mask = make_kv_prefill_causal_mask(seq_len, seq_len, 0);
-    for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
-        ggml_tensor * node = ggml_graph_node(graph, i);
-        if (node->flags & GGML_TENSOR_FLAG_INPUT && node->type == GGML_TYPE_F32 && node->ne[0] == seq_len &&
-            node->ne[1] == seq_len && node != input_t) {
-            ggml_backend_tensor_set(node, mask.data(), 0, mask.size() * sizeof(float));
-        }
+    if (mask_t) {
+        const std::vector<float> mask = make_causal_mask(seq_len);
+        ggml_backend_tensor_set(mask_t, mask.data(), 0, mask.size() * sizeof(float));
     }
 
     if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) {
@@ -547,11 +542,18 @@ std::vector<float> VoxCPM2ResidualLM::forward_step(const std::vector<float> & in
     ggml_tensor * input_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, config.hidden_size);
     ggml_set_input(input_t);
 
-    ggml_tensor * output = voxcpm2_transformer_forward_step(ctx, config, weights, input_t, position, kv_cache);
+    std::vector<ggml_tensor *> cache_writes;
+    ggml_tensor * output =
+        voxcpm2_transformer_forward_step(ctx, config, weights, input_t, position, kv_cache, &cache_writes);
 
     ggml_cgraph * graph = ggml_new_graph_custom(ctx, kMediumGraphNodes, false);
     ggml_set_output(output);
     ggml_build_forward_expand(graph, output);
+    // Add KV cache writes as independent graph roots so the current token's K/V
+    // is committed to the cache without perturbing the decode output value.
+    for (ggml_tensor * w : cache_writes) {
+        ggml_build_forward_expand(graph, w);
+    }
 
     BackendBufferGuard buffer(ggml_backend_alloc_ctx_tensors(ctx, backend));
     if (!buffer.buffer) {
@@ -912,16 +914,13 @@ bool VoxCPM2Runtime::prefill(const VoxCPM2PrefillInputs & inputs) {
 
     // Store for debug/dump
 
-    // Use forward() for accurate residual_hidden (cos=0.999966 vs Python),
-    // then prefill_kv() solely to populate the KV cache for decode steps.
-    // prefill_kv() adds cache write ops to the graph that marginally alter
-    // GPU scheduling and accumulate ~0.65 max error in mu after projection,
-    // which cascades through LocDiT and the CFM Euler solver.
-    residual_hidden = residual_lm.forward_last(residual_fusion_input, seq_len);
+    // Single consistent path (mirrors PyTorch voxcpm2.py:1036-1041): the SAME
+    // forward that populates the ResidualLM KV cache also produces residual_hidden,
+    // so decode step 0 attends to exactly the K/V that produced the prefill output.
+    // prefill_kv() now returns the last hidden state of the prefill forward and the
+    // cache writes are pure graph sinks that do not perturb that value.
+    residual_hidden = residual_lm.prefill_kv(residual_fusion_input, seq_len);
     if (residual_hidden.size() != static_cast<size_t>(hidden)) {
-        return fail("ResidualLM forward failed");
-    }
-    if (residual_lm.prefill_kv(residual_fusion_input, seq_len).size() != static_cast<size_t>(hidden)) {
         return fail("ResidualLM KV cache prefill failed");
     }
 

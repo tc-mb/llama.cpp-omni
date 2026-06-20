@@ -823,7 +823,9 @@ static ggml_tensor * attention_forward_kv(ggml_context *                        
                                           int                                    layer_idx,
                                           int                                    n_tokens,
                                           int                                    n_past,
-                                          VoxCPM2KVCache &                       kv_cache) {
+                                          VoxCPM2KVCache &                       kv_cache,
+                                          std::vector<ggml_tensor *> &           cache_writes,
+                                          ggml_tensor *                          prefill_mask) {
     const int total_len = n_past + n_tokens;
 
     ggml_tensor * q = ggml_mul_mat(ctx, lw.wq, hidden);
@@ -837,18 +839,19 @@ static ggml_tensor * attention_forward_kv(ggml_context *                        
     q = apply_rope(ctx, cfg, weights, q, positions, total_len);
     k = apply_rope(ctx, cfg, weights, k, positions, total_len);
 
-    // Write current K/V to cache for future decode steps
+    // Write current K/V to cache for future decode steps. These cpy ops are
+    // pure sinks: the value computed below never reads the just-written cache
+    // slots (prefill reads fresh k/v; decode reads only [0..n_past-1] from the
+    // cache and concats with fresh k_cur). The caller adds these write tensors
+    // to the graph as independent roots so they execute without perturbing the
+    // attention output value — this keeps the KV-populating op graph numerically
+    // identical to the non-KV forward() that produces residual_hidden.
     ggml_tensor * k_write_target = kv_cache.get_k_write(ctx, layer_idx, n_past, n_tokens);
     ggml_tensor * v_write_target = kv_cache.get_v_write(ctx, layer_idx, n_past, n_tokens);
     ggml_tensor * k_write = ggml_cpy(ctx, k, k_write_target);
     ggml_tensor * v_write = ggml_cpy(ctx, v, v_write_target);
-
-    // Create a zero-valued sync tensor that depends on the writes.
-    // This ensures KV cache write ops are included in the graph and forces
-    // the graph scheduler to complete writes before reads in decode path.
-    ggml_tensor * kv_sync = ggml_add(ctx, ggml_sum(ctx, ggml_cont(ctx, k_write)),
-                                          ggml_sum(ctx, ggml_cont(ctx, v_write)));
-    kv_sync = ggml_scale(ctx, kv_sync, 0.0f);
+    cache_writes.push_back(k_write);
+    cache_writes.push_back(v_write);
 
     // Permute K/V for attention: [head_dim, n_kv_heads, n_tokens] → [head_dim, n_tokens, n_kv_heads]
     ggml_tensor * k_cur = ggml_permute(ctx, k, 0, 2, 1, 3);
@@ -872,12 +875,12 @@ static ggml_tensor * attention_forward_kv(ggml_context *                        
     ggml_tensor * kq = ggml_mul_mat(ctx, k_all, q);
     ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
 
-    // Causal mask: for prefill, need causal mask. For decode (n_tokens==1), no mask.
-    ggml_tensor * mask = nullptr;
-    if (n_tokens > 1) {
-        mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, total_len, n_tokens);
-        ggml_set_input(mask);
-    }
+    // Causal mask: for prefill (n_tokens > 1) the caller supplies an explicit
+    // mask tensor (leaf inputs created internally cannot be reliably located in
+    // the built graph, so they would never get filled). For decode (n_tokens==1)
+    // no mask is needed — the single query attends to all cached keys.
+    ggml_tensor * mask = (n_tokens > 1) ? prefill_mask : nullptr;
+    GGML_ASSERT(n_tokens <= 1 || mask != nullptr);
 
     kq = ggml_soft_max_ext(ctx, kq, mask, attn_scale, 0.0f);
 
@@ -885,11 +888,6 @@ static ggml_tensor * attention_forward_kv(ggml_context *                        
     ggml_tensor * kqv  = ggml_mul_mat(ctx, v_t, kq);
     ggml_tensor * attn = ggml_permute(ctx, kqv, 0, 2, 1, 3);
     attn               = ggml_cont_2d(ctx, attn, cfg.n_heads * cfg.head_dim, n_tokens);
-
-    // Add kv_sync to output to enforce write-before-read ordering AND to
-    // ensure KV cache write ops are included in the computation graph.
-    // kv_sync is [1] with value 0.0f; ggml_add broadcasts it to attn's shape.
-    attn = ggml_add(ctx, attn, kv_sync);
 
     return ggml_mul_mat(ctx, lw.wo, attn);
 }
@@ -901,9 +899,13 @@ ggml_tensor * voxcpm2_transformer_forward_step(ggml_context *                   
                                                const VoxCPM2TransformerWeights & weights,
                                                ggml_tensor *                     input,
                                                int                               position,
-                                               VoxCPM2KVCache &                  kv_cache) {
+                                               VoxCPM2KVCache &                  kv_cache,
+                                               std::vector<ggml_tensor *> *      cache_writes) {
     GGML_ASSERT(ctx != nullptr);
     GGML_ASSERT(input != nullptr);
+
+    std::vector<ggml_tensor *> local_writes;
+    std::vector<ggml_tensor *> & writes = cache_writes ? *cache_writes : local_writes;
 
     ggml_tensor * hidden = input;
     if (ggml_n_dims(hidden) == 1) {
@@ -918,8 +920,9 @@ ggml_tensor * voxcpm2_transformer_forward_step(ggml_context *                   
 
         ggml_tensor * residual = hidden;
         ggml_tensor * normed   = rms_norm(ctx, hidden, lw.attn_norm, cfg.rms_norm_eps);
-        ggml_tensor * attn_out = attention_forward_kv(ctx, cfg, weights, normed, positions, lw, i, 1, position, kv_cache);
-        hidden                 = ggml_add(ctx, residual, attn_out);
+        ggml_tensor * attn_out =
+            attention_forward_kv(ctx, cfg, weights, normed, positions, lw, i, 1, position, kv_cache, writes, nullptr);
+        hidden = ggml_add(ctx, residual, attn_out);
 
         residual              = hidden;
         normed                = rms_norm(ctx, hidden, lw.ffn_norm, cfg.rms_norm_eps);
@@ -936,10 +939,16 @@ ggml_tensor * voxcpm2_transformer_forward_prefill(ggml_context *                
                                                   const VoxCPM2TransformerWeights & weights,
                                                   ggml_tensor *                     input,
                                                   int                               n_tokens,
-                                                  VoxCPM2KVCache &                  kv_cache) {
+                                                  VoxCPM2KVCache &                  kv_cache,
+                                                  ggml_tensor *                     attention_mask,
+                                                  std::vector<ggml_tensor *> *      cache_writes) {
     GGML_ASSERT(ctx != nullptr);
     GGML_ASSERT(input != nullptr);
     GGML_ASSERT(input->ne[0] == cfg.hidden_size);
+    GGML_ASSERT(n_tokens <= 1 || attention_mask != nullptr);
+
+    std::vector<ggml_tensor *> local_writes;
+    std::vector<ggml_tensor *> & writes = cache_writes ? *cache_writes : local_writes;
 
     ggml_tensor * positions = voxcpm2_build_positions(ctx, n_tokens);
 
@@ -949,8 +958,9 @@ ggml_tensor * voxcpm2_transformer_forward_prefill(ggml_context *                
 
         ggml_tensor * residual = hidden;
         ggml_tensor * normed   = rms_norm(ctx, hidden, lw.attn_norm, cfg.rms_norm_eps);
-        ggml_tensor * attn_out = attention_forward_kv(ctx, cfg, weights, normed, positions, lw, i, n_tokens, 0, kv_cache);
-        hidden                 = ggml_add(ctx, residual, attn_out);
+        ggml_tensor * attn_out = attention_forward_kv(ctx, cfg, weights, normed, positions, lw, i, n_tokens, 0,
+                                                      kv_cache, writes, attention_mask);
+        hidden = ggml_add(ctx, residual, attn_out);
 
         residual              = hidden;
         normed                = rms_norm(ctx, hidden, lw.ffn_norm, cfg.rms_norm_eps);
