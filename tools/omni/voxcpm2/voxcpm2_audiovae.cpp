@@ -52,6 +52,30 @@ static ggml_tensor * reshape_conv1d_weight_2d(ggml_context * ctx, ggml_tensor * 
     return reshaped;
 }
 
+// Left-pad along dim 0 (the time axis) with `lp0` zeros.
+//
+// This is equivalent to ggml_pad_ext(ctx, x, lp0, 0, 0, 0, 0, 0, 0, 0), but the
+// Metal backend's GGML_OP_PAD kernel only implements *trailing* (right) padding
+// and rejects any non-zero left padding (lp0/lp1/lp2/lp3), aborting with
+// "unsupported op 'PAD'". Causal conv1d needs *leading* padding, so we build it
+// from Metal-supported ops instead: construct a zeros block of shape
+// [lp0, ne1, ne2, ne3] (a width-lp0 slice of x scaled by 0) and concat it in
+// front of x along dim 0. For causal conv the pad amount ((kernel-1)*dilation)
+// is always smaller than the sequence length, so the slice is well-defined.
+static ggml_tensor * left_pad_dim0(ggml_context * ctx, ggml_tensor * x, int lp0) {
+    if (lp0 <= 0) {
+        return x;
+    }
+    GGML_ASSERT(lp0 <= x->ne[0]);
+
+    ggml_tensor * slice = ggml_view_4d(ctx, x,
+                                       lp0, x->ne[1], x->ne[2], x->ne[3],
+                                       x->nb[1], x->nb[2], x->nb[3], 0);
+    ggml_tensor * zeros = ggml_scale(ctx, ggml_cont(ctx, slice), 0.0f);
+
+    return ggml_concat(ctx, zeros, x, 0);
+}
+
 static ggml_tensor * conv1d_mul_mat_impl(ggml_context * ctx,
                                          ggml_tensor *  weight,
                                          ggml_tensor *  input,
@@ -363,7 +387,7 @@ ggml_tensor * AudioVAEModel::causal_conv1d(ggml_context * ctx,
                                            int            padding) const {
     ggml_tensor * padded = x;
     if (padding > 0) {
-        padded = ggml_pad_ext(ctx, x, padding * 2, 0, 0, 0, 0, 0, 0, 0);
+        padded = left_pad_dim0(ctx, x, padding * 2);
     }
     ggml_tensor * result = conv1d_mul_mat_impl(ctx, weight, padded, kernel_size, stride, dilation);
     return add_bias_3d(ctx, result, bias);
@@ -378,7 +402,7 @@ ggml_tensor * AudioVAEModel::causal_conv1d_dw(ggml_context * ctx,
                                               int            padding) const {
     ggml_tensor * padded = x;
     if (padding > 0) {
-        padded = ggml_pad_ext(ctx, x, padding * 2, 0, 0, 0, 0, 0, 0, 0);
+        padded = left_pad_dim0(ctx, x, padding * 2);
     }
 
     ggml_tensor * result = ggml_conv_1d_dw(ctx, weight, padded, stride, 0, dilation);

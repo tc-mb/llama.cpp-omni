@@ -227,14 +227,7 @@ static void report_stats(const std::vector<float> & wav, int sample_rate, double
     LOG_INF("Elapsed: %.3fs, RTF=%.3f\n", elapsed_s, elapsed_s / dur);
 }
 
-}  // namespace
-
-int main(int argc, char ** argv) {
-    ggml_time_init();
-
-    CliConfig cfg;
-    if (!parse_args(argc, argv, cfg)) return 1;
-
+static int run_synthesis(const CliConfig & cfg) {
     LOG_INF("VoxCPM2 CLI — Text-to-Speech Synthesis\n");
     LOG_INF("  BaseLM:   %s\n", cfg.base_lm_path.c_str());
     LOG_INF("  Acoustic: %s\n", cfg.acoustic_path.c_str());
@@ -326,4 +319,21 @@ int main(int argc, char ** argv) {
     LOG_INF("WAV saved: %s\n", cfg.output_path.c_str());
 
     return 0;
+}
+
+}  // namespace
+
+int main(int argc, char ** argv) {
+    ggml_time_init();
+
+    CliConfig cfg;
+    if (!parse_args(argc, argv, cfg)) return 1;
+
+    const int rc = run_synthesis(cfg);
+
+    common_log_flush(common_log_main());
+    std::fflush(stdout);
+    std::fflush(stderr);
+
+    std::_Exit(rc);
 }
