@@ -191,6 +191,19 @@ if(LLAMA_TOOLS_INSTALL)
     install(TARGETS ${TARGET_VOXCPM2_CLI} RUNTIME)
 endif()
 
+# voxcpm2-cli build + smoke test (no weights). --help exits non-zero by design,
+# so assert on the usage banner instead of the exit code.
+if (LLAMA_BUILD_TESTS)
+    add_test(
+        NAME voxcpm2-cli-smoke
+        COMMAND ${TARGET_VOXCPM2_CLI} --help
+    )
+    set_tests_properties(voxcpm2-cli-smoke PROPERTIES
+        PASS_REGULAR_EXPRESSION "VoxCPM2"
+        LABELS "main;voxcpm2"
+    )
+endif()
+
 # Token2Mel-DiT CoreML 单元测试（仅 macOS + CoreML enable 时有效）
 if(ENABLE_COREML)
     set(TARGET_T2W_DIT_ANE_TEST llama-omni-test-t2w-dit-ane)
