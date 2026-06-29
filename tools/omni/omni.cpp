@@ -1613,7 +1613,16 @@ std::vector<float> projector_forward(projector_model & model, const float * inpu
 bool load_tts_weights_from_gguf(struct omni_context * ctx_omni, const char * tts_model_path) {
 
     auto ggml_tensor_to_f32 = [](const ggml_tensor * t, float * dst, int64_t n) {
-        ggml_get_type_traits(t->type)->to_float(t->data, dst, n);
+        if (t->type == GGML_TYPE_F32) {
+            memcpy(dst, t->data, (size_t)n * sizeof(float));
+            return;
+        }
+        const auto * traits = ggml_get_type_traits(t->type);
+        if (traits && traits->to_float) {
+            traits->to_float(t->data, dst, n);
+        } else {
+            LOG_ERR("TTS: no to_float converter for ggml type %d\n", (int)t->type);
+        }
     };
 
     // Initialize GGUF context
