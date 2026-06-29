@@ -6678,17 +6678,13 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
             llm_text.clear();
             response.clear();
             
-            // Handle final chunk
             if (llm_finish) {
-                tts_finish = true;
-                ctx_omni->speek_done = true;
-                ctx_omni->warmup_done = true;
-                speek_cv.notify_all();
-                
-                merge_wav_files(tts_wav_output_dir, chunk_idx + 1);
-                
-                if (ctx_omni->duplex_mode && !accumulated_is_end_of_turn) {
-                    // LISTEN/CHUNK_EOS: 保持 TTS 状态
+                const bool duplex_mid_chunk =
+                    ctx_omni->duplex_mode && !accumulated_is_end_of_turn;
+
+                if (duplex_mid_chunk) {
+                    ctx_omni->speek_done = false;
+                    ctx_omni->warmup_done = true;
                     if (ctx_omni->t2w_thread_info) {
                         T2WOut *t2w_out = new T2WOut();
                         t2w_out->audio_tokens.clear();
@@ -6705,6 +6701,13 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
                     tts_finish = false;
                 } else {
                     // 真正的轮次结束
+                    tts_finish = true;
+                    ctx_omni->speek_done = true;
+                    ctx_omni->warmup_done = true;
+                    speek_cv.notify_all();
+
+                    merge_wav_files(tts_wav_output_dir, chunk_idx + 1);
+
                     if (ctx_omni->t2w_thread_info && !turn_eos_flushed) {
                         T2WOut *t2w_out = new T2WOut();
                         t2w_out->audio_tokens.clear();
@@ -6724,6 +6727,7 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
                     ctx_omni->tts_n_past_accumulated = 0;
                     ctx_omni->tts_all_generated_tokens.clear();
                     ctx_omni->tts_condition_saved = false;
+                    chunk_idx = 0;
                     tts_n_past = 0;
                     audio_tokens.clear();
                     all_audio_tokens.clear();
@@ -6778,6 +6782,7 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
             ctx_omni->tts_n_past_accumulated = 0;
             ctx_omni->tts_all_generated_tokens.clear();
             ctx_omni->tts_condition_saved = false;
+            chunk_idx = 0;
             tts_n_past = 0;
             audio_tokens.clear();
             all_audio_tokens.clear();

@@ -523,7 +523,7 @@ static omni_context * create_session_octx(common_params & params, const ParsedSe
                                           const std::string & output_dir) {
     int media_type = 2; // omni
     bool duplex_mode = (init.mode == "full_duplex");
-    bool use_tts = init.use_tts;
+    bool use_tts = duplex_mode ? init.use_tts : true;
 
     // Build params for omni_init
     auto & p = params;
@@ -713,13 +713,16 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
         bool accumulate = false;
         std::vector<float> accum;
         bool emitted_audio = false;
+        bool has_stream_audio = false;
+        double streamed_audio_ms = 0.0;
+        std::chrono::steady_clock::time_point first_stream_audio_sent;
     };
     auto audio_state = std::make_shared<AudioCbState>();
     audio_state->session_id = session_id;
     audio_state->ws = &ws;
     audio_state->octx = octx;
 
-    octx->audio_output_cb = [audio_state](const float * samples, int n_samples, int /*sample_rate*/, bool /*is_final*/) {
+    octx->audio_output_cb = [audio_state](const float * samples, int n_samples, int sample_rate, bool /*is_final*/) {
         {
             // Non-streaming: buffer the PCM so it can be returned in
             // response.done.audio rather than emitted as audio deltas.
@@ -740,6 +743,15 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
                 response_id = audio_state->response_id;
                 response_start = audio_state->response_start;
                 audio_state->emitted_audio = true;
+                if (samples && n_samples > 0) {
+                    if (!audio_state->has_stream_audio) {
+                        audio_state->has_stream_audio = true;
+                        audio_state->first_stream_audio_sent = std::chrono::steady_clock::now();
+                    }
+                    const int sr = sample_rate > 0 ? sample_rate : 24000;
+                    audio_state->streamed_audio_ms +=
+                        1000.0 * static_cast<double>(n_samples) / static_cast<double>(sr);
+                }
             }
             std::string b64 = float32_pcm_to_b64(samples, n_samples);
             ProtocolMetrics metrics = make_runtime_metrics(
@@ -797,6 +809,8 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
             audio_state->response_id = response_id; // update for audio callback
             audio_state->response_start = t_request_start;
             audio_state->emitted_audio = false;
+            audio_state->has_stream_audio = false;
+            audio_state->streamed_audio_ms = 0.0;
         }
 
         // Branch: full_duplex vs turn_based. The input shape MUST match the
@@ -1147,6 +1161,7 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
             // Collect full text for response.done
             std::string full_text;
             std::string utf8_pending;
+            bool pending_listen = false;
 
             // Poll text_queue
             while (true) {
@@ -1169,14 +1184,7 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
 
                 if (!frag.empty()) {
                     if (frag == "__IS_LISTEN__") {
-                        // Model switched to listen
-                        send_event(make_listen_delta(
-                            session_id, response_id,
-                            make_runtime_metrics(octx, prefill_ms,
-                                                 elapsed_ms(t_generate_start),
-                                                 elapsed_ms(t_request_start), 0,
-                                                 turn_vision_slices)));
-                        break; // Done for this input
+                        pending_listen = true;
                     } else if (frag == "__END_OF_TURN__") {
                         // Turn ended — will be handled by response.done
                     } else {
@@ -1220,6 +1228,41 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
                                              elapsed_ms(t_request_start), 0,
                                              turn_vision_slices)));
                 }
+            }
+            if (pending_listen) {
+                const bool has_tts_tail =
+                    octx->use_tts &&
+                    (!full_text.empty() ||
+                     !omni_tts_queues_empty(octx));
+                if (has_tts_tail) {
+                    if (!omni_duplex_drain_tts_audio(octx, /*max_wait_ms*/3000, /*idle_ms*/100)) {
+                        LOG_WRN("WS /backend: timed out waiting for full-duplex TTS drain before listen for session %s\n",
+                                session_id.c_str());
+                    }
+                }
+                int playback_tail_wait_ms = 0;
+                {
+                    std::lock_guard<std::mutex> lk(audio_state->mtx);
+                    if (audio_state->has_stream_audio) {
+                        const int audio_ms = static_cast<int>(audio_state->streamed_audio_ms + 0.5);
+                        const int client_delay_ms = 250;
+                        const int safety_ms = 250;
+                        const auto playback_done_at =
+                            audio_state->first_stream_audio_sent +
+                            std::chrono::milliseconds(audio_ms + client_delay_ms + safety_ms);
+                        playback_tail_wait_ms = static_cast<int>(
+                            std::chrono::duration_cast<std::chrono::milliseconds>(
+                                playback_done_at - std::chrono::steady_clock::now()).count());
+                    }
+                }
+                if (playback_tail_wait_ms > 0) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(playback_tail_wait_ms));
+                }
+                send_event(make_listen_delta(
+                    session_id, response_id,
+                    make_runtime_metrics(octx, prefill_ms, generate_ms,
+                                         elapsed_ms(t_request_start), 0,
+                                         turn_vision_slices)));
             }
             bool emitted_audio = false;
             {
