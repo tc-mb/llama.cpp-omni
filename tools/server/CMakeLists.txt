@@ -29,37 +29,6 @@ target_include_directories(${TARGET} PRIVATE ../omni/voxcpm2)
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(${TARGET} PRIVATE llama-common omni mtmd voxcpm2_runtime ${CMAKE_THREAD_LIBS_INIT})
 
-# llama-server-impl: server logic, reusable by app
-
-set(TARGET llama-server-impl)
-
-add_library(${TARGET}
-    server.cpp
-    server-http.cpp
-    server-http.h
-    server-models.cpp
-    server-models.h
-)
-set_target_properties(${TARGET} PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
-
-target_include_directories(${TARGET} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_include_directories(${TARGET} PRIVATE ../mtmd ${CMAKE_SOURCE_DIR})
-target_link_libraries(${TARGET} PUBLIC server-context llama-ui cpp-httplib ${CMAKE_THREAD_LIBS_INIT})
-
-if(LLAMA_TOOLS_INSTALL)
-    install(TARGETS ${TARGET} LIBRARY)
-endif()
-
-# llama-server executable
-
-set(TARGET llama-server)
-
-add_executable(${TARGET} main.cpp)
-install(TARGETS ${TARGET} RUNTIME)
-
-target_link_libraries(${TARGET} PRIVATE llama-server-impl)
-target_compile_features(${TARGET} PRIVATE cxx_std_17)
-
 # llama-omni-server executable (standalone omni HTTP API)
 
 if (LLAMA_OPENSSL)
