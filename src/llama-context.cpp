@@ -3394,6 +3394,19 @@ llama_context * llama_init_from_model(
         params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
     }
 
+    // CANN (Ascend NPU): the fused attention operator is numerically unstable
+    // on some SOCs under long / multi-image shapes. Force-disable FA on CANN in
+    // AUTO mode; pass --flash-attn on to opt back in.
+    if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
+        for (const auto & dev : model->devices) {
+            if (dev.dev && strncmp(ggml_backend_dev_name(dev.dev), "CANN", 4) == 0) {
+                LLAMA_LOG_WARN("%s: flash_attn is not compatible with CANN - forcing off\n", __func__);
+                params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+                break;
+            }
+        }
+    }
+
     if (model->split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
         if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
             LLAMA_LOG_INFO("%s: enabling flash_attn since it is required for SPLIT_MODE_TENSOR\n", __func__);
