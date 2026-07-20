@@ -9678,7 +9678,20 @@ bool Token2Wav::load_models(const std::string & encoder_gguf,
                             const std::string & coreml_model_path) {
     reset_stream();
 
-    constexpr int kDefaultThreads = 8;
+    // CPU thread count for token2mel / vocoder. Overridable via env
+    // OMNI_T2W_THREADS: on many-core servers the vocoder-on-CPU path
+    // benefits from far more than 8 threads. Only affects CPU backends.
+    int kDefaultThreads = 8;
+    {
+        const char * th = getenv("OMNI_T2W_THREADS");
+        if (th && th[0]) {
+            int v = atoi(th);
+            if (v > 0) {
+                kDefaultThreads = v;
+            }
+        }
+    }
+    std::fprintf(stderr, "Token2Wav.load_models: using %d CPU threads (token2mel+vocoder)\n", kDefaultThreads);
     if (!t2m_.load_model(encoder_gguf, flow_matching_gguf, flow_extra_gguf, device_token2mel, kDefaultThreads,
                          coreml_model_path)) {
         LOG_ERROR( "Token2Wav.load_models: Token2Mel.load_model failed\n");
