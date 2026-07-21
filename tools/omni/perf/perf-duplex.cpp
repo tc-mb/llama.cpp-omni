@@ -13,9 +13,10 @@
  *   3. 把 frame 结果 + audio chunk 时间线序列化成 JSON。
  *
  * 判据参考（详见 DUPLEX_PROFILING.md）：
- *   - 每帧 push→判定 (ms_total) 的 P95 < 进帧间隔（默认 1000ms），否则跟不上实时进帧。
- *   - SPEAK 轮次首个 wav 的 push→落盘（首响）尽量 < 1000ms。
- *   - 音频 RTF < 1.0（生成 1s 音频耗时 < 1s），否则播放会饿死。
+ *   - 每帧 push->判定 (ms_total) 的 P95 < 进帧间隔（默认 1000ms），否则跟不上实时进帧。
+ *   - 首响 e2e：SPEAK 轮首帧 push -> 该轮首个 wav；P95 < 进帧间隔。
+ *   - TTS RTF：LLM 判定完成 (t_done) -> 该轮末 wav / 音频时长；平均 < 1.0。
+ *   - e2e RTF（仅展示）：首帧 push -> 末 wav / 音频时长，含 LLM 等待。
  */
 
 #include "omni-impl.h"
@@ -78,6 +79,7 @@ struct AudioChunkRecord {
     int    sample_rate   = 0;
     double duration_s    = 0;  // n_samples / sample_rate
     bool   is_final      = false;
+    int    audio_turn_id = -1; // 按 is_final 切分的音频轮次 id（0,1,2,...）
 };
 
 struct FrameRecord {
@@ -87,6 +89,7 @@ struct FrameRecord {
     double  t_done_ms     = 0;  // 相对 session 时钟：result 出队时刻
     bool    ok            = false;
     bool    is_speak      = false;
+    int     speak_turn_id = -1; // 连续 SPEAK 帧共享同一 id；LISTEN 为 -1
     double  ms_decode     = 0;
     double  ms_total      = 0;
     int     n_past_after  = 0;
@@ -99,6 +102,10 @@ struct PerfCollector {
     std::vector<AudioChunkRecord> audio;          // audio_output_cb 采集
     std::unordered_map<int64_t, double> push_ms;  // frame_id -> push 时刻
     std::vector<FrameRecord>      frames;
+    int  next_speak_turn_id = 0;
+    bool in_speak_turn      = false;
+    int  cur_speak_turn_id  = -1;
+    int  cur_audio_turn_id  = 0;
 };
 
 static PerfCollector g_perf;
@@ -190,11 +197,12 @@ static bool write_json_report(const std::string & path,
         const auto & fr = g_perf.frames[i];
         fprintf(f,
             "    {\"user_seq\": %lld, \"frame_id\": %lld, \"t_push_ms\": %.3f, "
-            "\"t_done_ms\": %.3f, \"ok\": %s, \"is_speak\": %s, \"ms_decode\": %.3f, "
-            "\"ms_total\": %.3f, \"n_past_after\": %d, \"text_len\": %d, \"text\": \"%s\"}%s\n",
+            "\"t_done_ms\": %.3f, \"ok\": %s, \"is_speak\": %s, \"speak_turn_id\": %d, "
+            "\"ms_decode\": %.3f, \"ms_total\": %.3f, \"n_past_after\": %d, "
+            "\"text_len\": %d, \"text\": \"%s\"}%s\n",
             (long long)fr.user_seq, (long long)fr.frame_id, fr.t_push_ms,
             fr.t_done_ms, fr.ok ? "true" : "false", fr.is_speak ? "true" : "false",
-            fr.ms_decode, fr.ms_total, fr.n_past_after, fr.text_len,
+            fr.speak_turn_id, fr.ms_decode, fr.ms_total, fr.n_past_after, fr.text_len,
             json_escape(fr.text).c_str(),
             (i + 1 < g_perf.frames.size()) ? "," : "");
     }
@@ -206,9 +214,9 @@ static bool write_json_report(const std::string & path,
         const auto & a = g_perf.audio[i];
         fprintf(f,
             "    {\"t_complete_ms\": %.3f, \"n_samples\": %d, \"sample_rate\": %d, "
-            "\"duration_s\": %.4f, \"is_final\": %s}%s\n",
+            "\"duration_s\": %.4f, \"is_final\": %s, \"audio_turn_id\": %d}%s\n",
             a.t_complete_ms, a.n_samples, a.sample_rate, a.duration_s,
-            a.is_final ? "true" : "false",
+            a.is_final ? "true" : "false", a.audio_turn_id,
             (i + 1 < g_perf.audio.size()) ? "," : "");
     }
     fprintf(f, "  ]\n");
@@ -294,6 +302,17 @@ static void duplex_perf_run(struct omni_context * ctx_omni,
             std::lock_guard<std::mutex> lk(g_perf.mtx);
             auto it = g_perf.push_ms.find(r.frame_id);
             fr.t_push_ms = (it != g_perf.push_ms.end()) ? it->second : 0.0;
+            if (r.is_speak) {
+                if (!g_perf.in_speak_turn) {
+                    g_perf.cur_speak_turn_id = g_perf.next_speak_turn_id++;
+                    g_perf.in_speak_turn = true;
+                }
+                fr.speak_turn_id = g_perf.cur_speak_turn_id;
+            } else {
+                g_perf.in_speak_turn = false;
+                g_perf.cur_speak_turn_id = -1;
+                fr.speak_turn_id = -1;
+            }
             g_perf.frames.push_back(std::move(fr));
         }
 
@@ -480,8 +499,9 @@ int main(int argc, char ** argv) {
     ctx_omni->async = true;
     ctx_omni->ref_audio_path = ref_audio_path;
 
-    // 🔑 [低侵入核心] 注册已存在的 audio_output_cb 钩子采集 wav chunk 时间线。
+    // [低侵入核心] 注册已存在的 audio_output_cb 钩子采集 wav chunk 时间线。
     //    T2W 线程每写完一个 wav chunk 就会调用它（cpp / python 两条 T2W 路径都会调）。
+    //    与 SPEAK 轮次的对齐在 analyze_perf.py 里按时间戳做，不依赖数组下标。
     ctx_omni->audio_output_cb =
         [](const float * /*samples*/, int n_samples, int sample_rate, bool is_final) {
             AudioChunkRecord rec;
@@ -491,7 +511,11 @@ int main(int argc, char ** argv) {
             rec.duration_s    = (sample_rate > 0) ? (double)n_samples / sample_rate : 0.0;
             rec.is_final      = is_final;
             std::lock_guard<std::mutex> lk(g_perf.mtx);
+            rec.audio_turn_id = g_perf.cur_audio_turn_id;
             g_perf.audio.push_back(rec);
+            if (is_final) {
+                g_perf.cur_audio_turn_id++;
+            }
         };
 
     // 硬编码默认样本：duplex omni 测试集（audio + image，共 36 帧 0000~0035）

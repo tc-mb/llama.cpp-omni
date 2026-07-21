@@ -8,11 +8,18 @@
 
 指标含义（详见 DUPLEX_PROFILING.md）：
   - LLM 判定实时性 : 每帧 push->判定(ms_total) 的 P50/P95/max。
-                     P95 必须 < 进帧间隔(stream_interval_ms)，否则 pipeline
-                     跟不上 1s 进帧速率，in-flight 队列会持续堆积。
-  - 首响延迟       : 每个 SPEAK 轮次「首帧 push -> 该轮首个 wav 落盘」的时间。
-  - 音频 RTF       : 生成 1s 音频所花的 wall time。<1.0 才能保证播放不饿死。
-  - wav chunk 分布 : 说明单个 wav chunk 的实际音频时长范围。
+                     P95 必须 < 进帧间隔(stream_interval_ms)。
+  - 首响 e2e       : SPEAK 轮首帧 push -> 匹配到的首个 wav 落盘。
+  - TTS RTF        : LLM 判定完成(t_done) -> 该轮末 wav / 音频时长；硬门槛 < 1.0。
+  - e2e RTF        : 首帧 push -> 末 wav / 音频时长；仅展示，含 LLM 等待。
+
+SPEAK 轮与音频轮按时间戳匹配（不用数组下标一一对应），避免中间无音频的
+SPEAK 轮导致错位。
+
+退出码:
+  0 = 通过（可支撑双工）
+  2 = 未通过实时性判据
+  3 = 数据不完整（--no-tts / 无音频等），不能判定双工可行性
 
 用法:
   python3 analyze_perf.py <perf_report.json> [--interval-ms 1000] [--md out.md]
@@ -37,7 +44,7 @@ def percentile(values, p):
 
 
 def segment_speak_turns(frames):
-    """把连续的 is_speak 帧聚合成 SPEAK 轮次。返回 [(start_idx, end_idx)] 列表。"""
+    """把连续的 is_speak 帧聚合成 SPEAK 轮次。返回 [(start_idx, end_idx)]。"""
     turns = []
     cur = None
     for i, fr in enumerate(frames):
@@ -56,7 +63,18 @@ def segment_speak_turns(frames):
 
 
 def segment_audio_turns(audio):
-    """把 audio_chunks 按 is_final 切成音频轮次。返回 [chunk子列表]。"""
+    """优先按 audio_turn_id 分组；否则按 is_final 切分。返回 [chunk子列表]。"""
+    if audio and all("audio_turn_id" in a for a in audio):
+        groups = {}
+        order = []
+        for a in audio:
+            tid = a["audio_turn_id"]
+            if tid not in groups:
+                groups[tid] = []
+                order.append(tid)
+            groups[tid].append(a)
+        return [groups[tid] for tid in order]
+
     turns = []
     cur = []
     for a in audio:
@@ -69,6 +87,54 @@ def segment_audio_turns(audio):
     return turns
 
 
+def match_speak_audio_turns(frames, speak_turns, audio_turns):
+    """
+    按时间戳匹配 SPEAK 轮与音频轮，避免靠数组下标错位。
+
+    对每个音频轮（按时间顺序）：取「尚未匹配、且 t_push <= 首 wav 落盘」的
+    最晚一个 SPEAK 轮。被跳过的 SPEAK 轮记为无音频输出。
+    """
+    pairs = []
+    unmatched_speak = []
+    unmatched_audio = []
+    next_s = 0
+
+    for a_idx, a_turn in enumerate(audio_turns):
+        if not a_turn:
+            unmatched_audio.append(a_idx)
+            continue
+        t0 = a_turn[0]["t_complete_ms"]
+        candidate = None
+        while next_s < len(speak_turns):
+            s0, _s1 = speak_turns[next_s]
+            t_push = frames[s0]["t_push_ms"]
+            if t_push <= t0:
+                if candidate is not None:
+                    unmatched_speak.append(candidate)
+                candidate = next_s
+                next_s += 1
+            else:
+                break
+        if candidate is None:
+            unmatched_audio.append(a_idx)
+        else:
+            pairs.append((candidate, a_idx))
+
+    while next_s < len(speak_turns):
+        unmatched_speak.append(next_s)
+        next_s += 1
+
+    return pairs, unmatched_speak, unmatched_audio
+
+
+def speak_turn_label(frames, speak_turns, s_idx):
+    s0, _s1 = speak_turns[s_idx]
+    tid = frames[s0].get("speak_turn_id")
+    if tid is not None and tid >= 0:
+        return f"speak#{tid}"
+    return f"speak@{s_idx}"
+
+
 def analyze(report, interval_ms):
     meta = report.get("meta", {})
     frames = report.get("frames", [])
@@ -76,9 +142,12 @@ def analyze(report, interval_ms):
 
     interval = interval_ms if interval_ms is not None else meta.get("stream_interval_ms", 1000)
     if interval <= 0:
-        interval = 1000  # 背靠背压测时用 1000ms 作为实时基准
+        interval = 1000
+
+    use_tts = bool(meta.get("use_tts", True))
 
     lines = []
+
     def out(s=""):
         lines.append(s)
 
@@ -105,68 +174,125 @@ def analyze(report, interval_ms):
     p95 = percentile(ms_total, 95)
     mx = max(ms_total) if ms_total else 0.0
     out("[1] LLM 判定延迟 (push -> LISTEN/SPEAK, ms_total)")
-    out(f"    P50 {p50:.1f}ms | P95 {p95:.1f}ms | max {mx:.1f}ms | "
-        f"avg decode {sum(ms_decode)/len(ms_decode):.1f}ms" if ms_decode else "    无数据")
-    jud_llm = p95 < interval
-    out(f"    判据: P95({p95:.1f}ms) < 进帧间隔({interval}ms)  => {'PASS' if jud_llm else 'FAIL'}")
+    if ms_decode:
+        out(f"    P50 {p50:.1f}ms | P95 {p95:.1f}ms | max {mx:.1f}ms | "
+            f"avg decode {sum(ms_decode)/len(ms_decode):.1f}ms")
+    else:
+        out("    无数据")
+    jud_llm = bool(ms_total) and p95 < interval
+    out(f"    判据: P95({p95:.1f}ms) < 进帧间隔({interval}ms)  => "
+        f"{'PASS' if jud_llm else 'FAIL'}")
     out("")
 
-    # ---- 2. 首响延迟 ----
     speak_turns = segment_speak_turns(frames)
     audio_turns = segment_audio_turns(audio)
-    out("[2] 首响延迟 (SPEAK 轮次首帧 push -> 该轮首个 wav 落盘)")
-    first_resp = []
-    n_match = min(len(speak_turns), len(audio_turns))
-    if n_match == 0:
-        out("    无 SPEAK 轮次或无音频输出（可能全程 LISTEN / 未开 TTS）")
+    pairs, unmatched_speak, unmatched_audio = match_speak_audio_turns(
+        frames, speak_turns, audio_turns)
+
+    out("[匹配] SPEAK 轮 <-> 音频轮 (按时间戳，非下标对齐)")
+    out(f"    SPEAK 轮: {len(speak_turns)} | 音频轮: {len(audio_turns)} | "
+        f"匹配成功: {len(pairs)}")
+    if unmatched_speak:
+        labels = [speak_turn_label(frames, speak_turns, i) for i in unmatched_speak]
+        out(f"    无音频的 SPEAK 轮: {labels}")
+    if unmatched_audio:
+        out(f"    未匹配到 SPEAK 的音频轮 index: {unmatched_audio}")
+    out("")
+
+    # TTS 侧是否具备判定条件
+    if not use_tts:
+        tts_status = "skipped"   # --no-tts
+        tts_reason = "use_tts=false (--no-tts)，跳过音频侧判定"
+    elif n_speak == 0:
+        tts_status = "skipped"   # 全程 LISTEN，没有可测的 speak/audio
+        tts_reason = "全程 LISTEN，无 SPEAK 轮，跳过音频侧判定"
+    elif not audio or not pairs:
+        tts_status = "incomplete"
+        tts_reason = "有 SPEAK 但无可用音频时间线，无法判定首响/RTF"
     else:
-        for k in range(n_match):
-            s_start = speak_turns[k][0]
-            t_push = frames[s_start]["t_push_ms"]
-            t_first_wav = audio_turns[k][0]["t_complete_ms"]
-            d = t_first_wav - t_push
-            first_resp.append(d)
-            out(f"    turn#{k+1}: 首帧 push@{t_push:.0f}ms -> 首 wav@{t_first_wav:.0f}ms "
-                f"= {d:.0f}ms")
-        out(f"    P50 {percentile(first_resp,50):.0f}ms | "
-            f"P95 {percentile(first_resp,95):.0f}ms")
-    jud_resp = bool(first_resp) and percentile(first_resp, 95) < interval
-    if first_resp:
-        out(f"    判据: 首响 P95 < 进帧间隔({interval}ms) => {'PASS' if jud_resp else 'FAIL'}")
+        tts_status = "ok"
+        tts_reason = ""
+
+    # ---- 2. 首响延迟 ----
+    out("[2] 首响延迟")
+    out("    e2e  = SPEAK 首帧 push -> 该轮首 wav（硬判据）")
+    out("    tts  = SPEAK 首帧 t_done(LLM完成) -> 首 wav（仅展示）")
+    first_resp_e2e = []
+    first_resp_tts = []
+    if tts_status != "ok":
+        out(f"    {tts_reason}")
+        jud_resp = None
+    else:
+        for s_idx, a_idx in pairs:
+            s0, _s1 = speak_turns[s_idx]
+            a_turn = audio_turns[a_idx]
+            t_push = frames[s0]["t_push_ms"]
+            t_done = frames[s0]["t_done_ms"]
+            t_first = a_turn[0]["t_complete_ms"]
+            d_e2e = t_first - t_push
+            d_tts = t_first - t_done
+            first_resp_e2e.append(d_e2e)
+            first_resp_tts.append(d_tts)
+            label = speak_turn_label(frames, speak_turns, s_idx)
+            out(f"    {label}/audio#{a_idx}: e2e {d_e2e:.0f}ms | tts {d_tts:.0f}ms "
+                f"(push@{t_push:.0f} done@{t_done:.0f} wav@{t_first:.0f})")
+        out(f"    e2e P50 {percentile(first_resp_e2e,50):.0f}ms | "
+            f"P95 {percentile(first_resp_e2e,95):.0f}ms")
+        out(f"    tts P50 {percentile(first_resp_tts,50):.0f}ms | "
+            f"P95 {percentile(first_resp_tts,95):.0f}ms")
+        jud_resp = percentile(first_resp_e2e, 95) < interval
+        out(f"    判据: 首响 e2e P95 < 进帧间隔({interval}ms) => "
+            f"{'PASS' if jud_resp else 'FAIL'}")
     out("")
 
     # ---- 3. 音频 RTF ----
-    out("[3] 音频生成 RTF (生成 1s 音频所花 wall time，需 < 1.0)")
+    out("[3] 音频 RTF")
+    out("    TTS RTF = (末 wav - LLM t_done) / 音频时长  （硬判据，需 < 1.0）")
+    out("    e2e RTF = (末 wav - 首帧 push) / 音频时长  （仅展示，含 LLM 等待）")
     total_audio_s = sum(a["duration_s"] for a in audio)
-    jud_rtf = True
-    if audio and total_audio_s > 0:
-        # 用每个音频轮次的 wall 跨度估算 RTF
-        rtf_turns = []
-        for k, t in enumerate(audio_turns):
-            if not t:
-                continue
-            audio_s = sum(c["duration_s"] for c in t)
-            # 该轮 wall 起点：优先用匹配的 speak 轮首帧 push，否则用首 chunk 落盘
-            if k < len(speak_turns):
-                wall_start = frames[speak_turns[k][0]]["t_push_ms"]
-            else:
-                wall_start = t[0]["t_complete_ms"]
-            wall_end = t[-1]["t_complete_ms"]
-            wall_s = max(1e-6, (wall_end - wall_start) / 1000.0)
-            rtf = wall_s / audio_s if audio_s > 0 else float("inf")
-            rtf_turns.append(rtf)
-            out(f"    turn#{k+1}: 音频 {audio_s:.2f}s | wall {wall_s:.2f}s | RTF {rtf:.2f}")
-        avg_rtf = sum(rtf_turns) / len(rtf_turns) if rtf_turns else float("inf")
-        out(f"    平均 RTF: {avg_rtf:.2f}")
-        jud_rtf = avg_rtf < 1.0
-        out(f"    判据: 平均 RTF < 1.0 => {'PASS' if jud_rtf else 'FAIL'}")
+    tts_rtf_turns = []
+    e2e_rtf_turns = []
+    if tts_status != "ok":
+        out(f"    {tts_reason}")
+        jud_rtf = None
     else:
-        out("    无音频输出，跳过 RTF（全程 LISTEN 或未开 TTS）")
-        jud_rtf = True
+        for s_idx, a_idx in pairs:
+            s0, _s1 = speak_turns[s_idx]
+            a_turn = audio_turns[a_idx]
+            audio_s = sum(c["duration_s"] for c in a_turn)
+            if audio_s <= 0:
+                continue
+            t_push = frames[s0]["t_push_ms"]
+            t_done = frames[s0]["t_done_ms"]
+            t_first = a_turn[0]["t_complete_ms"]
+            t_last = a_turn[-1]["t_complete_ms"]
+            # 若音频回调早于 wait_next_frame 返回，用首 wav 时刻避免负 wall
+            tts_wall_start = min(t_done, t_first)
+            tts_wall_s = max(1e-6, (t_last - tts_wall_start) / 1000.0)
+            e2e_wall_s = max(1e-6, (t_last - t_push) / 1000.0)
+            tts_rtf = tts_wall_s / audio_s
+            e2e_rtf = e2e_wall_s / audio_s
+            tts_rtf_turns.append(tts_rtf)
+            e2e_rtf_turns.append(e2e_rtf)
+            label = speak_turn_label(frames, speak_turns, s_idx)
+            out(f"    {label}/audio#{a_idx}: 音频 {audio_s:.2f}s | "
+                f"TTS wall {tts_wall_s:.2f}s RTF {tts_rtf:.2f} | "
+                f"e2e wall {e2e_wall_s:.2f}s RTF {e2e_rtf:.2f}")
+        if tts_rtf_turns:
+            avg_tts = sum(tts_rtf_turns) / len(tts_rtf_turns)
+            avg_e2e = sum(e2e_rtf_turns) / len(e2e_rtf_turns)
+            out(f"    平均 TTS RTF: {avg_tts:.2f} | 平均 e2e RTF: {avg_e2e:.2f}")
+            jud_rtf = avg_tts < 1.0
+            out(f"    判据: 平均 TTS RTF < 1.0 => {'PASS' if jud_rtf else 'FAIL'}")
+        else:
+            out("    匹配轮次音频时长均为 0，无法计算 RTF")
+            jud_rtf = None
+            tts_status = "incomplete"
+            tts_reason = "匹配轮次无有效音频时长"
     out("")
 
-    # ---- 4. 单 wav 时长分布（回答 demand 点 5） ----
-    out("[4] 单个 wav chunk 时长分布 (验证「一帧≠1s音频」)")
+    # ---- 4. 单 wav 时长分布 ----
+    out("[4] 单个 wav chunk 时长分布 (验证「一帧!=1s音频」)")
     durs = [a["duration_s"] for a in audio]
     if durs:
         out(f"    chunk 数: {len(durs)} | 总音频 {total_audio_s:.2f}s")
@@ -183,18 +309,51 @@ def analyze(report, interval_ms):
 
     # ---- 总判定 ----
     out("=" * 64)
-    checks = {
-        "LLM 判定实时性 (P95<间隔)": jud_llm,
-        "首响 (<间隔)": jud_resp if first_resp else None,
-        "音频 RTF (<1.0)": jud_rtf,
-    }
-    for name, v in checks.items():
-        tag = "—" if v is None else ("PASS" if v else "FAIL")
+    checks = [
+        ("LLM 判定实时性 (P95<间隔)", jud_llm if ms_total else None),
+        ("首响 e2e (<间隔)", jud_resp),
+        ("TTS RTF (<1.0)", jud_rtf),
+    ]
+    for name, v in checks:
+        if v is None:
+            tag = "SKIP"
+        elif v:
+            tag = "PASS"
+        else:
+            tag = "FAIL"
         out(f"  [{tag:>4}] {name}")
-    hard = [v for v in checks.values() if v is not None]
-    verdict = all(hard) if hard else False
+
+    hard = [v for _n, v in checks if v is not None]
+    any_fail = any(v is False for _n, v in checks)
+
+    if tts_status == "incomplete" or (tts_status == "skipped" and use_tts is False):
+        # --no-tts 或音频数据缺失：不能宣称可支撑双工
+        if any_fail:
+            verdict = "fail"
+            summary = "未通过实时性判据（且音频侧数据不完整）"
+        else:
+            verdict = "incomplete"
+            summary = f"数据不完整，不能判定双工可行性 ({tts_reason or tts_status})"
+    elif tts_status == "skipped" and n_speak == 0:
+        # 全程 LISTEN：只看 LLM；通过也不等于「双工音频 OK」，标 incomplete
+        if any_fail:
+            verdict = "fail"
+            summary = "未通过实时性判据"
+        else:
+            verdict = "incomplete"
+            summary = "全程 LISTEN，未覆盖 SPEAK/TTS，不能判定双工可行性"
+    elif not hard:
+        verdict = "incomplete"
+        summary = "无有效判据数据"
+    elif all(hard):
+        verdict = "pass"
+        summary = "该机器可支撑双工"
+    else:
+        verdict = "fail"
+        summary = "该机器暂不满足双工实时性"
+
     out("-" * 64)
-    out(f"  最终判定: {'✅ 该机器可支撑双工' if verdict else '❌ 该机器暂不满足双工实时性'}")
+    out(f"  最终判定: {summary}")
     out("=" * 64)
 
     return "\n".join(lines), verdict
@@ -219,7 +378,11 @@ def main():
             f.write("```\n" + text + "\n```\n")
         print(f"\n[已写入 markdown: {args.md}]")
 
-    sys.exit(0 if verdict else 2)
+    if verdict == "pass":
+        sys.exit(0)
+    if verdict == "incomplete":
+        sys.exit(3)
+    sys.exit(2)
 
 
 if __name__ == "__main__":

@@ -9,7 +9,7 @@
 #   tools/omni/perf/run_perf.sh -m <llm.gguf> [--omni] \
 #       [--test <prefix> <n>] [--stream-interval 1000] [--build] [-- <额外 perf-duplex 参数>]
 #
-# 退出码: 0=可支撑双工, 2=不满足, 其它=运行/编译失败
+# 退出码: 0=可支撑双工, 2=不满足实时性, 3=数据不完整(不能判定), 其它=运行/编译失败
 
 set -euo pipefail
 
