@@ -175,6 +175,13 @@ set_target_properties  (${TARGET_DUPLEX_TEST} PROPERTIES OUTPUT_NAME llama-omni-
 target_link_libraries  (${TARGET_DUPLEX_TEST} PRIVATE llama-common omni Threads::Threads)
 target_compile_features(${TARGET_DUPLEX_TEST} PRIVATE cxx_std_17)
 
+# 双工可行性 profiling（低侵入：仅复用 omni API + audio_output_cb 钩子）
+set(TARGET_DUPLEX_PERF llama-omni-perf-duplex)
+add_executable         (${TARGET_DUPLEX_PERF} perf/perf-duplex.cpp)
+set_target_properties  (${TARGET_DUPLEX_PERF} PROPERTIES OUTPUT_NAME llama-omni-perf-duplex)
+target_link_libraries  (${TARGET_DUPLEX_PERF} PRIVATE llama-common omni Threads::Threads)
+target_compile_features(${TARGET_DUPLEX_PERF} PRIVATE cxx_std_17)
+
 # Token2Wav 测试程序 - 纯 C++ 单线程 baseline（用于 profile 对照，不占 LLM/TTS GPU）
 add_executable(token2wav-example token2wav/token2wav-example.cpp)
 target_link_libraries(token2wav-example PRIVATE llama-common omni Threads::Threads)
