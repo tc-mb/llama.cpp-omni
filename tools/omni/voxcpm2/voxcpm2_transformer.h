@@ -166,17 +166,28 @@ ggml_tensor * voxcpm2_transformer_forward(ggml_context *                    ctx,
 
 // Single-token decode step with KV cache (for ResidualLM incremental decode).
 // Processes 1 token at `position`, writes K/V to cache, attends to [0..position].
+// If `cache_writes` is non-null, the per-layer K/V cache-write tensors are
+// appended to it; the caller MUST add them to the graph as additional roots
+// (via ggml_build_forward_expand) so the writes execute.
 ggml_tensor * voxcpm2_transformer_forward_step(ggml_context *                    ctx,
                                                const VoxCPM2TransformerConfig &  cfg,
                                                const VoxCPM2TransformerWeights & weights,
                                                ggml_tensor *                     input,
                                                int                               position,
-                                               VoxCPM2KVCache &                  kv_cache);
+                                               VoxCPM2KVCache &                  kv_cache,
+                                               std::vector<ggml_tensor *> *      cache_writes = nullptr);
 
 // Multi-token prefill with KV cache (populates cache positions 0..n_tokens-1).
+// `attention_mask` must be a caller-created, caller-filled causal mask of shape
+// [n_tokens(keys), >=n_tokens(queries)] (e.g. via ggml_set_input + tensor_set);
+// it is required when n_tokens > 1. If `cache_writes` is non-null, the per-layer
+// K/V cache-write tensors are appended to it; the caller MUST add them to the
+// graph as additional roots.
 ggml_tensor * voxcpm2_transformer_forward_prefill(ggml_context *                    ctx,
                                                   const VoxCPM2TransformerConfig &  cfg,
                                                   const VoxCPM2TransformerWeights & weights,
                                                   ggml_tensor *                     input,
                                                   int                               n_tokens,
-                                                  VoxCPM2KVCache &                  kv_cache);
+                                                  VoxCPM2KVCache &                  kv_cache,
+                                                  ggml_tensor *                     attention_mask = nullptr,
+                                                  std::vector<ggml_tensor *> *      cache_writes   = nullptr);

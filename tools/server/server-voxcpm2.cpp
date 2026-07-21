@@ -207,7 +207,7 @@ int main(int argc, char ** argv) {
 
     // HTTP server setup
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
-    httplib::SSLServer svr(params.ssl_file_key.c_str(), params.ssl_file_cert.c_str());
+    httplib::SSLServer svr(params.ssl_file_cert.c_str(), params.ssl_file_key.c_str());
 #else
     httplib::Server svr;
 #endif

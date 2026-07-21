@@ -86,19 +86,6 @@ static std::vector<float> make_causal_mask(int n_tokens) {
     return mask;
 }
 
-static std::vector<float> make_kv_prefill_causal_mask(int total_len, int n_tokens, int n_past) {
-    const float neg_inf = -std::numeric_limits<float>::infinity();
-
-    std::vector<float> mask(static_cast<size_t>(total_len) * static_cast<size_t>(n_tokens), neg_inf);
-    for (int q = 0; q < n_tokens; ++q) {
-        const int max_key = std::min(total_len - 1, n_past + q);
-        for (int k = 0; k <= max_key; ++k) {
-            mask[static_cast<size_t>(k) + static_cast<size_t>(q) * static_cast<size_t>(total_len)] = 0.0f;
-        }
-    }
-    return mask;
-}
-
 static void copy_token(const std::vector<float> & src, int hidden, int token_idx, std::vector<float> & dst) {
     dst.resize(static_cast<size_t>(hidden));
     std::copy_n(src.data() + static_cast<size_t>(token_idx) * static_cast<size_t>(hidden), static_cast<size_t>(hidden),
@@ -495,15 +482,29 @@ std::vector<float> VoxCPM2ResidualLM::prefill_kv(const std::vector<float> & inpu
     ggml_tensor * input_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, config.hidden_size, seq_len);
     ggml_set_input(input_t);
 
-    ggml_tensor * output = voxcpm2_transformer_forward_prefill(ctx, config, weights, input_t, seq_len, kv_cache);
+    // Build the prefill causal mask explicitly and pass it in. (Previously the
+    // mask was created as a leaf input *inside* attention_forward_kv and the
+    // runtime tried to locate it by scanning graph op-nodes — but leaf inputs
+    // are not op-nodes, so the scan matched 0 tensors and the softmax ran with
+    // an uninitialized mask, corrupting the prefill output and the cached K/V.)
+    ggml_tensor * mask_t = nullptr;
+    if (seq_len > 1) {
+        mask_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, seq_len, GGML_PAD(seq_len, GGML_KQ_MASK_PAD));
+        ggml_set_input(mask_t);
+    }
 
-    // Build causal mask for the prefill attention (needed by attention_forward_kv when n_tokens > 1)
-    // The mask tensor is created inside attention_forward_kv, we need to find and fill it.
-    // Actually, the mask is created as an input tensor inside the graph — we need to set it after allocation.
+    std::vector<ggml_tensor *> cache_writes;
+    ggml_tensor * output =
+        voxcpm2_transformer_forward_prefill(ctx, config, weights, input_t, seq_len, kv_cache, mask_t, &cache_writes);
 
     ggml_cgraph * graph = ggml_new_graph_custom(ctx, kMediumGraphNodes, false);
     ggml_set_output(output);
     ggml_build_forward_expand(graph, output);
+    // Add KV cache writes as independent graph roots so they execute without
+    // feeding into (and thus perturbing) the attention output value.
+    for (ggml_tensor * w : cache_writes) {
+        ggml_build_forward_expand(graph, w);
+    }
 
     BackendBufferGuard buffer(ggml_backend_alloc_ctx_tensors(ctx, backend));
     if (!buffer.buffer) {
@@ -511,15 +512,9 @@ std::vector<float> VoxCPM2ResidualLM::prefill_kv(const std::vector<float> & inpu
     }
 
     ggml_backend_tensor_set(input_t, input.data(), 0, input.size() * sizeof(float));
-
-    // Find and set causal mask tensors created by attention_forward_kv
-    const std::vector<float> mask = make_kv_prefill_causal_mask(seq_len, seq_len, 0);
-    for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
-        ggml_tensor * node = ggml_graph_node(graph, i);
-        if (node->flags & GGML_TENSOR_FLAG_INPUT && node->type == GGML_TYPE_F32 && node->ne[0] == seq_len &&
-            node->ne[1] == seq_len && node != input_t) {
-            ggml_backend_tensor_set(node, mask.data(), 0, mask.size() * sizeof(float));
-        }
+    if (mask_t) {
+        const std::vector<float> mask = make_causal_mask(seq_len);
+        ggml_backend_tensor_set(mask_t, mask.data(), 0, mask.size() * sizeof(float));
     }
 
     if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) {
@@ -547,11 +542,18 @@ std::vector<float> VoxCPM2ResidualLM::forward_step(const std::vector<float> & in
     ggml_tensor * input_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, config.hidden_size);
     ggml_set_input(input_t);
 
-    ggml_tensor * output = voxcpm2_transformer_forward_step(ctx, config, weights, input_t, position, kv_cache);
+    std::vector<ggml_tensor *> cache_writes;
+    ggml_tensor * output =
+        voxcpm2_transformer_forward_step(ctx, config, weights, input_t, position, kv_cache, &cache_writes);
 
     ggml_cgraph * graph = ggml_new_graph_custom(ctx, kMediumGraphNodes, false);
     ggml_set_output(output);
     ggml_build_forward_expand(graph, output);
+    // Add KV cache writes as independent graph roots so the current token's K/V
+    // is committed to the cache without perturbing the decode output value.
+    for (ggml_tensor * w : cache_writes) {
+        ggml_build_forward_expand(graph, w);
+    }
 
     BackendBufferGuard buffer(ggml_backend_alloc_ctx_tensors(ctx, backend));
     if (!buffer.buffer) {
@@ -912,16 +914,13 @@ bool VoxCPM2Runtime::prefill(const VoxCPM2PrefillInputs & inputs) {
 
     // Store for debug/dump
 
-    // Use forward() for accurate residual_hidden (cos=0.999966 vs Python),
-    // then prefill_kv() solely to populate the KV cache for decode steps.
-    // prefill_kv() adds cache write ops to the graph that marginally alter
-    // GPU scheduling and accumulate ~0.65 max error in mu after projection,
-    // which cascades through LocDiT and the CFM Euler solver.
-    residual_hidden = residual_lm.forward_last(residual_fusion_input, seq_len);
+    // Single consistent path (mirrors PyTorch voxcpm2.py:1036-1041): the SAME
+    // forward that populates the ResidualLM KV cache also produces residual_hidden,
+    // so decode step 0 attends to exactly the K/V that produced the prefill output.
+    // prefill_kv() now returns the last hidden state of the prefill forward and the
+    // cache writes are pure graph sinks that do not perturb that value.
+    residual_hidden = residual_lm.prefill_kv(residual_fusion_input, seq_len);
     if (residual_hidden.size() != static_cast<size_t>(hidden)) {
-        return fail("ResidualLM forward failed");
-    }
-    if (residual_lm.prefill_kv(residual_fusion_input, seq_len).size() != static_cast<size_t>(hidden)) {
         return fail("ResidualLM KV cache prefill failed");
     }
 
@@ -1560,6 +1559,74 @@ bool VoxCPM2Runtime::build_reference_prefill_inputs(const std::vector<int32_t> &
     return true;
 }
 
+bool VoxCPM2Runtime::build_continuation_prefill_inputs(const std::vector<int32_t> & text_token_ids,
+                                                       const std::vector<float> &   prompt_feat,
+                                                       bool                         append_audio_start,
+                                                       VoxCPM2PrefillInputs &       inputs) {
+    // Mirrors Python continuation mode (voxcpm2.py:589-623). The text segment
+    // (already the tokenized prompt_text + target_text concatenation) is laid on
+    // the text track, followed by audio_start, then the prompt-audio VAE features
+    // on the audio track. audio_start (token 101) marks the text/audio boundary.
+    inputs = {};
+    if (text_token_ids.empty()) {
+        return fail("text tokenization produced no tokens");
+    }
+
+    const int    patch_elems = feat_dim() * patch_size();
+    const size_t stride      = static_cast<size_t>(patch_elems);
+    if (patch_elems <= 0) {
+        return fail("invalid feat_dim or patch_size");
+    }
+    if (prompt_feat.empty() || (prompt_feat.size() % stride) != 0) {
+        return fail("prompt features must contain whole VoxCPM2 latent patches");
+    }
+
+    const int prompt_frames = static_cast<int>(prompt_feat.size() / stride);
+    if (prompt_frames <= 0) {
+        return fail("prompt features are empty");
+    }
+
+    // text region = [tokens..., audio_start]; matches Python text_length, which
+    // includes audio_start (text_token cat audio_start_token before text_length).
+    std::vector<int32_t> text_segment = text_token_ids;
+    if (append_audio_start && (text_segment.empty() || text_segment.back() != kAudioStartToken)) {
+        text_segment.push_back(kAudioStartToken);
+    }
+
+    const int text_length = static_cast<int>(text_segment.size());
+    const int seq_len      = text_length + prompt_frames;
+    inputs.token_ids.reserve(static_cast<size_t>(seq_len));
+    inputs.text_mask.reserve(static_cast<size_t>(seq_len));
+    inputs.feat_mask.reserve(static_cast<size_t>(seq_len));
+    inputs.audio_feat.reserve(static_cast<size_t>(seq_len) * stride);
+
+    const auto append_zero_patch = [&]() {
+        inputs.audio_feat.insert(inputs.audio_feat.end(), stride, 0.0f);
+    };
+
+    // Text region: text tokens (incl. audio_start), text_mask=1, feat_mask=0,
+    // zero audio patches (text_pad_feat in Python).
+    for (const int32_t token : text_segment) {
+        inputs.token_ids.push_back(token);
+        inputs.text_mask.push_back(1);
+        inputs.feat_mask.push_back(0);
+        append_zero_patch();
+    }
+
+    // Prompt-audio region: pad token 0 (prompt_pad_token), text_mask=0, feat_mask=1,
+    // carrying the prompt VAE features (prompt_feat) on the audio track.
+    for (int i = 0; i < prompt_frames; ++i) {
+        inputs.token_ids.push_back(0);
+        inputs.text_mask.push_back(0);
+        inputs.feat_mask.push_back(1);
+        const size_t offset = static_cast<size_t>(i) * stride;
+        inputs.audio_feat.insert(inputs.audio_feat.end(), prompt_feat.begin() + static_cast<std::ptrdiff_t>(offset),
+                                 prompt_feat.begin() + static_cast<std::ptrdiff_t>(offset + stride));
+    }
+
+    return true;
+}
+
 std::vector<float> VoxCPM2Runtime::generate_tokens(const std::vector<int32_t> &  token_ids,
                                                    const VoxCPM2GenerateParams & params) {
     clear_error();
@@ -1633,6 +1700,60 @@ std::vector<float> VoxCPM2Runtime::generate_with_clone(const std::string &      
     if (!last_error_msg.empty()) {
         return {};
     }
+    return decode_to_waveform(params.target_sr);
+}
+
+std::vector<float> VoxCPM2Runtime::generate_with_continuation(const std::string &           target_text,
+                                                             const std::string &           prompt_text,
+                                                             const std::vector<float> &    prompt_wav,
+                                                             const VoxCPM2GenerateParams & params) {
+    // Continuation-mode voice cloning (Python voxcpm2.py:589-623 / 668-676).
+    // Tokenize the CONCATENATED string (prompt_text + target_text) ONCE so that
+    // CJK multi-char expansion applies to the joined string — do NOT tokenize the
+    // two strings separately and concatenate token ids.
+    const std::string    joined_text = prompt_text + target_text;
+    std::vector<int32_t> token_ids   = tokenize_text(joined_text, false, true);
+    if (token_ids.empty()) {
+        if (last_error_msg.empty()) {
+            fail("text tokenization produced no tokens");
+        }
+        return {};
+    }
+
+    // VAE-encode the prompt audio with the existing reference-audio encoder.
+    std::vector<float> prompt_feat = encode_reference_audio(prompt_wav, params.reference_sample_rate);
+    if (prompt_feat.empty()) {
+        return {};
+    }
+
+    VoxCPM2PrefillInputs inputs;
+    if (!build_continuation_prefill_inputs(token_ids, prompt_feat, params.append_audio_start, inputs)) {
+        return {};
+    }
+
+    if (params.seed != 0) {
+        rng.seed(params.seed);
+    }
+    if (!prefill(inputs)) {
+        return {};
+    }
+    decode_loop(params, nullptr);
+    if (!last_error_msg.empty()) {
+        return {};
+    }
+
+    // Head-trim note (Python voxcpm2.py:947-948 / 668-676):
+    //   Python pre-seeds pred_feat_seq with the last (streaming_prefix_len - 1)
+    //   PROMPT audio patches (voxcpm2.py:1016-1020), decodes the whole sequence,
+    //   then trims patch_len*(streaming_prefix_len - 1) leading samples to drop
+    //   that regenerated prompt region.
+    //   This C++ runtime does NOT pre-seed output_pool: prefill() seeds only
+    //   prefix_feat_cond from the last prompt-audio patch (voxcpm2_runtime.cpp
+    //   ~930-936) while output_pool starts empty, and the decode loop appends
+    //   ONLY generated patches. decode_to_waveform() therefore already produces
+    //   exactly the generated region — equivalent to Python's POST-trim output.
+    //   So no explicit head-trim is applied here (same as the reference/clone
+    //   path, which also never pre-seeds nor trims).
     return decode_to_waveform(params.target_sr);
 }
 

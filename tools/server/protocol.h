@@ -83,6 +83,9 @@ struct ParsedSessionInit {
 
     std::string mode; // "full_duplex" or "turn_based"
 
+    // TTS enabled flag — defaults to true for backward compatibility
+    bool use_tts = true;
+
     // voice reference audio (base64 float32 PCM)
     std::string ref_audio_b64;
     std::string tts_ref_audio_b64;

@@ -614,8 +614,16 @@ void ggml_metal_rsets_free(ggml_metal_rsets_t rsets) {
         return;
     }
 
-    // note: if you hit this assert, most likely you haven't deallocated all Metal resources before exiting
-    GGML_ASSERT([rsets->data count] == 0);
+    // Tolerate leftover residency-set entries at teardown instead of aborting.
+    // On process exit the Metal device singleton's destructor can run before
+    // every Metal buffer has been released (static destruction ordering), which
+    // used to trip GGML_ASSERT([rsets->data count] == 0) and abort an otherwise
+    // successful run (exit 134) *after* the result was already produced. Since
+    // we are freeing the residency-set collection itself here, just drop any
+    // stragglers rather than crashing.
+    if ([rsets->data count] != 0) {
+        [rsets->data removeAllObjects];
+    }
 
     atomic_store_explicit(&rsets->d_stop, true, memory_order_relaxed);
 

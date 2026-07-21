@@ -523,9 +523,7 @@ static omni_context * create_session_octx(common_params & params, const ParsedSe
                                           const std::string & output_dir) {
     int media_type = 2; // omni
     bool duplex_mode = (init.mode == "full_duplex");
-    // Turn-based sessions may request TTS per input.append. Load the TTS-capable
-    // context up front, then toggle octx->use_tts per request.
-    bool use_tts = true;
+    bool use_tts = init.use_tts;
 
     // Build params for omni_init
     auto & p = params;
@@ -581,7 +579,7 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
                         llama_context * ctx,
                         omni_context *& shared_octx,
                         std::mutex & octx_mutex) {
-    const std::string temp_dir = fs::temp_directory_path() / "omni_ws";
+    const std::string temp_dir = (fs::temp_directory_path() / "omni_ws").string();
     fs::create_directories(temp_dir);
     int msg_counter = 0;
     std::vector<std::string> retained_media_files;
