@@ -56,6 +56,7 @@
 #include <aclnnop/aclnn_index_select.h>
 #include <aclnnop/aclnn_layer_norm.h>
 #include <aclnnop/aclnn_log.h>
+#include <aclnnop/aclnn_lt_scalar.h>
 #include <aclnnop/aclnn_matmul.h>
 #include <aclnnop/aclnn_max_pool.h>
 #include <aclnnop/aclnn_mean.h>
@@ -3970,48 +3971,62 @@ void ggml_cann_flash_attn_ext(ggml_backend_cann_context & ctx, ggml_tensor * dst
             src2_bsnd_ne[0] = D_padded;
         }
 
-        // Step 3: create the PSEShift tensor if needed
-        //         this tensor is considered as mask (f16) in the llama.cpp
+        // Step 3: attention mask / position encoding for FusedInferAttentionScoreV2.
+        // Ascend docs:
+        //   - attenMaskOptional: BOOL/INT8/UINT8 hard mask (True/1 = do not attend)
+        //   - pseShiftOptional:  FLOAT16/BFLOAT16 position encoding (ALiBi etc.), NOT -Inf masks
+        // llama.cpp src3 is an additive F16 mask (-Inf masked, finite keep/bias). Convert the
+        // hard-mask part to BOOL attenMask; keep finite ALiBi bias in pseShift when needed.
+        acl_tensor_ptr       atten_mask_tensor;
         acl_tensor_ptr       bcast_pse_tensor;
+        ggml_cann_pool_alloc atten_mask_allocator(ctx.pool());
         ggml_cann_pool_alloc bcast_pse_allocator(ctx.pool());
         if (src3 != nullptr) {
-            // Construct the truncated pse tensor (common for prefill/decode)
-            int64_t trunc_pse_ne[GGML_MAX_DIMS] = {
-                src3->ne[0],  // D
-                src0->ne[1],  // S (number of Q tokens)
-                src3->ne[2],  // mask N
+            // Truncate to current Q length; ACL layout after reverse is [B, N_mask, Q_S, KV_S].
+            int64_t mask_ne[GGML_MAX_DIMS] = {
+                src3->ne[0],  // KV_S
+                src0->ne[1],  // Q_S
+                src3->ne[2],  // mask N (often 1)
                 src3->ne[3]   // B
             };
-            size_t * trunc_pse_nb = src3->nb;
+            size_t * mask_src_nb = src3->nb;
 
             acl_tensor_ptr acl_mask_f16_trunc_tensor = ggml_cann_create_tensor(
-                src3->data, ACL_FLOAT16, sizeof(uint16_t), trunc_pse_ne, trunc_pse_nb, GGML_MAX_DIMS);
+                src3->data, ACL_FLOAT16, sizeof(uint16_t), mask_ne, mask_src_nb, GGML_MAX_DIMS);
 
-            int64_t bcast_pse_ne[GGML_MAX_DIMS];
-            size_t  bcast_pse_nb[GGML_MAX_DIMS];
-            bcast_pse_ne[0] = src3->ne[0];  // D
-            bcast_pse_ne[1] = src0->ne[1];  // S
-            bcast_pse_ne[2] = src0->ne[2];  // N (num_heads)
-            bcast_pse_ne[3] = src3->ne[3];  // B
-            if (maxBias == 0.0f) {
-                // When maxBias == 0.0f, use nb = 0 reduce once repeat (Qwen2)
-                // Construct the bcast tensor (simulate repeat on the head dimension using stride=0)
-                bcast_pse_nb[0] = sizeof(uint16_t);
-                bcast_pse_nb[1] = bcast_pse_nb[0] * bcast_pse_ne[0];
-                bcast_pse_nb[2] = 0;  // <---- the head dimension shares the same data
-                bcast_pse_nb[3] = src3->nb[3];
+            // Contiguous BOOL attenMask: True where additive mask is -Inf / large negative.
+            size_t mask_bool_nb[GGML_MAX_DIMS];
+            mask_bool_nb[0] = sizeof(uint8_t);
+            for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+                mask_bool_nb[i] = mask_bool_nb[i - 1] * (size_t) mask_ne[i - 1];
+            }
+            const int64_t mask_nelems = mask_ne[0] * mask_ne[1] * mask_ne[2] * mask_ne[3];
+            void *        atten_buf   = atten_mask_allocator.alloc((size_t) mask_nelems * sizeof(uint8_t));
+            atten_mask_tensor =
+                ggml_cann_create_tensor(atten_buf, ACL_BOOL, sizeof(uint8_t), mask_ne, mask_bool_nb, GGML_MAX_DIMS);
 
-                bcast_pse_tensor = ggml_cann_create_tensor(src3->data, ACL_FLOAT16, sizeof(uint16_t), bcast_pse_ne,
-                                                           bcast_pse_nb, GGML_MAX_DIMS);
+            float          thresh   = -1.0e4f;
+            acl_scalar_ptr thresh_s = ggml_cann_create_scalar(&thresh, ACL_FLOAT);
+            GGML_CANN_CALL_ACLNN_OP(ctx, LtScalar, acl_mask_f16_trunc_tensor.get(), thresh_s.get(),
+                                    atten_mask_tensor.get());
 
-            } else {
+            // ALiBi / max_bias: finite position bias still belongs in pseShift.
+            if (maxBias != 0.0f) {
+                int64_t bcast_pse_ne[GGML_MAX_DIMS] = {
+                    src3->ne[0],  // KV_S
+                    src0->ne[1],  // Q_S
+                    src0->ne[2],  // N heads
+                    src3->ne[3]   // B
+                };
+                size_t bcast_pse_nb[GGML_MAX_DIMS];
                 bcast_pse_nb[0] = sizeof(uint16_t);
                 for (int i = 1; i < GGML_MAX_DIMS; i++) {
-                    bcast_pse_nb[i] = bcast_pse_nb[i - 1] * bcast_pse_ne[i - 1];
+                    bcast_pse_nb[i] = bcast_pse_nb[i - 1] * (size_t) bcast_pse_ne[i - 1];
                 }
 
-                void * bcast_pse_buffer =
-                    bcast_pse_allocator.alloc(ggml_nelements(src3) * src0->ne[2] * sizeof(uint16_t));
+                void * bcast_pse_buffer = bcast_pse_allocator.alloc(
+                    (size_t) (bcast_pse_ne[0] * bcast_pse_ne[1] * bcast_pse_ne[2] * bcast_pse_ne[3]) *
+                    sizeof(uint16_t));
 
                 bcast_pse_tensor = ggml_cann_create_tensor(bcast_pse_buffer, ACL_FLOAT16, sizeof(uint16_t),
                                                            bcast_pse_ne, bcast_pse_nb, GGML_MAX_DIMS);
@@ -4019,8 +4034,14 @@ void ggml_cann_flash_attn_ext(ggml_backend_cann_context & ctx, ggml_tensor * dst
                 int64_t repeats[] = { 1, src0->ne[2], 1, 1 };
                 aclnn_repeat(ctx, acl_mask_f16_trunc_tensor.get(), bcast_pse_tensor.get(), repeats);
 
-                // alibi
-                // Compute the slope if needed. Derived from ggml_cann_softmax().
+                // Remove -Inf from PSE; hard masking is already in attenMask.
+                float          lo    = -1.0e4f;
+                float          hi    = 1.0e4f;
+                acl_scalar_ptr min_s = ggml_cann_create_scalar(&lo, ACL_FLOAT);
+                acl_scalar_ptr max_s = ggml_cann_create_scalar(&hi, ACL_FLOAT);
+                GGML_CANN_CALL_ACLNN_OP(ctx, Clamp, bcast_pse_tensor.get(), min_s.get(), max_s.get(),
+                                        bcast_pse_tensor.get());
+
                 const int64_t        n_heads = src0->ne[2];
                 ggml_cann_pool_alloc slope_allocator(ctx.pool(), n_heads * sizeof(uint16_t));
                 void *               slope_buffer = slope_allocator.get();
@@ -4030,7 +4051,7 @@ void ggml_cann_flash_attn_ext(ggml_backend_cann_context & ctx, ggml_tensor * dst
                 size_t  slope_nb[GGML_MAX_DIMS];
                 slope_nb[0] = sizeof(uint16_t);
                 for (int i = 1; i < GGML_MAX_DIMS; i++) {
-                    slope_nb[i] = slope_nb[i - 1] * slope_ne[0];
+                    slope_nb[i] = slope_nb[i - 1] * (size_t) slope_ne[0];
                 }
 
                 acl_tensor_ptr slope_tensor = ggml_cann_create_tensor(slope_buffer, ACL_FLOAT16, sizeof(uint16_t),
@@ -4050,12 +4071,16 @@ void ggml_cann_flash_attn_ext(ggml_backend_cann_context & ctx, ggml_tensor * dst
         int64_t nextTokens         = 65535;
         char    layout[5]          = { 'B', 'S', 'N', 'D', 0 };
         int64_t sparseMode         = 0;
+        // Q_S>1 + custom attenMask: high-precision + row-invalid fix (bit1), per Ascend docs.
         int64_t innerPrecise       = (src0->ne[1] == 1) ? 0 : 2;
         int64_t blockSize          = 0;
         int64_t antiquantMode      = 0;
         bool    softmaxLseFlag     = false;
         int64_t keyAntiquantMode   = 0;
         int64_t valueAntiquantMode = 0;
+
+        aclTensor * pse_arg  = bcast_pse_tensor.get();   // set only when maxBias != 0
+        aclTensor * mask_arg = atten_mask_tensor.get();  // BOOL attenMask from additive F16 mask
 
         GGML_ASSERT(dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16);
         acl_tensor_ptr       fa_dst_tensor;
@@ -4078,7 +4103,7 @@ void ggml_cann_flash_attn_ext(ggml_backend_cann_context & ctx, ggml_tensor * dst
 
         GGML_CANN_CALL_ACLNN_OP(ctx, FusedInferAttentionScoreV2, acl_q_tensor.get(), acl_k_tensor_list.get(),
                                 acl_v_tensor_list.get(),               // q, k, v
-                                bcast_pse_tensor.get(), nullptr,       // pse, mask
+                                pse_arg, mask_arg,                     // pse, mask
                                 nullptr, nullptr,                      // actSeqLen, actSeqLenkv
                                 nullptr, nullptr,                      // deqScale1, quantScale1
                                 nullptr, nullptr, nullptr,             // deqScale2, quantScale2, quantOffset2
