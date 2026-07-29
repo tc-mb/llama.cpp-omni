@@ -10,6 +10,8 @@
 #include "session.h"
 #include "ws_handler.h"
 
+#include <atomic>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <queue>
@@ -309,8 +311,18 @@ int main(int argc, char ** argv) {
         }
 
         // SSE streaming
+        // cpp-httplib calls ContentProviderWithoutLength in a loop until sink.done()
+        // or the provider returns false. Returning true after a non-empty write WITHOUT
+        // sink.done() re-enters this lambda and starts another stream_decode (burns
+        // force_listen 1/2/3 in ~1ms, then runaway SPEAK).
+        auto decode_once = std::make_shared<std::atomic<bool>>(false);
         res.set_chunked_content_provider("text/event-stream",
-            [&](size_t, httplib::DataSink & sink) -> bool {
+            [&, debug_dir, round_idx, decode_once](size_t, httplib::DataSink & sink) -> bool {
+                if (decode_once->exchange(true)) {
+                    sink.done();
+                    return false;
+                }
+
                 // reset state
                 {
                     std::lock_guard<std::mutex> lock(state.octx->text_mtx);
@@ -348,6 +360,7 @@ int main(int argc, char ** argv) {
 
                         if (!server_sent_event(sink, ev)) {
                             if (worker.joinable()) worker.join();
+                            sink.done();
                             return false;
                         }
                         lk.lock();
@@ -358,10 +371,10 @@ int main(int argc, char ** argv) {
 
                 if (worker.joinable()) worker.join();
 
-                // send done
                 static const std::string ev_done = "data: [DONE]\n\n";
                 sink.write(ev_done.data(), ev_done.size());
-                return true;
+                sink.done();
+                return false;
             });
     });
 
