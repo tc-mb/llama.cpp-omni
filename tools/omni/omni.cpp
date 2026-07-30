@@ -244,7 +244,9 @@ static OmniTokenType get_token_type(struct omni_context * ctx, llama_token token
         return OmniTokenType::TURN_EOS;
     } else if (token == ctx->special_token_tts_eos) {
         return OmniTokenType::TTS_EOS;
-    } else if (token == ctx->special_token_eos) {
+    } else if (token == ctx->special_token_im_end ||
+               token == ctx->special_token_slash_s ||
+               token == ctx->special_token_eos) {
         return OmniTokenType::EOS;
     }
     return OmniTokenType::NORMAL;
@@ -1381,6 +1383,27 @@ static const char * sample_with_hidden_and_token(struct common_sampler * smpl, s
             } else {
                 // logit <= 0 时，乘以 length_penalty 来降低概率
                 logits[ctx_omni->special_token_tts_eos] = eos_logit * ctx_omni->length_penalty;
+            }
+        }
+    }
+
+    if (!ctx_omni->duplex_mode && logits != nullptr) {
+        // Simplex generation must not enter the duplex state machine. These
+        // control tokens can otherwise form a chunk_eos/listen loop instead
+        // of reaching a simplex terminator.
+        const llama_token simplex_forbidden[] = {
+            ctx_omni->special_token_speak,
+            ctx_omni->special_token_listen,
+            ctx_omni->special_token_chunk_eos,
+            ctx_omni->special_token_chunk_tts_eos,
+            ctx_omni->special_token_turn_eos,
+            ctx_omni->special_token_tts_pad,
+            ctx_omni->special_token_unit_end,
+            ctx_omni->tts_bos_token_id,
+        };
+        for (const llama_token token : simplex_forbidden) {
+            if (token >= 0) {
+                logits[token] = -INFINITY;
             }
         }
     }
@@ -4610,7 +4633,16 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
         ctx_omni->special_token_chunk_tts_eos = find_token("<|chunk_tts_eos|>");
         ctx_omni->special_token_turn_eos = find_token("<|turn_eos|>");
         ctx_omni->special_token_tts_eos = find_token("<|tts_eos|>");
+        ctx_omni->special_token_im_end = find_token("<|im_end|>");
+        ctx_omni->special_token_slash_s = find_token("</s>");
         ctx_omni->special_token_eos = llama_vocab_eos(vocab);
+
+        print_with_timestamp(
+            "LLM terminators: tts_eos=%d, im_end=%d, slash_s=%d, vocab_eos=%d\n",
+            ctx_omni->special_token_tts_eos,
+            ctx_omni->special_token_im_end,
+            ctx_omni->special_token_slash_s,
+            ctx_omni->special_token_eos);
         
         // 同时初始化 tts_bos_token_id（用于双工模式强制继续说话）
         llama_token tts_bos = find_token("<|tts_bos|>");
@@ -11202,7 +11234,8 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
                     // 🔧 [与 Python 对齐] 设置 llm_generation_done 标志
                     // TTS 线程会检查这个标志来决定是否添加 text_eos_embed
                     if (!ctx_omni->duplex_mode) ctx_omni->llm_generation_done.store(true);
-                    print_with_timestamp("LLM: detected end token, set llm_generation_done=true\n");
+                    print_with_timestamp("LLM: detected end token id=%d type=%s, set llm_generation_done=true\n",
+                                         sampled_token, get_token_type_name(token_type));
                     
                     // 🔧 [P1-双工模式] 设置 current_turn_ended 状态
                     // Python: end_of_turn = last_id in turn_terminator_token_ids (只有 turn_eos)
