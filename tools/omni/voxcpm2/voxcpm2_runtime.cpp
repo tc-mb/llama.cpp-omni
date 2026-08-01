@@ -1283,24 +1283,34 @@ void VoxCPM2Runtime::decode_loop(const VoxCPM2GenerateParams &                  
     }
 }
 
-std::vector<float> VoxCPM2Runtime::decode_to_waveform(int target_sr) {
+std::vector<float> VoxCPM2Runtime::decode_pool_range_to_waveform(int start_patch, int end_patch, int target_sr) {
     clear_error();
     if (!is_initialized) {
         fail("runtime is not initialized");
         return {};
     }
-    if (output_pool.empty()) {
+    const int n_pool = static_cast<int>(output_pool.size());
+    if (n_pool <= 0) {
+        return {};
+    }
+    if (end_patch < 0 || end_patch > n_pool) {
+        end_patch = n_pool;
+    }
+    if (start_patch < 0) {
+        start_patch = 0;
+    }
+    if (start_patch >= end_patch) {
         return {};
     }
 
     const int fdim         = feat_dim();
     const int psize        = patch_size();
-    const int n_patches    = static_cast<int>(output_pool.size());
+    const int n_patches    = end_patch - start_patch;
     const int total_frames = n_patches * psize;
 
     std::vector<float> latents(static_cast<size_t>(total_frames) * static_cast<size_t>(fdim), 0.0f);
     for (int p = 0; p < n_patches; ++p) {
-        const std::vector<float> & patch = output_pool[static_cast<size_t>(p)];
+        const std::vector<float> & patch = output_pool[static_cast<size_t>(start_patch + p)];
         if (patch.size() != static_cast<size_t>(fdim * psize)) {
             fail("output_pool contains an invalid latent patch");
             return {};
@@ -1357,6 +1367,10 @@ std::vector<float> VoxCPM2Runtime::decode_to_waveform(int target_sr) {
     auto result = tensor_to_vector(waveform);
     ggml_gallocr_free(galloc);
     return result;
+}
+
+std::vector<float> VoxCPM2Runtime::decode_to_waveform(int target_sr) {
+    return decode_pool_range_to_waveform(0, -1, target_sr);
 }
 
 std::vector<float> VoxCPM2Runtime::encode_reference_audio(const std::vector<float> & reference_wav, int sample_rate) {
@@ -1764,28 +1778,42 @@ bool VoxCPM2Runtime::decode_streaming_from_ready_state(const VoxCPM2GeneratePara
         return fail("streaming decode requires initialized runtime and successful prefill");
     }
 
-    size_t emitted_samples = 0;
-    bool   sent_final      = false;
+    // Match Python: decode only the last streaming_prefix_len patches each step and
+    // yield the newest patch's audio. Full-pool re-decode was O(n^2) and routinely
+    // pushed RTF > 1 (playback underruns / mid-stream pauses).
+    const int prefix_len = std::max(1, params.streaming_prefix_len);
+    bool      sent_final = false;
     for (int i = 0; i < params.max_steps; ++i) {
         VoxCPM2DecodeStepResult step = decode_step(params);
         if (step.latent_patch.empty()) {
             break;
         }
 
-        std::vector<float> waveform = decode_to_waveform(params.target_sr);
-        if (waveform.size() < emitted_samples) {
-            return fail("streaming waveform unexpectedly shrank");
+        const int n_pool = static_cast<int>(output_pool.size());
+        const int n_win  = std::min(prefix_len, n_pool);
+        const int start  = n_pool - n_win;
+        std::vector<float> waveform = decode_pool_range_to_waveform(start, n_pool, params.target_sr);
+        if (waveform.empty()) {
+            if (!last_error_msg.empty()) {
+                return false;
+            }
+            break;
+        }
+        if (waveform.size() % static_cast<size_t>(n_win) != 0) {
+            return fail("streaming AudioVAE decode length is not divisible by window patch count");
         }
 
-        std::vector<float> chunk;
-        if (waveform.size() > emitted_samples) {
-            chunk.assign(waveform.begin() + static_cast<std::ptrdiff_t>(emitted_samples), waveform.end());
-            emitted_samples = waveform.size();
-        }
+        // Yield only the newest patch (tail), keeping earlier patches as VAE context.
+        const size_t patch_samples = waveform.size() / static_cast<size_t>(n_win);
+        const size_t tail_off      = patch_samples * static_cast<size_t>(n_win - 1);
+        std::vector<float> chunk(waveform.begin() + static_cast<std::ptrdiff_t>(tail_off), waveform.end());
 
         const bool is_final = params.stop_on_predictor && i > params.min_steps && step.should_stop;
         if (callback && (!chunk.empty() || is_final)) {
-            callback(chunk, is_final);
+            if (!callback(chunk, is_final)) {
+                // Consumer cancelled (client gone): stop decoding, not an error.
+                return true;
+            }
         }
         if (is_final) {
             sent_final = true;
@@ -1831,6 +1859,73 @@ bool VoxCPM2Runtime::generate_streaming(const std::string &               text,
         return false;
     }
     return generate_tokens_streaming(token_ids, callback, params);
+}
+
+bool VoxCPM2Runtime::generate_with_clone_streaming(const std::string &               text,
+                                                   const std::vector<float> &        reference_wav,
+                                                   const VoxCPM2AudioChunkCallback & callback,
+                                                   const VoxCPM2GenerateParams &     params) {
+    clear_error();
+    std::vector<int32_t> token_ids = tokenize_text(text, false, true);
+    if (token_ids.empty()) {
+        if (last_error_msg.empty()) {
+            fail("text tokenization produced no tokens");
+        }
+        return false;
+    }
+
+    std::vector<float> reference_feat = encode_reference_audio(reference_wav, params.reference_sample_rate);
+    if (reference_feat.empty()) {
+        return false;
+    }
+
+    VoxCPM2PrefillInputs inputs;
+    if (!build_reference_prefill_inputs(token_ids, reference_feat, params.append_audio_start, inputs)) {
+        return false;
+    }
+
+    if (params.seed != 0) {
+        rng.seed(params.seed);
+    }
+    if (!prefill(inputs)) {
+        return false;
+    }
+    return decode_streaming_from_ready_state(params, callback);
+}
+
+bool VoxCPM2Runtime::generate_with_continuation_streaming(const std::string &               target_text,
+                                                          const std::string &               prompt_text,
+                                                          const std::vector<float> &        prompt_wav,
+                                                          const VoxCPM2AudioChunkCallback & callback,
+                                                          const VoxCPM2GenerateParams &     params) {
+    clear_error();
+    // Same tokenize-once rule as generate_with_continuation (CJK expansion on joined string).
+    const std::string    joined_text = prompt_text + target_text;
+    std::vector<int32_t> token_ids   = tokenize_text(joined_text, false, true);
+    if (token_ids.empty()) {
+        if (last_error_msg.empty()) {
+            fail("text tokenization produced no tokens");
+        }
+        return false;
+    }
+
+    std::vector<float> prompt_feat = encode_reference_audio(prompt_wav, params.reference_sample_rate);
+    if (prompt_feat.empty()) {
+        return false;
+    }
+
+    VoxCPM2PrefillInputs inputs;
+    if (!build_continuation_prefill_inputs(token_ids, prompt_feat, params.append_audio_start, inputs)) {
+        return false;
+    }
+
+    if (params.seed != 0) {
+        rng.seed(params.seed);
+    }
+    if (!prefill(inputs)) {
+        return false;
+    }
+    return decode_streaming_from_ready_state(params, callback);
 }
 
 void VoxCPM2Runtime::free() {

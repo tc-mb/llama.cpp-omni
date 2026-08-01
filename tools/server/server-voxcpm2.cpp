@@ -312,6 +312,12 @@ int main(int argc, char ** argv) {
             return;
         }
 
+        // Ultimate clone (continuation): reference_audio + prompt_text/ref_text
+        // Plain clone: reference_audio only
+        std::string prompt_text = json_value(data, "prompt_text", std::string(""));
+        if (prompt_text.empty()) prompt_text = json_value(data, "reference_text", std::string(""));
+        if (prompt_text.empty()) prompt_text = json_value(data, "ref_text", std::string(""));
+
         std::vector<float> wav;
         if (data.contains("reference_audio") && data.at("reference_audio").is_string()) {
             std::string ref_b64 = data.at("reference_audio").get<std::string>();
@@ -324,7 +330,13 @@ int main(int argc, char ** argv) {
                     return;
                 }
                 gen_params.reference_sample_rate = ref_sr;
-                wav = rt->generate_with_clone(input, ref_pcm, gen_params);
+                if (!prompt_text.empty()) {
+                    LOG_INF("clone+continuation (prompt_text len=%zu)\n", prompt_text.size());
+                    wav = rt->generate_with_continuation(input, prompt_text, ref_pcm, gen_params);
+                } else {
+                    LOG_INF("clone (reference_audio only, no prompt_text)\n");
+                    wav = rt->generate_with_clone(input, ref_pcm, gen_params);
+                }
             } else {
                 wav = rt->generate(input, gen_params);
             }
@@ -398,23 +410,33 @@ int main(int argc, char ** argv) {
                     memcpy(p, "RIFF", 4); p += 4; w32(0x7FFFFFFF); memcpy(p, "WAVE", 4); p += 4;
                     memcpy(p, "fmt ", 4); p += 4; w32(16); w16(1); w16(1); w32(sr); w32(sr * 2); w16(2); w16(16);
                     memcpy(p, "data", 4); p += 4; w32(0x7FFFFFFF);
-                    sink.write(header.data(), header.size());
+                    if (!sink.write(header.data(), header.size())) {
+                        return false;
+                    }
                 }
 
                 bool has_clone = data.contains("reference_audio") && data.at("reference_audio").is_string()
                                  && !data.at("reference_audio").get<std::string>().empty();
+                std::string prompt_text = json_value(data, "prompt_text", std::string(""));
+                if (prompt_text.empty()) prompt_text = json_value(data, "reference_text", std::string(""));
+                if (prompt_text.empty()) prompt_text = json_value(data, "ref_text", std::string(""));
 
-                auto chunk_callback = [&sink](const std::vector<float> & chunk, bool /*is_final*/) {
-                    if (chunk.empty()) return;
+                // Return false to cancel decode when the HTTP client disconnects.
+                auto chunk_callback = [&sink](const std::vector<float> & chunk, bool /*is_final*/) -> bool {
+                    if (chunk.empty()) return sink.is_writable();
                     std::string buf(chunk.size() * 2, '\0');
                     auto * dst = reinterpret_cast<int16_t *>(buf.data());
                     for (size_t i = 0; i < chunk.size(); ++i) {
                         float v = std::max(-1.0f, std::min(1.0f, chunk[i]));
                         dst[i] = static_cast<int16_t>(v * 32767.0f);
                     }
-                    sink.write(buf.data(), buf.size());
+                    return sink.write(buf.data(), buf.size());
                 };
 
+                // Full text in → true streaming audio out (incl. clone / continuation).
+                // Clone uses the same prefill as generate_with_* then patch-wise
+                // decode_streaming_from_ready_state for early TTFA (was: full decode + 100ms fake chunks).
+                VoxCPM2Runtime * mutable_rt = const_cast<VoxCPM2Runtime *>(rt);
                 if (has_clone) {
                     std::string ref_b64 = data.at("reference_audio").get<std::string>();
                     std::vector<uint8_t> ref_bytes = base64_decode(ref_b64);
@@ -425,18 +447,17 @@ int main(int argc, char ** argv) {
                     }
                     auto p = gen_params;
                     p.reference_sample_rate = ref_sr;
-                    VoxCPM2Runtime * mutable_rt = const_cast<VoxCPM2Runtime *>(rt);
-                    std::vector<float> wav = mutable_rt->generate_with_clone(input, ref_pcm, p);
-                    if (wav.empty()) return false;
-                    const size_t chunk_size = sr / 10; // 100ms chunks
-                    for (size_t i = 0; i < wav.size(); i += chunk_size) {
-                        size_t len = std::min(chunk_size, wav.size() - i);
-                        std::vector<float> chunk(wav.begin() + i, wav.begin() + i + len);
-                        chunk_callback(chunk, false);
+                    const bool ok = prompt_text.empty()
+                        ? mutable_rt->generate_with_clone_streaming(input, ref_pcm, chunk_callback, p)
+                        : mutable_rt->generate_with_continuation_streaming(
+                              input, prompt_text, ref_pcm, chunk_callback, p);
+                    if (!ok) {
+                        return false;
                     }
                 } else {
-                    VoxCPM2Runtime * mutable_rt = const_cast<VoxCPM2Runtime *>(rt);
-                    mutable_rt->generate_streaming(input, chunk_callback, gen_params);
+                    if (!mutable_rt->generate_streaming(input, chunk_callback, gen_params)) {
+                        return false;
+                    }
                 }
 
                 sink.done();

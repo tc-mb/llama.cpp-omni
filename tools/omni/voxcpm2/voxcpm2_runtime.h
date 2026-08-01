@@ -17,7 +17,10 @@
 #include <unordered_set>
 #include <vector>
 
-using VoxCPM2AudioChunkCallback = std::function<void(const std::vector<float> & pcm, bool is_final)>;
+// Return false to cancel the stream (e.g. HTTP client disconnected): the decode
+// loop stops after the current step. Cancellation is not an error — the generate_*
+// call still returns true, and the next prefill() resets all decode state.
+using VoxCPM2AudioChunkCallback = std::function<bool(const std::vector<float> & pcm, bool is_final)>;
 
 struct VoxCPM2GenerateParams {
     int      max_steps             = 200;
@@ -30,6 +33,10 @@ struct VoxCPM2GenerateParams {
     uint32_t seed                  = 0;
     bool     stop_on_predictor     = true;
     bool     append_audio_start    = true;
+    // Sliding-window AudioVAE decode for streaming (Python default=4).
+    // Each step decodes only the last N patches and yields the newest patch —
+    // avoids O(n^2) full-sequence re-decode that pushes RTF > 1.
+    int      streaming_prefix_len  = 4;
 };
 
 struct VoxCPM2PrefillInputs {
@@ -157,6 +164,17 @@ struct VoxCPM2Runtime {
     bool                 generate_streaming(const std::string &               text,
                                             const VoxCPM2AudioChunkCallback & callback,
                                             const VoxCPM2GenerateParams &     params = {});
+    // Same prefill as generate_with_clone / continuation, then patch-wise streaming decode
+    // (early TTFA — mirrors Python generate_streaming with reference/prompt audio).
+    bool                 generate_with_clone_streaming(const std::string &               text,
+                                                       const std::vector<float> &        reference_wav,
+                                                       const VoxCPM2AudioChunkCallback & callback,
+                                                       const VoxCPM2GenerateParams &     params = {});
+    bool                 generate_with_continuation_streaming(const std::string &               target_text,
+                                                              const std::string &               prompt_text,
+                                                              const std::vector<float> &        prompt_wav,
+                                                              const VoxCPM2AudioChunkCallback & callback,
+                                                              const VoxCPM2GenerateParams &     params = {});
 
     void reset_state();
     void free();
@@ -238,5 +256,7 @@ struct VoxCPM2Runtime {
                                                            VoxCPM2PrefillInputs &       inputs);
     bool                 decode_streaming_from_ready_state(const VoxCPM2GenerateParams &     params,
                                                            const VoxCPM2AudioChunkCallback & callback);
+    // Decode output_pool[start_patch, end_patch). end_patch < 0 → size.
+    std::vector<float>   decode_pool_range_to_waveform(int start_patch, int end_patch, int target_sr = 0);
     std::vector<int32_t> expand_multichar_cjk_tokens(const std::vector<int32_t> & ids) const;
 };

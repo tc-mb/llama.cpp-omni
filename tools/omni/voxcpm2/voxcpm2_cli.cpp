@@ -266,10 +266,27 @@ static int run_synthesis(const CliConfig & cfg) {
                 static_cast<double>(prompt_wav.size()) / prompt_sr, prompt_sr);
 
         params.reference_sample_rate = prompt_sr;
-        wav = runtime.generate_with_continuation(cfg.text, cfg.prompt_text, prompt_wav, params);
-        if (wav.empty()) {
-            LOG_ERR("Continuation cloning failed: %s\n", runtime.last_error().c_str());
-            return 1;
+        if (cfg.streaming) {
+            LOG_INF("Generating (continuation streaming)...\n");
+            std::vector<float> all_wav;
+            if (!runtime.generate_with_continuation_streaming(
+                    cfg.text, cfg.prompt_text, prompt_wav,
+                    [&all_wav](const std::vector<float> & chunk, bool is_final) {
+                        all_wav.insert(all_wav.end(), chunk.begin(), chunk.end());
+                        LOG_INF("  Chunk: %zu samples%s\n", chunk.size(), is_final ? " (final)" : "");
+                        return true;
+                    },
+                    params)) {
+                LOG_ERR("Continuation streaming failed: %s\n", runtime.last_error().c_str());
+                return 1;
+            }
+            wav = std::move(all_wav);
+        } else {
+            wav = runtime.generate_with_continuation(cfg.text, cfg.prompt_text, prompt_wav, params);
+            if (wav.empty()) {
+                LOG_ERR("Continuation cloning failed: %s\n", runtime.last_error().c_str());
+                return 1;
+            }
         }
     } else if (!cfg.reference_wav_path.empty()) {
         // Voice cloning mode
@@ -284,10 +301,27 @@ static int run_synthesis(const CliConfig & cfg) {
                 static_cast<double>(ref_wav.size()) / ref_sr, ref_sr);
 
         params.reference_sample_rate = ref_sr;
-        wav = runtime.generate_with_clone(cfg.text, ref_wav, params);
-        if (wav.empty()) {
-            LOG_ERR("Voice cloning failed: %s\n", runtime.last_error().c_str());
-            return 1;
+        if (cfg.streaming) {
+            LOG_INF("Generating (clone streaming)...\n");
+            std::vector<float> all_wav;
+            if (!runtime.generate_with_clone_streaming(
+                    cfg.text, ref_wav,
+                    [&all_wav](const std::vector<float> & chunk, bool is_final) {
+                        all_wav.insert(all_wav.end(), chunk.begin(), chunk.end());
+                        LOG_INF("  Chunk: %zu samples%s\n", chunk.size(), is_final ? " (final)" : "");
+                        return true;
+                    },
+                    params)) {
+                LOG_ERR("Clone streaming failed: %s\n", runtime.last_error().c_str());
+                return 1;
+            }
+            wav = std::move(all_wav);
+        } else {
+            wav = runtime.generate_with_clone(cfg.text, ref_wav, params);
+            if (wav.empty()) {
+                LOG_ERR("Voice cloning failed: %s\n", runtime.last_error().c_str());
+                return 1;
+            }
         }
     } else if (cfg.streaming) {
         // Streaming mode
@@ -297,6 +331,7 @@ static int run_synthesis(const CliConfig & cfg) {
             [&all_wav](const std::vector<float> & chunk, bool is_final) {
                 all_wav.insert(all_wav.end(), chunk.begin(), chunk.end());
                 LOG_INF("  Chunk: %zu samples%s\n", chunk.size(), is_final ? " (final)" : "");
+                return true;
             },
             params);
         wav = std::move(all_wav);
