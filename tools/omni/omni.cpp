@@ -9840,6 +9840,15 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
     // ---- force_listen：会话开局强制 LISTEN N 次 ----
     if (ctx_omni->force_listen_used < ctx_omni->force_listen_count) {
         ctx_omni->force_listen_used++;
+        if (ctx_omni->special_token_listen >= 0) {
+            common_sampler_accept(ctx_omni->ctx_sampler, ctx_omni->special_token_listen, true);
+            std::vector<llama_token> tokens = {ctx_omni->special_token_listen};
+            eval_tokens(ctx_omni, params, tokens, params->n_batch, &ctx_omni->n_past);
+        }
+        if (ctx_omni->special_token_unit_end >= 0) {
+            std::vector<llama_token> tokens = {ctx_omni->special_token_unit_end};
+            eval_tokens(ctx_omni, params, tokens, params->n_batch, &ctx_omni->n_past);
+        }
         ctx_omni->slide_last_was_listen = true;
         ctx_omni->ended_with_listen     = true;
         ctx_omni->current_turn_ended    = false;
@@ -10782,6 +10791,20 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
         // 用户音频的 KV cache 已经在 stream_prefill 阶段写入，所以不会丢失上下文。
         if (ctx_omni->force_listen_used < ctx_omni->force_listen_count) {
             ctx_omni->force_listen_used++;
+            {
+                std::lock_guard<std::mutex> llama_lock(ctx_omni->llama_mtx);
+                if (ctx_omni->special_token_listen >= 0) {
+                    common_sampler_accept(ctx_omni->ctx_sampler, ctx_omni->special_token_listen, true);
+                    std::vector<llama_token> tokens = {ctx_omni->special_token_listen};
+                    eval_tokens(ctx_omni, ctx_omni->params, tokens,
+                                ctx_omni->params->n_batch, &ctx_omni->n_past);
+                }
+                if (ctx_omni->special_token_unit_end >= 0) {
+                    std::vector<llama_token> tokens = {ctx_omni->special_token_unit_end};
+                    eval_tokens(ctx_omni, ctx_omni->params, tokens,
+                                ctx_omni->params->n_batch, &ctx_omni->n_past);
+                }
+            }
             ctx_omni->slide_last_was_listen = true;
             ctx_omni->ended_with_listen = true;
             ctx_omni->current_turn_ended = false;
