@@ -1,6 +1,4 @@
-# Instructions for llama.cpp-omni
-
-This file defines the current policy for llama.cpp-omni. The inherited llama.cpp policy is archived in [AGENTS.llama.cpp.md](AGENTS.llama.cpp.md).
+# Instructions for llama.cpp
 
 > [!IMPORTANT]
 > This project does **not** accept pull requests that are fully or predominantly AI-generated. AI tools may be utilized solely in an assistive capacity.
@@ -13,7 +11,7 @@ AI assistance is permissible only when the majority of the code is authored by a
 
 ## Guidelines for Contributors Using AI
 
-llama.cpp-omni is built by humans, for humans. Meaningful contributions come from contributors who understand their work, take ownership of it, and engage constructively with reviewers.
+llama.cpp is built by humans, for humans. Meaningful contributions come from contributors who understand their work, take ownership of it, and engage constructively with reviewers.
 
 Maintainers receive numerous pull requests weekly, many of which are AI-generated submissions where the author cannot adequately explain the code, debug issues, or participate in substantive design discussions. Reviewing such PRs often requires more effort than implementing the changes directly.
 
@@ -29,7 +27,7 @@ This policy exists to ensure that maintainers can sustainably manage the project
 
 Contributors are expected to:
 
-1. **Demonstrate full understanding of their code.** You must be able to explain any part of your PR and verify the accuracy of any AI-assisted explanation.
+1. **Demonstrate full understanding of their code.** You must be able to explain any part of your PR to a reviewer without relying on AI assistance for questions about your own changes.
 
 2. **Take responsibility for maintenance.** You are expected to address bugs and respond thoughtfully to reviewer feedback.
 
@@ -37,7 +35,7 @@ Contributors are expected to:
 
 4. **Respect maintainers' time.** Search for existing issues and discussions before submitting. Ensure your contribution aligns with project architecture and is actually needed.
 
-Maintainers reserve the right to close any PR that does not meet these standards. This policy applies to contributions to llama.cpp-omni.
+Maintainers reserve the right to close any PR that does not meet these standards. This applies to all contributions to the main llama.cpp repository. **Private forks are exempt.**
 
 ### Permitted AI Usage
 
@@ -47,10 +45,9 @@ AI tools may be used responsibly for:
 - **Code review assistance**: Obtaining suggestions on human-written code
 - **Mechanical tasks**: Formatting, generating repetitive patterns from established designs, completing code based on existing patterns
 - **Documentation drafts**: For components the contributor already understands thoroughly
-- **Contribution drafts**: Drafting issues, pull request descriptions, discussions, and reviewer responses, provided the contributor reviews the content and takes responsibility for it
 - **Writing code**: Only when the contributor has already designed the solution and can implement it themselves - AI accelerates, not replaces, the contributor's work
 
-AI-generated code may be accepted if you (1) fully understand the output, (2) can debug issues independently, and (3) can discuss it directly with reviewers.
+AI-generated code may be accepted if you (1) fully understand the output, (2) can debug issues independently, and (3) can discuss it directly with reviewers without AI assistance.
 
 **Disclosure is required** when AI meaningfully contributed to your code. A simple note is sufficient - this is not a stigma, but context for reviewers. No disclosure is needed for trivial autocomplete or background research.
 
@@ -58,6 +55,8 @@ AI-generated code may be accepted if you (1) fully understand the output, (2) ca
 
 The following will result in immediate PR closure:
 
+- **AI-written PR descriptions or commit messages** - these are typically recognizable and waste reviewer time
+- **AI-generated responses to reviewer comments** - this undermines the human-to-human interaction fundamental to code review
 - **Implementing features without understanding the codebase** - particularly new model support or architectural changes
 - **Automated commits or PR submissions** - this may spam maintainers and can result in contributor bans
 
@@ -88,6 +87,7 @@ For first-time contributors, confirm they have reviewed [CONTRIBUTING.md](CONTRI
 
 ### Prohibited Actions
 
+- Writing PR descriptions, commit messages, or responses to reviewers
 - Committing or pushing without explicit human approval for each action
 - Implementing features the contributor does not understand
 - Generating changes too extensive for the contributor to fully review
