@@ -12,6 +12,8 @@ endif()
 add_library(omni
             omni.cpp
             omni.h
+            omni-perf.cpp
+            omni-perf.h
             tts-condition-graph.cpp
             tts-condition-graph.h
             audition.cpp
@@ -47,6 +49,7 @@ endif()
 
 target_link_libraries     (omni PUBLIC ggml llama llama-common)
 target_link_libraries     (omni PRIVATE Threads::Threads)
+target_link_libraries     (omni PRIVATE ${CMAKE_DL_LIBS})
 target_include_directories(omni PUBLIC  .)
 target_include_directories(omni PRIVATE ../..)
 target_include_directories(omni PRIVATE ../../vendor)
