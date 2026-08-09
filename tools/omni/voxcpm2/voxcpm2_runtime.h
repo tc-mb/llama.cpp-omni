@@ -33,10 +33,6 @@ struct VoxCPM2GenerateParams {
     uint32_t seed                  = 0;
     bool     stop_on_predictor     = true;
     bool     append_audio_start    = true;
-    // Sliding-window AudioVAE decode for streaming (Python default=4).
-    // Each step decodes only the last N patches and yields the newest patch —
-    // avoids O(n^2) full-sequence re-decode that pushes RTF > 1.
-    int      streaming_prefix_len  = 4;
 };
 
 struct VoxCPM2PrefillInputs {
@@ -258,5 +254,8 @@ struct VoxCPM2Runtime {
                                                            const VoxCPM2AudioChunkCallback & callback);
     // Decode output_pool[start_patch, end_patch). end_patch < 0 → size.
     std::vector<float>   decode_pool_range_to_waveform(int start_patch, int end_patch, int target_sr = 0);
+    // Decode one latent patch through the AudioVAE's stateful streaming path.
+    // Requires audio_vae.stream_begin(); consecutive calls continue the stream.
+    std::vector<float>   decode_patch_streaming(const std::vector<float> & patch, int target_sr);
     std::vector<int32_t> expand_multichar_cjk_tokens(const std::vector<int32_t> & ids) const;
 };

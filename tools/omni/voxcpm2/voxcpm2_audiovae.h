@@ -88,6 +88,27 @@ struct VoxCPM2AudioVAEWeights {
     ggml_tensor *                                   decoder_final_conv_bias   = nullptr;
 };
 
+// Persistent left context for stateful streaming decode.
+//
+// Every causal conv in the decoder normally derives its left padding from the
+// sequence it is handed. When that sequence arrives one patch at a time the
+// padding has to come from the previous chunk instead, so each causal site gets
+// a slot holding its last `pad` input frames. Slots start zeroed, which makes
+// the first chunk identical to a fresh causal conv — the stream as a whole is
+// then equivalent to decoding the concatenated latents in one pass.
+//
+// Mirrors StreamingVAEDecoder in the reference implementation
+// (VoxCPM/src/voxcpm/modules/audiovae/audio_vae_v2.py).
+struct VoxCPM2AudioVAEStreamState {
+    ggml_context *             ctx = nullptr;
+    ggml_backend_buffer_t      buf = nullptr;
+    std::vector<ggml_tensor *> slots;    // [pad, channels, 1], one per causal site
+    std::vector<ggml_tensor *> updates;  // this chunk's slot writebacks
+    size_t                     cursor = 0;
+    bool                       begun  = false;
+    bool                       active = false;  // true only while building a chunk graph
+};
+
 struct AudioVAEModel {
     VoxCPM2AudioVAEConfig  config;
     VoxCPM2AudioVAEWeights weights;
@@ -119,11 +140,34 @@ struct AudioVAEModel {
     // Call after graph allocation and before compute if decode() created an SR bucket input.
     void prepare_decode_inputs() const;
 
+    // ── stateful streaming decode ────────────────────────────────────────────
+    //
+    // Per chunk:
+    //   ggml_tensor * wave = vae.decode_chunk(ctx, latents, sr);
+    //   ggml_build_forward_expand(graph, wave);      // main chain first,
+    //   vae.stream_expand_updates(graph);            // then the slot writebacks
+    //   vae.stream_alloc();                          // allocates + zeroes on first chunk
+    //   ... gallocr / compute ...
+    //
+    // The writebacks must be expanded after the main chain: each slot is read by
+    // a concat near the start of the graph and rewritten at the end, and ggml
+    // runs nodes in the order they were expanded.
+    bool          stream_begin();
+    ggml_tensor * decode_chunk(ggml_context * ctx, ggml_tensor * latents, int target_sr = -1);
+    void          stream_expand_updates(ggml_cgraph * graph) const;
+    bool          stream_alloc();
+    void          stream_end();
+
     void free();
 
   private:
     bool bind_from_store();
     bool validate_weights() const;
+
+    // Left padding for a causal conv: zeros when decoding a whole sequence, the
+    // previous chunk's tail when streaming. Records the slot writeback as a side
+    // effect, so it must be called exactly once per causal site per graph.
+    ggml_tensor * causal_left_context(ggml_context * ctx, ggml_tensor * x, int pad) const;
 
     ggml_tensor * get_required(const std::string & name) const;
     ggml_tensor * get_optional(const std::string & name) const;
@@ -175,4 +219,8 @@ struct AudioVAEModel {
                                                 ggml_tensor *                                     x,
                                                 const VoxCPM2AudioVAESampleRateConditionWeights & weights,
                                                 ggml_tensor *                                     sr_bucket) const;
+
+    // Mutable so the const graph builders above can carry streaming state; the
+    // model weights themselves stay const.
+    mutable VoxCPM2AudioVAEStreamState stream;
 };

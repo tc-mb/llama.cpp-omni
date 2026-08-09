@@ -60,18 +60,32 @@ static ggml_tensor * reshape_conv1d_weight_2d(ggml_context * ctx, ggml_tensor * 
 // "unsupported op 'PAD'". Causal conv1d needs *leading* padding, so we build it
 // from Metal-supported ops instead: construct a zeros block of shape
 // [lp0, ne1, ne2, ne3] (a width-lp0 slice of x scaled by 0) and concat it in
-// front of x along dim 0. For causal conv the pad amount ((kernel-1)*dilation)
-// is always smaller than the sequence length, so the slice is well-defined.
+// front of x along dim 0.
+//
+// The zeros block can be wider than x itself: decoding a single 4-frame patch
+// already hits `model.0` (kernel 7, pad 6) with x->ne[0] == 4, and the dilated
+// residual units need up to 54 frames of left context. A plain width-lp0 slice
+// of x is then out of range, so grow the zero block with doubling concats.
 static ggml_tensor * left_pad_dim0(ggml_context * ctx, ggml_tensor * x, int lp0) {
     if (lp0 <= 0) {
         return x;
     }
-    GGML_ASSERT(lp0 <= x->ne[0]);
+    GGML_ASSERT(x->ne[0] >= 1);
 
-    ggml_tensor * slice = ggml_view_4d(ctx, x,
-                                       lp0, x->ne[1], x->ne[2], x->ne[3],
-                                       x->nb[1], x->nb[2], x->nb[3], 0);
-    ggml_tensor * zeros = ggml_scale(ctx, ggml_cont(ctx, slice), 0.0f);
+    const int64_t seed_w = std::min<int64_t>(lp0, x->ne[0]);
+    ggml_tensor * seed   = ggml_view_4d(ctx, x,
+                                        seed_w, x->ne[1], x->ne[2], x->ne[3],
+                                        x->nb[1], x->nb[2], x->nb[3], 0);
+    ggml_tensor * zeros  = ggml_scale(ctx, ggml_cont(ctx, seed), 0.0f);
+
+    while (zeros->ne[0] < lp0) {
+        const int64_t have = zeros->ne[0];
+        const int64_t take = std::min(have, lp0 - have);
+        ggml_tensor * more = ggml_view_4d(ctx, zeros,
+                                          take, zeros->ne[1], zeros->ne[2], zeros->ne[3],
+                                          zeros->nb[1], zeros->nb[2], zeros->nb[3], 0);
+        zeros = ggml_concat(ctx, zeros, ggml_cont(ctx, more), 0);
+    }
 
     return ggml_concat(ctx, zeros, x, 0);
 }
@@ -176,6 +190,7 @@ AudioVAEModel::~AudioVAEModel() {
 }
 
 void AudioVAEModel::free() {
+    stream_end();
     store.reset();
     weights                    = {};
     config                     = {};
@@ -377,6 +392,38 @@ bool AudioVAEModel::init_manual(const VoxCPM2AudioVAEConfig & cfg, const VoxCPM2
     return true;
 }
 
+ggml_tensor * AudioVAEModel::causal_left_context(ggml_context * ctx, ggml_tensor * x, int pad) const {
+    if (pad <= 0) {
+        return x;
+    }
+    if (!stream.active) {
+        return left_pad_dim0(ctx, x, pad);
+    }
+
+    GGML_ASSERT(stream.ctx != nullptr);
+    if (stream.cursor >= stream.slots.size()) {
+        stream.slots.resize(stream.cursor + 1, nullptr);
+    }
+    ggml_tensor *& slot = stream.slots[stream.cursor++];
+    if (!slot) {
+        slot = ggml_new_tensor_3d(stream.ctx, x->type, pad, x->ne[1], x->ne[2]);
+    }
+    // The graph shape is identical for every chunk, so a slot must keep the shape
+    // it was created with; a mismatch means the sites were visited out of order.
+    GGML_ASSERT(slot->ne[0] == pad && slot->ne[1] == x->ne[1] && slot->ne[2] == x->ne[2]);
+    GGML_ASSERT(slot->type == x->type);
+
+    ggml_tensor * x_pad = ggml_concat(ctx, slot, x, 0);
+
+    // Next chunk's left context is this chunk's tail. Taking it from the padded
+    // input (rather than from x) also covers chunks shorter than `pad`, where the
+    // carry has to blend the previous slot with the new frames.
+    ggml_tensor * tail = ggml_view_3d(ctx, x_pad, pad, x_pad->ne[1], x_pad->ne[2], x_pad->nb[1], x_pad->nb[2],
+                                      static_cast<size_t>(x_pad->ne[0] - pad) * x_pad->nb[0]);
+    stream.updates.push_back(ggml_cpy(ctx, ggml_cont(ctx, tail), slot));
+    return x_pad;
+}
+
 ggml_tensor * AudioVAEModel::causal_conv1d(ggml_context * ctx,
                                            ggml_tensor *  x,
                                            ggml_tensor *  weight,
@@ -385,10 +432,7 @@ ggml_tensor * AudioVAEModel::causal_conv1d(ggml_context * ctx,
                                            int            stride,
                                            int            dilation,
                                            int            padding) const {
-    ggml_tensor * padded = x;
-    if (padding > 0) {
-        padded = left_pad_dim0(ctx, x, padding * 2);
-    }
+    ggml_tensor * padded = causal_left_context(ctx, x, padding * 2);
     ggml_tensor * result = conv1d_mul_mat_impl(ctx, weight, padded, kernel_size, stride, dilation);
     return add_bias_3d(ctx, result, bias);
 }
@@ -400,10 +444,7 @@ ggml_tensor * AudioVAEModel::causal_conv1d_dw(ggml_context * ctx,
                                               int            stride,
                                               int            dilation,
                                               int            padding) const {
-    ggml_tensor * padded = x;
-    if (padding > 0) {
-        padded = left_pad_dim0(ctx, x, padding * 2);
-    }
+    ggml_tensor * padded = causal_left_context(ctx, x, padding * 2);
 
     ggml_tensor * result = ggml_conv_1d_dw(ctx, weight, padded, stride, 0, dilation);
     result               = add_bias_3d(ctx, result, bias);
@@ -417,7 +458,20 @@ ggml_tensor * AudioVAEModel::causal_transpose_conv1d(ggml_context * ctx,
                                                      int            stride,
                                                      int            padding,
                                                      int            output_padding) const {
-    ggml_tensor * x_matrix = x;
+    // Transposed conv is causal by trimming its tail, so a whole-sequence decode
+    // needs no left context. A chunk does: with kernel = 2*stride each output
+    // sample sees at most (kernel-1)/stride == 1 earlier input frame, so carrying
+    // that one frame reproduces the full-sequence result across the seam. The
+    // re-synthesised context is dropped from the front afterwards.
+    int           lead_frames = 0;
+    ggml_tensor * x_ctx       = x;
+    if (stream.active) {
+        const int kernel = 2 * stride;
+        lead_frames      = (kernel - 1) / stride;
+        x_ctx            = causal_left_context(ctx, x, lead_frames);
+    }
+
+    ggml_tensor * x_matrix = x_ctx;
     if (ggml_n_dims(x_matrix) == 3 && x_matrix->ne[2] == 1) {
         x_matrix = ggml_reshape_2d(ctx, x_matrix, x_matrix->ne[0], x_matrix->ne[1]);
     }
@@ -432,10 +486,12 @@ ggml_tensor * AudioVAEModel::causal_transpose_conv1d(ggml_context * ctx,
         result = ggml_reshape_3d(ctx, result, result->ne[0], result->ne[1], result->ne[2]);
     }
 
-    const int crop = padding * 2 - output_padding;
-    if (crop > 0) {
-        result = ggml_view_3d(ctx, result, result->ne[0] - crop, result->ne[1], result->ne[2], result->nb[1],
-                              result->nb[2], 0);
+    const int     crop = padding * 2 - output_padding;
+    const int64_t lead = static_cast<int64_t>(lead_frames) * stride;
+    if (crop > 0 || lead > 0) {
+        GGML_ASSERT(result->ne[0] > lead + crop);
+        result = ggml_view_3d(ctx, result, result->ne[0] - lead - crop, result->ne[1], result->ne[2], result->nb[1],
+                              result->nb[2], static_cast<size_t>(lead) * result->nb[0]);
     }
     return add_bias_3d(ctx, result, bias);
 }
@@ -585,4 +641,70 @@ void AudioVAEModel::prepare_decode_inputs() const {
     if (last_decode_sr_cond_tensor) {
         ggml_backend_tensor_set(last_decode_sr_cond_tensor, &last_decode_sr_bucket, 0, sizeof(last_decode_sr_bucket));
     }
+}
+
+bool AudioVAEModel::stream_begin() {
+    stream_end();
+    if (!backend) {
+        LOG_ERR("AudioVAEModel: streaming decode requires a backend\n");
+        return false;
+    }
+
+    // The decoder has 26 causal sites for the shipped config (model.0, then per
+    // block one transposed conv and three dilated residual convs, then the final
+    // conv); round up so other rate configurations still fit.
+    ggml_init_params params = {
+        /*.mem_size   =*/ggml_tensor_overhead() * 128,
+        /*.mem_buffer =*/nullptr,
+        /*.no_alloc   =*/true,
+    };
+    stream.ctx = ggml_init(params);
+    if (!stream.ctx) {
+        LOG_ERR("AudioVAEModel: failed to create streaming state context\n");
+        return false;
+    }
+    stream.begun = true;
+    return true;
+}
+
+ggml_tensor * AudioVAEModel::decode_chunk(ggml_context * ctx, ggml_tensor * latents, int target_sr) {
+    GGML_ASSERT(stream.begun);
+    stream.cursor = 0;
+    stream.updates.clear();
+    stream.active = true;
+    ggml_tensor * out = decode(ctx, latents, target_sr);
+    stream.active     = false;
+    return out;
+}
+
+void AudioVAEModel::stream_expand_updates(ggml_cgraph * graph) const {
+    for (ggml_tensor * update : stream.updates) {
+        ggml_build_forward_expand(graph, update);
+    }
+}
+
+bool AudioVAEModel::stream_alloc() {
+    if (stream.buf) {
+        return true;
+    }
+    stream.buf = ggml_backend_alloc_ctx_tensors(stream.ctx, backend);
+    if (!stream.buf) {
+        LOG_ERR("AudioVAEModel: failed to allocate streaming state buffer\n");
+        return false;
+    }
+    // Zeroed slots make the first chunk identical to a fresh causal conv.
+    ggml_backend_buffer_clear(stream.buf, 0);
+    LOG_INF("AudioVAEModel: streaming state %zu slots, %.1f KiB\n", stream.slots.size(),
+            ggml_backend_buffer_get_size(stream.buf) / 1024.0);
+    return true;
+}
+
+void AudioVAEModel::stream_end() {
+    if (stream.buf) {
+        ggml_backend_buffer_free(stream.buf);
+    }
+    if (stream.ctx) {
+        ggml_free(stream.ctx);
+    }
+    stream = {};
 }
