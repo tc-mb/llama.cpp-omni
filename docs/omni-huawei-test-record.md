@@ -94,7 +94,7 @@ Q8 W8A8 路径已完成迁移，但严格保持显式 opt-in，不改变 F16 正
 | Token2Mel 主线 | modulate/gate fusion、attention time pack、affine LayerNorm | 已迁移并默认启用 | policy/CANN 测试、逐项真实 A/B |
 | Token2Mel 实验项 | AdaLN SiLU/cache、estimator writeback、conv-state、fused QKV、SET_ROWS F32→F16、K/V pair | 已迁移；严格显式 opt-in | policy 测试、真实链路逐项测试 |
 | TTS/流水线 | first prefill、partial TopK/workspace/稀疏 penalty、持久 head executor、debug 默认关闭、same-turn KV | 已迁移；same-turn KV 保持 opt-in | 固定 seed/tie 测试、executor 测试、真实 A/B |
-| 设备/APM | TTS/Projector 分阶段设备、APM baseline/replay | 已迁移；不设置时维持单芯正式路径 | APM audio-encode-only、duplex baseline/replay 计数与 hash；分阶段设备双卡 A/B 已排队 |
+| 设备/APM | TTS/Projector 分阶段设备、APM baseline/replay | 已迁移；不设置时维持单芯正式路径 | APM audio-encode-only、duplex baseline/replay 计数与 hash；分阶段设备真实双卡 ABBA 未获收益，保持显式配置 |
 | 独立实验 | ACL Graph bucket、Q8 W8A8、主 LLM TP2 | Q8 W8A8 已迁移并完成真实单卡 A/B；TP2 已迁移并完成真实双卡 ABBA；均不改变正式默认 | Q8 正确性、Graph replay 与真实性能已验证；TP2 稳定但未通过收益门槛，继续保持显式 opt-in |
 
 另外，源工作树中的 `Token2WavSession::switch_prompt_bundle` 已在目标分支现有
@@ -123,7 +123,9 @@ executor 接线改由根 `CMakeLists.txt` 完成。以上均已核对，不构�
 - TTS：`c7be3748a863dd6966ae7eed42600b7f41ca67affb03729ff245247f0e5ea088`
 - RTS 视频：`31622e1efd9a7b197a340266037b45aeec13b3b27f010f1ea1d22d9c6e69405f`
 - 旧基线 server：`e48f8acfcfcee98387fb148db6b86798d8d95cf5badcc5263fb0c29a73db95c6`
-- 迁移后 server：`1430ff007e9308e530f78d5bcaaa490e583e96855369047788f30ea15003ee02`
+- 正式 3+20 组合 server：`1430ff007e9308e530f78d5bcaaa490e583e96855369047788f30ea15003ee02`
+- Q8 W8A8 / TP2 迁移后的最终 server：
+  `baede9ae9261ffa2b623abadc998521b60d9761ab724ea38b238859529ea90bc`
 
 ## 4. 正式 3+20 RTS 结果
 
@@ -208,6 +210,28 @@ off/on 的 pooled RTF 为 `0.8634/0.8560`，chunk mean 为 `0.8834/0.8845`，P95
 继续 `GGML_CANN_ACL_GRAPH=off`，不追加 3+20。原始结果位于
 `/workspace/MiniCPM--competition/result/llama_huawei_migration_graph/`。
 
+PR #26 的分阶段双芯设备路径在目标分支上完成 A/B/B/A。A 仅暴露物理 NPU0，并将
+主 LLM、TTS、projector 和 Token2Wav 全部放在 `CANN0/npu:0`；B 暴露 NPU0、NPU1，
+主 LLM 仍固定在 CANN0，TTS/projector 和 Token2Wav 的 flow/vocoder 移到
+`CANN1/npu:1`。日志确认 B 的 LLM 为 `devices=CANN0 split_mode=0`、TTS 为
+`OMNI_TTS_DEVICE=CANN1`，flow/vocoder 后端均初始化为 CANN1；四段均完整运行 37 个
+chunk 并生成 WAV。
+
+| 指标 | 单卡 A（两次均值） | 分阶段双芯 B（两次均值） | B 相对 A |
+| --- | ---: | ---: | ---: |
+| all pooled RTF | 0.65305 | 0.71315 | `+9.20%`（变慢） |
+| chunk mean RTF | 0.66560 | 0.72205 | `+8.48%`（变慢） |
+| chunk P95 RTF | 0.82035 | 0.96950 | `+18.18%`（变慢） |
+| core pooled RTF | 0.70920 | 0.72995 | `+2.93%`（变慢） |
+| SPEAK→WAV 平均耗时 | 897.75 ms | 948.40 ms | `+5.64%`（变慢） |
+| TTS RTF | 0.16075 | 0.18100 | `+12.60%`（变慢） |
+| Token2Wav RTF | 0.12790 | 0.13785 | `+7.78%`（变慢） |
+
+结果位于
+`/workspace/MiniCPM--competition/result/llama_huawei_migration_dualstage_abba/`。
+分阶段双芯未达到收益门槛，因此不追加 3+20、不进入默认正式组合；设备选择能力仍保留
+为显式配置，单芯默认不变。
+
 逐项原始目录均位于：
 `/workspace/MiniCPM--competition/result/llama_huawei_migration/`。目录名与表中测试项对应，
 每个目录包含 manifest、console log、评测原始 JSON 和 `summary.json`。
@@ -234,12 +258,18 @@ EVAL_CONFIG=../.local-eval/config.env ./run_all.sh --no-build --smoke 2
 `evaluation/output/20260812_000722`，当时因 Video-MME 和 Daily-Omni 数据不完整，
 未记为通过。
 
-补齐数据后已重新启动正式全量评测，结果目录为
+补齐数据后重新启动了正式全量评测，结果目录为
 `evaluation/output/20260812_003522`。Video-MME 已完成 900 个视频、2700 个问题，
-正式重跑无效答案后官方 Overall 为 `69.8%`。统一脚本当前继续执行 Daily-Omni；
-截至本记录更新时已稳定处理超过 39/1197 条，未出现无效响应、进程崩溃或超时。
-Daily-Omni 完成后，统一脚本将自动继续 Seed-TTS 和 RTS。完整四任务门禁仍在运行，
-在其结束前不提前声明 full 通过。
+初次统计为 `1882/2700 = 69.7%`，正式重跑无效答案后的官方 Overall 为 `69.8%`。
+随后按要求停止全量长跑；停止前 Daily-Omni 完成 `158/1197` 条，其中 `133` 条正确，
+阶段准确率为 `84.18%`，响应有效率为 `100%`，Wilson 95% 置信区间为
+`77.69%–89.05%`。已完成样本平均耗时为 `10.496 s/条`，期间未出现进程崩溃、
+超时或无效答案。该 Daily 数值是按数据集原始顺序得到的阶段结果，不冒充全量指标。
+
+Seed-TTS full 推理未启动；为复用后续工作，提前生成了 `81/1010` 个唯一参考音频的
+prompt bundle。中断时留下的单个不完整目录没有 `spk_f32.bin`，正式脚本的
+`--skip-existing` 检查会自动重新处理，不会把它当成有效缓存。RTS 已有独立完整链路
+和正式 3+20 结果，因此没有继续重复执行本次 full 中的 RTS 阶段。
 
 另一次单卡 full 启动记录保存在 `evaluation/output/20260812_000128`。两次 full 尝试
 都保留原始日志，不混入通过结论。四任务 smoke 与独立 3+20 RTS 均已完成；完整
@@ -258,7 +288,7 @@ Video-MME 视频和真实 Daily-Omni 全量 annotation 已补齐，当前 full �
   NPU 上 `torch._weight_norm` 的 5,039,616 个 BF16 元素逐位一致；旧 F32 合并顺序有
   1,555,565 个元素不同（`30.87%`）。
 - `benchmarks/omni-huawei/validate.sh static`：通过。
-- 最新静态验证目录：`benchmarks/omni-huawei/results/20260812T133302Z`。
+- 最新静态验证目录：`benchmarks/omni-huawei/results/20260812T141204Z`。
 - `git diff --check`：通过。
 
 ## 8. Q8 W8A8 与主 LLM TP2 追加迁移
