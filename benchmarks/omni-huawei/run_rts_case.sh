@@ -19,6 +19,14 @@ stamp=$(date -u +%Y%m%dT%H%M%SZ)
 result_root="${result_base}/${label}_${stamp}"
 server_bin=${OMNI_SERVER_BIN:-${repo}/build/bin/llama-omni-server}
 ctx_size=${CTX_SIZE:-40960}
+real_server_bin=${OMNI_REAL_SERVER_BIN:-}
+
+for assignment in "$@"; do
+    if [[ ${assignment} == OMNI_REAL_SERVER_BIN=* ]]; then
+        real_server_bin=${assignment#OMNI_REAL_SERVER_BIN=}
+        break
+    fi
+done
 
 source "${repo}/.local-eval/config.env"
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
@@ -39,6 +47,10 @@ mkdir -p "${result_root}"
     echo "git_head=$(git -C "${repo}" rev-parse HEAD)"
     echo "server_bin=${server_bin}"
     echo "server_sha256=$(sha256sum "${server_bin}" | awk '{print $1}')"
+    if [[ -n ${real_server_bin} ]]; then
+        echo "real_server_bin=${real_server_bin}"
+        echo "real_server_sha256=$(sha256sum "${real_server_bin}" | awk '{print $1}')"
+    fi
     echo "gpu=${gpu}"
     echo "ctx_size=${ctx_size}"
     echo "warmups=${warmups}"

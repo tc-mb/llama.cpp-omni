@@ -22,6 +22,7 @@
 
 #include "aclnn_ops.h"
 
+#include "q8-w8a8.h"
 #include "set_rows_f32_f16.h"
 
 #include "ggml-impl.h"
@@ -40,6 +41,7 @@
 #include <aclnnop/aclnn_convolution.h>
 #include <aclnnop/aclnn_copy.h>
 #include <aclnnop/aclnn_div.h>
+#include <aclnnop/aclnn_dynamic_quant.h>
 #include <aclnnop/aclnn_elu.h>
 #include <aclnnop/aclnn_embedding.h>
 #include <aclnnop/aclnn_eq_tensor.h>
@@ -68,6 +70,7 @@
 #include <aclnnop/aclnn_permute.h>
 #include <aclnnop/aclnn_pow.h>
 #include <aclnnop/aclnn_pow_tensor_tensor.h>
+#include <aclnnop/aclnn_quant_matmul_v5.h>
 // #include <aclnnop/aclnn_recurrent_gated_delta_rule.h>  // not available in CANN 25.5.1
 #include <aclnnop/aclnn_reduce_sum.h>
 #include <aclnnop/aclnn_reflection_pad1d.h>
@@ -2332,6 +2335,153 @@ static void ggml_cann_mul_mat_quant(ggml_backend_cann_context & ctx, ggml_tensor
     }
 }
 
+static void ggml_cann_mul_mat_q8_w8a8(
+        ggml_backend_cann_context & ctx,
+        ggml_tensor * dst,
+        const ggml_cann_q8_w8a8_layout & layout) {
+    ggml_tensor * weight = dst->src[0];
+    ggml_tensor * input = dst->src[1];
+    GGML_ASSERT(weight->type == GGML_TYPE_Q8_0);
+    GGML_ASSERT(weight->ne[0] == layout.k && weight->ne[1] == layout.n);
+    GGML_ASSERT(weight->ne[2] == 1 && weight->ne[3] == 1);
+
+    constexpr size_t fp16_size = sizeof(uint16_t);
+    const int64_t k = weight->ne[0];
+    const int64_t n = weight->ne[1];
+    const int64_t m = input->ne[1];
+    const int64_t batches = input->ne[2] * input->ne[3];
+    const size_t input_slice_bytes = static_cast<size_t>(k * m) * fp16_size;
+    const size_t output_slice_bytes = static_cast<size_t>(n * m) * fp16_size;
+
+    ggml_cann_pool_alloc input_allocator;
+    ggml_cann_pool_alloc quant_allocator;
+    ggml_cann_pool_alloc token_scale_allocator;
+    ggml_cann_pool_alloc output_allocator;
+
+#ifdef USE_ACL_GRAPH
+    ggml_cann_q8_w8a8_workspace_slot * graph_workspace = nullptr;
+    if (ctx.active_capture_graph != nullptr) {
+        GGML_ASSERT(ctx.active_capture_node >= 0);
+        graph_workspace = ctx.active_capture_graph->q8_w8a8_workspace(ctx.active_capture_node, dst);
+        GGML_ASSERT(graph_workspace != nullptr);
+    }
+#endif
+
+    void * input_buffer = input->data;
+    if (input->type != GGML_TYPE_F16) {
+#ifdef USE_ACL_GRAPH
+        input_buffer = graph_workspace != nullptr ? graph_workspace->input_f16() :
+            input_allocator.alloc(ctx.pool(), ggml_nelements(input) * fp16_size);
+#else
+        input_buffer = input_allocator.alloc(ctx.pool(), ggml_nelements(input) * fp16_size);
+#endif
+        acl_tensor_ptr acl_input = ggml_cann_create_tensor(input);
+        int64_t * cast_ne = input->ne;
+        size_t cast_nb[GGML_MAX_DIMS];
+        cast_nb[0] = fp16_size;
+        for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+            cast_nb[i] = cast_nb[i - 1] * static_cast<size_t>(cast_ne[i - 1]);
+        }
+        acl_tensor_ptr acl_cast = ggml_cann_create_tensor(
+            input_buffer, ACL_FLOAT16, fp16_size, cast_ne, cast_nb, GGML_MAX_DIMS);
+        aclnn_cast(ctx, acl_input.get(), acl_cast.get(), ACL_FLOAT16);
+    }
+
+    void * quant_buffer = nullptr;
+    void * token_scale_buffer = nullptr;
+#ifdef USE_ACL_GRAPH
+    if (graph_workspace != nullptr) {
+        quant_buffer = graph_workspace->quant();
+        token_scale_buffer = graph_workspace->token_scale();
+    } else
+#endif
+    {
+        quant_buffer = quant_allocator.alloc(ctx.pool(), ggml_nelements(input));
+        token_scale_buffer = token_scale_allocator.alloc(
+            ctx.pool(), static_cast<size_t>(m * batches) * sizeof(float));
+    }
+
+    void * output_buffer = dst->data;
+    if (dst->type != GGML_TYPE_F16) {
+#ifdef USE_ACL_GRAPH
+        output_buffer = graph_workspace != nullptr ? graph_workspace->output_f16() :
+            output_allocator.alloc(ctx.pool(), ggml_nelements(dst) * fp16_size);
+#else
+        output_buffer = output_allocator.alloc(ctx.pool(), ggml_nelements(dst) * fp16_size);
+#endif
+    }
+
+    constexpr int64_t max_n = 65535;
+    for (int64_t batch = 0; batch < batches; ++batch) {
+        int64_t input_ne[2] = { k, m };
+        size_t input_nb[2] = { fp16_size, static_cast<size_t>(k) * fp16_size };
+        acl_tensor_ptr acl_input = ggml_cann_create_tensor(
+            static_cast<uint8_t *>(input_buffer) + batch * input_slice_bytes,
+            ACL_FLOAT16, fp16_size, input_ne, input_nb, 2);
+
+        size_t quant_nb[2] = { sizeof(int8_t), static_cast<size_t>(k) };
+        acl_tensor_ptr acl_quant = ggml_cann_create_tensor(
+            static_cast<uint8_t *>(quant_buffer) + batch * static_cast<size_t>(k * m),
+            ACL_INT8, sizeof(int8_t), input_ne, quant_nb, 2);
+
+        int64_t token_scale_ne[1] = { m };
+        size_t token_scale_nb[1] = { sizeof(float) };
+        acl_tensor_ptr acl_token_scale = ggml_cann_create_tensor(
+            static_cast<uint8_t *>(token_scale_buffer) + batch * static_cast<size_t>(m) * sizeof(float),
+            ACL_FLOAT, sizeof(float), token_scale_ne, token_scale_nb, 1);
+
+        GGML_CANN_CALL_ACLNN_OP(
+            ctx, DynamicQuant, acl_input.get(), nullptr,
+            acl_quant.get(), acl_token_scale.get());
+
+        for (int64_t split_start = 0; split_start < n; split_start += max_n) {
+            const int64_t split_n = std::min(max_n, n - split_start);
+
+            int64_t weight_ne[2] = { k, split_n };
+            size_t weight_nb[2] = { sizeof(int8_t), static_cast<size_t>(k) };
+            acl_tensor_ptr acl_weight = ggml_cann_create_tensor(
+                static_cast<uint8_t *>(weight->data) + static_cast<size_t>(split_start * k),
+                ACL_INT8, sizeof(int8_t), weight_ne, weight_nb, 2);
+
+            int64_t weight_scale_ne[1] = { split_n };
+            size_t weight_scale_nb[1] = { sizeof(float) };
+            acl_tensor_ptr acl_weight_scale = ggml_cann_create_tensor(
+                static_cast<uint8_t *>(weight->data) + layout.scale_offset +
+                    static_cast<size_t>(split_start) * sizeof(float),
+                ACL_FLOAT, sizeof(float), weight_scale_ne, weight_scale_nb, 1);
+
+            int64_t output_ne[2] = { split_n, m };
+            size_t output_nb[2] = { fp16_size, static_cast<size_t>(n) * fp16_size };
+            acl_tensor_ptr acl_output = ggml_cann_create_tensor(
+                static_cast<uint8_t *>(output_buffer) + batch * output_slice_bytes +
+                    static_cast<size_t>(split_start) * fp16_size,
+                ACL_FLOAT16, fp16_size, output_ne, output_nb, 2);
+
+            GGML_CANN_CALL_ACLNN_OP(
+                ctx, QuantMatmulV5, acl_quant.get(), acl_weight.get(),
+                acl_token_scale.get(), acl_weight_scale.get(),
+                nullptr, nullptr, nullptr, nullptr, nullptr,
+                false, true, 0, acl_output.get());
+        }
+    }
+
+    if (dst->type != GGML_TYPE_F16) {
+        int64_t * cast_ne = dst->ne;
+        size_t cast_nb[GGML_MAX_DIMS];
+        cast_nb[0] = fp16_size;
+        for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+            cast_nb[i] = cast_nb[i - 1] * static_cast<size_t>(cast_ne[i - 1]);
+        }
+        acl_tensor_ptr acl_output = ggml_cann_create_tensor(
+            output_buffer, ACL_FLOAT16, fp16_size, cast_ne, cast_nb, GGML_MAX_DIMS);
+        acl_tensor_ptr acl_dst = ggml_cann_create_tensor(dst);
+        aclnn_cast(ctx, acl_output.get(), acl_dst.get(), ggml_cann_type_mapping(dst->type));
+    }
+
+    ggml_cann_q8_w8a8_stats_note_matmul();
+}
+
+
 void ggml_cann_mul_mat(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     const enum ggml_type type = dst->src[0]->type;
     switch (type) {
@@ -2343,9 +2493,30 @@ void ggml_cann_mul_mat(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
             ggml_cann_mat_mul_fp(ctx, dst);
             break;
         case GGML_TYPE_Q4_0:
-        case GGML_TYPE_Q8_0:
             ggml_cann_mul_mat_quant(ctx, dst, type);
             break;
+        case GGML_TYPE_Q8_0: {
+#ifdef USE_ACL_GRAPH
+            if (ctx.active_capture_graph != nullptr) {
+                GGML_ASSERT(ctx.active_capture_node >= 0);
+                const ggml_cann_q8_w8a8_layout * captured_layout =
+                    ctx.active_capture_graph->q8_w8a8_layout(ctx.active_capture_node, dst);
+                if (captured_layout != nullptr) {
+                    ggml_cann_mul_mat_q8_w8a8(ctx, dst, *captured_layout);
+                } else {
+                    ggml_cann_mul_mat_quant(ctx, dst, type);
+                }
+                break;
+            }
+#endif
+            ggml_cann_q8_w8a8_layout layout = {};
+            if (ggml_cann_get_q8_w8a8_layout(dst->src[0], &layout)) {
+                ggml_cann_mul_mat_q8_w8a8(ctx, dst, layout);
+            } else {
+                ggml_cann_mul_mat_quant(ctx, dst, type);
+            }
+            break;
+        }
         default:
             GGML_ABORT("Unsupported type for mul_mat");
             break;

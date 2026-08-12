@@ -965,6 +965,11 @@ struct llama_model::impl {
 };
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
+    if (params.tensor_split != nullptr) {
+        tensor_split_data.assign(params.tensor_split, params.tensor_split + llama_max_devices());
+        this->params.tensor_split = tensor_split_data.data();
+    }
+
     pimpl->has_tensor_overrides = params.tensor_buft_overrides && params.tensor_buft_overrides[0].pattern;
 }
 

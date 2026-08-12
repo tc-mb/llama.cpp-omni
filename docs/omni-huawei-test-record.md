@@ -12,7 +12,7 @@
 - SPEAK 输入到 WAV 完整链路：`1287.11 ms -> 1109.53 ms`，降低 `13.80%`。
 - decode 结束到 WAV：`575.63 ms -> 373.75 ms`，降低 `35.07%`。
 - `./run_all.sh --no-build --smoke 2` 的四个任务全部成功。
-- 13 个定向 C++/CANN 测试、10 个 Python wiring 测试全部通过。
+- 14 个定向 C++/CANN 测试、11 个 Python wiring 测试全部通过。
 - `evaluation/` 和四个指定文件的校验值保持不变。
 
 旧基线和新版本的生成轨迹不完全相同，因此总体 RTF 对比用于衡量同一输入下的
@@ -55,8 +55,13 @@
 - `OMNI_TTS_LEGACY_DUPLEX_CHUNK_RESET=0`
 - APM baseline/replay API，以及 `OMNI_TTS_DEVICE`、`OMNI_PROJECTOR_DEVICE` 分阶段设备选择。
 
-本轮只有一张获准使用的空闲卡，因此未启用主 LLM 的 TP2；正式默认仍是单芯，
-没有为跑分静默改变设备拓扑。
+主 LLM TP2 配置已迁移，支持通过 `OMNI_LLM_DEVICES`、
+`OMNI_LLM_SPLIT_MODE` 和 `OMNI_LLM_TENSOR_SPLIT` 显式启用。未设置这些变量时仍维持
+原有单芯路径，不会静默改变设备拓扑。`OMNI_LLM_DEVICES=auto` 会运行时枚举 CANN
+设备；只发现一张卡时明确回退到 `split_mode=none`，显式无效设备仍然报错，不回退
+到 CPU。CANN 上的真实 TP2 使用 `OMNI_LLM_SPLIT_MODE=tensor`，由 llama.cpp Meta
+backend 对每层权重和 KV 做张量切分；旧 `row` 模式因 CANN 不提供 legacy split
+buffer，不能作为 TP2 证据。双卡真实性能与稳定性测试已经完成，结论和原始结果见第 8 节。
 
 ### 2.4 GitHub PR 覆盖边界
 
@@ -73,9 +78,9 @@ PR #1–#27。与 llama.cpp-omni F16/Graph-off 子赛道直接相关的内容已
 - PR #9：迁移 `ws_handler.cpp` 中多图片、音频、文本的 prefill 顺序及失败清理修复；
   PR 内其余 vLLM/Python 实现不直接搬入 C++ 评测分支。
 
-以下 PR 不进入本次 F16、`ACL_GRAPH=off` 的正式组合：PR #5、#7、#15–#20
-是 vLLM-Omni/Python 模型实现；PR #12 只优化 ACL Graph vocoder bucket；PR #14 是
-Q8 W8A8 opt-in 路径。它们不是遗漏，也不应混入本子赛道的 F16 正式默认。
+以下 PR 不进入本次 F16、`ACL_GRAPH=off` 的正式默认组合：PR #5、#7、#15–#20
+是 vLLM-Omni/Python 模型实现；PR #12 只优化 ACL Graph vocoder bucket。PR #14 的
+Q8 W8A8 路径已完成迁移，但严格保持显式 opt-in，不改变 F16 正式默认。
 
 ### 2.5 迁移计划逐项复核
 
@@ -89,8 +94,8 @@ Q8 W8A8 opt-in 路径。它们不是遗漏，也不应混入本子赛道的 F16 
 | Token2Mel 主线 | modulate/gate fusion、attention time pack、affine LayerNorm | 已迁移并默认启用 | policy/CANN 测试、逐项真实 A/B |
 | Token2Mel 实验项 | AdaLN SiLU/cache、estimator writeback、conv-state、fused QKV、SET_ROWS F32→F16、K/V pair | 已迁移；严格显式 opt-in | policy 测试、真实链路逐项测试 |
 | TTS/流水线 | first prefill、partial TopK/workspace/稀疏 penalty、持久 head executor、debug 默认关闭、same-turn KV | 已迁移；same-turn KV 保持 opt-in | 固定 seed/tie 测试、executor 测试、真实 A/B |
-| 设备/APM | TTS/Projector 分阶段设备、APM baseline/replay | 已迁移；不设置时维持单芯正式路径 | 语法/接口测试及单芯兼容验证 |
-| 独立实验 | ACL Graph bucket、Q8 W8A8、主 LLM TP2 | 未进入本 PR 正式组合 | 计划要求与 F16/Graph-off 隔离；当前仅一张可用卡，且没有相应质量门禁证据 |
+| 设备/APM | TTS/Projector 分阶段设备、APM baseline/replay | 已迁移；不设置时维持单芯正式路径 | APM audio-encode-only、duplex baseline/replay 计数与 hash；分阶段设备双卡 A/B 已排队 |
+| 独立实验 | ACL Graph bucket、Q8 W8A8、主 LLM TP2 | Q8 W8A8 已迁移并完成真实单卡 A/B；TP2 已迁移并完成真实双卡 ABBA；均不改变正式默认 | Q8 正确性、Graph replay 与真实性能已验证；TP2 稳定但未通过收益门槛，继续保持显式 opt-in |
 
 另外，源工作树中的 `Token2WavSession::switch_prompt_bundle` 已在目标分支现有
 `token2wav.cpp` 和声明中存在；`src/llama-graph.cpp` 仅为空行差异；保护 CMake 中的
@@ -107,7 +112,8 @@ executor 接线改由根 `CMakeLists.txt` 完成。以上均已核对，不构�
 - ffmpeg：`6.1.1`
 - rubberband：`1.8.2`
 - 目标基线 commit：`c9785ccca96501820e36744d6310e0c80af5c054`
-- 设备：物理 device `1`，单芯执行
+- 正式主组合设备：物理 device `1`，单芯执行；Q8 独立实验使用 device `0`，TP2
+  独立实验使用 device `0,1`
 - 固定配置：F16、`CTX_SIZE=40960`、seed `42`、
   `GGML_CANN_WEIGHT_NZ=off`、`GGML_CANN_ACL_GRAPH=off`
 
@@ -187,6 +193,21 @@ executor 接线改由根 `CMakeLists.txt` 完成。以上均已核对，不构�
 | KV pair + SET_ROWS | 0.8680 | 0.8880 / 1.0079 | 1098.6 ms | 0.1727 / 0.1301 | 未优于 SET_ROWS 单项，保持 opt-in |
 | same-turn duplex KV | 0.8591 | 0.8793 / 1.0101 | 1095.1 ms | 0.1699 / 0.1277 | 有性能方向，保持 opt-in |
 
+APM baseline/replay 另按计划使用非保护测试入口验证。`--audio-encode-only` 完成 2/2
+帧，首帧/热帧为 `209.173/12.036 ms`。同一两帧进入 duplex baseline 时 APM 为
+`35.5/33.2 ms`，计数 `prepared=0 live=2 hit=0 miss=0`；replay 预计算后的运行时
+encoder wall 均约 `0.1 ms`，计数 `prepared=2 live=0 hit=2 miss=0`。两条 replay 的
+embedding hash 与 baseline 分别一致为 `1cb33cbebd5b51b4`、`086917cadac8866c`。
+原始日志位于 `/workspace/MiniCPM--competition/result/llama_huawei_migration_apm/`。
+该能力保持显式测试/API 路径，不改变正式在线默认。
+
+Token2Wav ACL Graph bucket 使用同一个 `USE_ACL_GRAPH=ON` 构建做短 A/B。运行时 Graph
+off/on 的 pooled RTF 为 `0.8634/0.8560`，chunk mean 为 `0.8834/0.8845`，P95 为
+`1.0017/1.1252`，SPEAK→WAV 为 `1098.0/1074.0 ms`。虽然单次 pooled 和端到端时延
+方向较好，但 chunk mean 未改善且 P95 回退 `12.33%`，未达到准入门槛，因此正式默认
+继续 `GGML_CANN_ACL_GRAPH=off`，不追加 3+20。原始结果位于
+`/workspace/MiniCPM--competition/result/llama_huawei_migration_graph/`。
+
 逐项原始目录均位于：
 `/workspace/MiniCPM--competition/result/llama_huawei_migration/`。目录名与表中测试项对应，
 每个目录包含 manifest、console log、评测原始 JSON 和 `summary.json`。
@@ -214,27 +235,131 @@ EVAL_CONFIG=../.local-eval/config.env ./run_all.sh --no-build --smoke 2
 未记为通过。
 
 补齐数据后已重新启动正式全量评测，结果目录为
-`evaluation/output/20260812_003522`。截至本记录更新时，Video-MME 已完成
-`680/900`，后台任务仍在运行；未出现进程崩溃或超时，已观察到 1 条非标准答案
-`BC`，将按评测器原始结果如实计入有效率，不能提前声明 full 通过。Video-MME
-结束后，统一脚本将继续执行 Daily-Omni、Seed-TTS 和 RTS。
+`evaluation/output/20260812_003522`。Video-MME 已完成 900 个视频、2700 个问题，
+正式重跑无效答案后官方 Overall 为 `69.8%`。统一脚本当前继续执行 Daily-Omni；
+截至本记录更新时已稳定处理超过 39/1197 条，未出现无效响应、进程崩溃或超时。
+Daily-Omni 完成后，统一脚本将自动继续 Seed-TTS 和 RTS。完整四任务门禁仍在运行，
+在其结束前不提前声明 full 通过。
 
 另一次单卡 full 启动记录保存在 `evaluation/output/20260812_000128`。两次 full 尝试
-都保留原始日志，不混入通过结论。四任务 smoke 与独立 3+20 RTS 均已完成；要补齐
-full 验收，必须先提供完整 Video-MME 视频和真实 Daily-Omni 全量 annotation。
+都保留原始日志，不混入通过结论。四任务 smoke 与独立 3+20 RTS 均已完成；完整
+Video-MME 视频和真实 Daily-Omni 全量 annotation 已补齐，当前 full 继续使用这些资产
+执行，不再存在此前的数据缺失问题。
 
 ## 7. 构建与自动化验证
 
 - 构建目标：`llama-omni-server`、`llama-omni-eval-cli`、
   `llama-omni-eval-daily-cli`、`llama-omni-tts-eval`，全部成功。
-- CTest：13/13 通过，包括真实 CANN Im2col1D 测试。
+- CTest：14/14 通过，包括真实 CANN Im2col1D 和 Q8 W8A8 测试。
 - `test_cpp_oneshot_wiring.py`：5/5 通过。
-- `test_runtime_optimization_wiring.py`：5/5 通过。
+- `test_runtime_optimization_wiring.py`：7/7 通过，包含主 LLM TP2 配置接线和
+  Meta split-state 地址复用回归检查。
+- BF16 weight-norm Ascend 数值对照：固定 seed `42`、形状 `[6562,768]`，迁移公式与
+  NPU 上 `torch._weight_norm` 的 5,039,616 个 BF16 元素逐位一致；旧 F32 合并顺序有
+  1,555,565 个元素不同（`30.87%`）。
 - `benchmarks/omni-huawei/validate.sh static`：通过。
-- 最新静态验证目录：`benchmarks/omni-huawei/results/20260812T095039Z`。
+- 最新静态验证目录：`benchmarks/omni-huawei/results/20260812T133302Z`。
 - `git diff --check`：通过。
 
-## 8. 保护文件校验
+## 8. Q8 W8A8 与主 LLM TP2 追加迁移
+
+Q8 W8A8 保持默认关闭，仅在 `GGML_CANN_Q8_W8A8=on` 时启用；默认仍走原有
+W8A16 路径。迁移内容包括动态量化、QuantMatmulV5、Q8 权重布局注册、Graph
+workspace/replay 事务和定向测试。NPU0 上三组正确性测试全部通过，W8A8 相对
+W8A16 的平均绝对误差为 `0.00859515`、`0.00956655`、`0.00863347`，最大绝对误差
+分别为 `0.01953125`、`0.03027344`、`0.01953125`。另使用 Graph-enabled 独立构建
+验证了 eager、capture/replay、缓存淘汰、注册表切换及同设备资源路径。
+
+对照 PR #14 最终合并头 `3a68b3f397c1f858baf4f17ae1fdfba6c52fdffb` 复核：
+`graph-transaction.h`、`q8-w8a8.{h,cpp}` 和 `test-cann-q8-w8a8.cpp` 与上游文件
+SHA-256 完全一致；修改文件中的 QuantMatmulV5、workspace plan、Graph snapshot、
+per-device transaction gate、RoPE preload 与 active capture 接线均已进入目标实现。
+
+真实吞吐测试使用 `MiniCPM-o-4_5-Q8_0.gguf`、CANN0、32-token decode，并分别执行
+3 次预热和 20 次测量；Weight NZ 与 ACL Graph 均关闭，结果如下：
+
+| 路径 | 平均耗时 | 平均吞吐 | 相对 W8A16 |
+| --- | ---: | ---: | ---: |
+| W8A16（Q8 优化关闭） | 1166.397 ms | 27.4349 token/s | 基线 |
+| W8A8（Q8 优化开启） | 894.835 ms | 35.7609 token/s | 吞吐 `+30.35%`，耗时 `-23.28%` |
+
+两组均为 20/20 有效。W8A16 吞吐范围为 `27.4121–27.4591 token/s`，W8A8 为
+`35.5439–35.8012 token/s`；耗时 P95 分别为 `1167.256 ms` 和 `895.695 ms`。
+原始 JSON 与日志位于
+`/workspace/MiniCPM--competition/result/llama_huawei_migration_q8_3plus20_20260812T1105Z`。
+
+随后使用同一目标构建、`MiniCPM-o-4_5-Q8_0.gguf` 和
+`GGML_CANN_Q8_W8A8=on` 在 NPU0 运行 VideoMME smoke 2。进程正常加载并完成端到端
+视频推理，2/2 响应有效、1/2 正确，任务退出码为 0；结果目录为
+`evaluation/output/20260812_104457`。该小样本只证明端到端可运行和输出合法，不替代
+全量质量结论。
+
+主 LLM TP2 支持以下显式配置：
+
+```bash
+OMNI_LLM_DEVICES=CANN0,CANN1
+OMNI_LLM_SPLIT_MODE=tensor
+OMNI_LLM_TENSOR_SPLIT=0.5,0.5
+```
+
+实现会校验设备存在性、拒绝 CPU、校验 split mode，并拒绝非有限数、负数或超出设备上限
+的 tensor split；`OMNI_LLM_DEVICES=auto` 使用运行时 CANN 设备枚举，单卡时自动关闭
+tensor split。`tensor` 会进入 llama.cpp 的 `LLAMA_SPLIT_MODE_TENSOR` Meta backend；
+`row` 和 `layer` 仍保留用于兼容多设备配置，但不宣称为 CANN 张量并行。未设置环境变量
+时维持原有单芯行为。代码已通过 `llama-omni-server` 构建和静态接线测试。另在 NPU0 上以
+`OMNI_LLM_DEVICES=CANN0`、`OMNI_LLM_SPLIT_MODE=none` 完成一次真实完整 RTS，日志确认
+新设备路径命中；all pooled RTF 为 `0.8742`，SPEAK→WAV 平均 `1099.0 ms`，LLM decode
+阶段 RTF 为 `0.3626`。原始结果位于
+`/workspace/MiniCPM--competition/result/llama_huawei_migration_tp2/tp2_single_explicit_20260812T104114Z`。
+双卡 TP2 首次长链路在 compute arena 地址复用后触发 Meta split-state 递归，表现为
+`ggml_backend_meta_get_split_state` 无限递归并最终段错误。修复为只淘汰身份不匹配的
+单项缓存，不再清空递归遍历仍依赖的整个缓存。相同输入回归已连续完成 69 个 chunk，
+all pooled RTF 为 `0.8304`，SPEAK→WAV 平均 `1106.3 ms`，未再出现段错误；原始结果位于
+`/workspace/MiniCPM--competition/result/llama_huawei_migration_tp2_fix/tp2_fix_B1_20260812T131159Z`。
+
+随后在同一构建、同一视频、F16、seed 42、ACL Graph/Weight NZ 关闭条件下完成
+单卡/双卡/双卡/单卡（A/B/B/A）对照。A 使用 CANN0 单卡，B 使用 CANN0+CANN1、
+`tensor`、`0.5,0.5`；每段均运行完整 120 秒链路：
+
+| 指标 | 单卡 A（两次均值） | TP2 B（两次均值） | TP2 相对变化 |
+| --- | ---: | ---: | ---: |
+| all pooled RTF | 0.6606 | 0.8248 | `+24.85%`（变慢） |
+| chunk mean RTF | 0.6725 | 0.8388 | `+24.73%`（变慢） |
+| chunk P95 RTF | 0.8219 | 0.9794 | `+19.17%`（变慢） |
+| core pooled RTF | 0.7135 | 0.9739 | `+36.49%`（变慢） |
+| SPEAK→WAV 平均耗时 | 899.4 ms | 1085.7 ms | `+20.71%`（变慢） |
+| LLM prefill RTF | 0.0142 | 0.0672 | `+374.91%`（变慢） |
+| LLM decode RTF | 0.1687 | 0.2854 | `+69.18%`（变慢） |
+
+四段原始结果位于
+`/workspace/MiniCPM--competition/result/llama_huawei_migration_tp2_abba/` 下时间戳
+`20260812T131424Z`、`T131557Z`、`T131747Z`、`T131939Z` 的目录。两次 B 均确认同一
+server PID 同时驻留两张物理 NPU，主 LLM 日志记录 `devices=CANN0,CANN1 split_mode=3`，
+因此是真实 tensor parallel，而不是设备配置空转。
+
+为验证通信瓶颈，另做了 CANN HCCL AllReduce 原型：串行 rank 调度会阻塞，并发 rank
+调度可完整运行，但 all pooled RTF 为 `1.0471`、SPEAK→WAV 为 `1350.6 ms`，比通用
+P2P TP2 更差。该无收益实现和新增依赖已撤销，仅保留结果证据：
+`/workspace/MiniCPM--competition/result/llama_huawei_migration_tp2_hccl_threads/tp2_hccl_threads_B1_20260812T132802Z`。
+由于 TP2 未达到预设 `>=2%` pooled 或关键阶段 `>=5%` 的准入门槛，未继续 3+20，
+并保持默认单卡路径不变；TP2 仅作为可用、稳定的显式实验功能保留。
+
+在正式 Daily-Omni 使用物理 NPU1 期间，另用空闲物理 NPU0 完成一次隔离的 RTS
+全链路验证。37/37 个 chunk 全部完成，生成 12 个 WAV 事件；core pooled RTF 为
+`0.8882`，chunk mean/P95 为 `0.888/0.960`，SPEAK→WAV 平均/中位耗时为
+`1067.0/1109.4 ms`。阶段 RTF 为 encode `0.1757`、LLM prefill `0.0157`、
+LLM decode `0.3779`、TTS `0.2121`、Token2Wav `0.1068`。结果位于
+`/workspace/MiniCPM--competition/result/llama_huawei_migration_rts_parallel_20260812T1341Z`。
+该运行用于补强真实全链路稳定性证据；由于与 Daily-Omni 并发，不替代最终
+`run_all.sh --full` 的隔离门禁，也不作为新的性能基线。
+
+新 `tensor` 路径的单卡回退也以 `OMNI_LLM_DEVICES=auto`、
+`OMNI_LLM_SPLIT_MODE=tensor` 和 `tensor_split=0.5,0.5` 完成真实 RTS。日志最终记录
+`devices=auto split_mode=0`，证明只发现一张 CANN 卡时不会创建伪 TP；all pooled RTF
+为 `0.8648`，chunk mean/P95 为 `0.8853/1.0512`，SPEAK→WAV 为 `1122.8 ms`，
+结果位于 `/workspace/MiniCPM--competition/result/llama_huawei_migration_tp2_tensor_fallback/tp2_tensor_auto_single_20260812T114801Z`。
+
+## 9. 保护文件校验
 
 - `evaluation/` tracked tree：`f7c02a99eae0cda6df4b1806814fa049495add6e17c8b557201dcfdd64f30e43`
 - `tools/omni/omni-eval-cli.cpp`：`f1d1a0c8169cd9ca356251854411d6c439ceeff234ad79b0bb25a312d5cbd457`

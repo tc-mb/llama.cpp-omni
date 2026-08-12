@@ -27,6 +27,8 @@
 #include "../include/ggml-cann.h"
 #include "../include/ggml.h"
 #include "graph-bypass.h"
+#include "graph-transaction.h"
+#include "q8-w8a8.h"
 
 #include <acl/acl.h>
 #include <unistd.h>
@@ -215,6 +217,29 @@ struct ggml_cann_pool_alloc {
 };
 
 #ifdef USE_ACL_GRAPH
+struct ggml_cann_q8_w8a8_workspace_slot {
+    ggml_cann_q8_w8a8_workspace_slot(
+        int node_index,
+        int32_t device,
+        const ggml_cann_q8_w8a8_workspace_plan & plan);
+    ~ggml_cann_q8_w8a8_workspace_slot();
+
+    ggml_cann_q8_w8a8_workspace_slot(const ggml_cann_q8_w8a8_workspace_slot &) = delete;
+    ggml_cann_q8_w8a8_workspace_slot & operator=(const ggml_cann_q8_w8a8_workspace_slot &) = delete;
+
+    void allocate();
+
+    void * input_f16() const;
+    void * quant() const;
+    void * token_scale() const;
+    void * output_f16() const;
+
+    int node_index;
+    int32_t device;
+    ggml_cann_q8_w8a8_workspace_plan plan;
+    void * data = nullptr;
+};
+
 struct ggml_graph_node_properties {
     // dst tensor
     void *    node_address;
@@ -232,6 +257,8 @@ struct ggml_graph_node_properties {
     ggml_op node_op;
     int32_t op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t)];
 
+    ggml_cann_q8_w8a8_graph_node_snapshot q8_w8a8;
+
     /**
      * @brief Check if a ggml tensor node matches this property set.
      *
@@ -241,7 +268,9 @@ struct ggml_graph_node_properties {
      * @param node The current ggml tensor node.
      * @return true if all fields match (excluding GGML_OP_VIEW); false otherwise.
      */
-    bool has_matching_properties(ggml_tensor * node) {
+    bool has_matching_properties(
+            ggml_tensor * node,
+            const ggml_cann_q8_w8a8_graph_node_snapshot & candidate_q8_w8a8) const {
         if (node->data != this->node_address && node->op != GGML_OP_VIEW) {
             return false;
         }
@@ -288,6 +317,10 @@ struct ggml_graph_node_properties {
             }
         }
 
+        if (!ggml_cann_q8_w8a8_graph_node_snapshot_matches(candidate_q8_w8a8, q8_w8a8)) {
+            return false;
+        }
+
         return memcmp(this->op_params, node->op_params, GGML_MAX_OP_PARAMS) == 0;
     }
 };
@@ -302,6 +335,12 @@ struct ggml_cann_graph {
     aclmdlRI graph = nullptr;
 
     std::vector<ggml_graph_node_properties> ggml_graph_properties;
+    std::vector<std::unique_ptr<ggml_cann_q8_w8a8_workspace_slot>> q8_w8a8_workspaces;
+
+    bool plan_q8_w8a8_workspaces(int32_t device);
+    void allocate_q8_w8a8_workspaces();
+    ggml_cann_q8_w8a8_workspace_slot * q8_w8a8_workspace(int node_index, ggml_tensor * node);
+    const ggml_cann_q8_w8a8_layout * q8_w8a8_layout(int node_index, ggml_tensor * node) const;
 
     /**
      * @brief Create a new CANN graph from a ggml computation graph.
@@ -320,7 +359,10 @@ struct ggml_cann_graph {
      * @param cgraph The current ggml computation graph.
      * @return Pointer to the newly created ggml_cann_graph object.
      */
-    static ggml_cann_graph * create_from_cgraph(ggml_cgraph * cgraph) {
+    static ggml_cann_graph * create_from_cgraph(
+            ggml_cgraph * cgraph,
+            const ggml_cann_q8_w8a8_graph_snapshot & q8_w8a8_snapshot) {
+        GGML_ASSERT(q8_w8a8_snapshot.nodes.size() == static_cast<size_t>(cgraph->n_nodes));
         ggml_cann_graph * new_graph = new ggml_cann_graph();
         new_graph->ggml_graph_properties.resize(cgraph->n_nodes);
 
@@ -331,6 +373,7 @@ struct ggml_cann_graph {
             prop.node_address = node->data;
             prop.node_op      = node->op;
             prop.node_type    = node->type;
+            prop.q8_w8a8 = q8_w8a8_snapshot.nodes[static_cast<size_t>(node_idx)];
 
             std::copy_n(node->ne, GGML_MAX_DIMS, prop.ne);
             std::copy_n(node->nb, GGML_MAX_DIMS, prop.nb);
@@ -365,13 +408,19 @@ struct ggml_cann_graph {
      * @param cgraph The current ggml computation graph.
      * @return true if this CANN graph matches the ggml graph; false otherwise.
      */
-    bool matches_cgraph(ggml_cgraph * cgraph) {
+    bool matches_cgraph(
+            ggml_cgraph * cgraph,
+            const ggml_cann_q8_w8a8_graph_snapshot & q8_w8a8_snapshot) const {
         if (this->ggml_graph_properties.size() != static_cast<size_t>(cgraph->n_nodes)) {
+            return false;
+        }
+        if (q8_w8a8_snapshot.nodes.size() != static_cast<size_t>(cgraph->n_nodes)) {
             return false;
         }
 
         for (int i = 0; i < cgraph->n_nodes; ++i) {
-            if (!this->ggml_graph_properties[i].has_matching_properties(cgraph->nodes[i])) {
+            if (!this->ggml_graph_properties[i].has_matching_properties(
+                    cgraph->nodes[i], q8_w8a8_snapshot.nodes[static_cast<size_t>(i)])) {
                 return false;
             }
         }
@@ -392,21 +441,35 @@ struct ggml_cann_graph_lru_cache {
 
     std::list<ggml_cann_graph *> cache_list; /**< List storing cached graphs as raw pointers. */
 
-    ggml_cann_graph_lru_cache() { capacity = parse_integer(get_env_as_lowercase("GGML_CANN_GRAPH_CACHE_CAPACITY").value_or("12")); }
+    ggml_cann_graph_lru_cache() {
+        const std::string configured = get_env_as_lowercase("GGML_CANN_GRAPH_CACHE_CAPACITY").value_or("12");
+        const int parsed = parse_integer(configured);
+        if (parsed < 1) {
+            GGML_LOG_WARN("%s: invalid GGML_CANN_GRAPH_CACHE_CAPACITY='%s'; using 1\n",
+                          __func__, configured.c_str());
+            capacity = 1;
+        } else {
+            capacity = static_cast<size_t>(parsed);
+        }
+    }
 
     /**
      * @brief Push a new graph to the front of the cache.
-     * If the cache exceeds capacity, the least recently used graph is deleted.
      * @param new_node Pointer to the new ggml_cann_graph to cache.
      *        Ownership is transferred to the cache (cache will delete it).
      */
     void push(ggml_cann_graph * new_node) {
-        if (cache_list.size() >= capacity) {
-            ggml_cann_graph * old = cache_list.back();
-            cache_list.pop_back();
-            delete old;  // free the old graph
-        }
         cache_list.push_front(new_node);
+    }
+
+    ggml_cann_graph * take_lru_if_full() {
+        if (cache_list.size() < capacity) {
+            return nullptr;
+        }
+        GGML_ASSERT(!cache_list.empty());
+        ggml_cann_graph * old = cache_list.back();
+        cache_list.pop_back();
+        return old;
     }
 
     /**
@@ -435,11 +498,12 @@ struct ggml_cann_graph_lru_cache {
      * @param cgraph The current ggml computation graph.
      * @return true if found; false otherwise.
      */
-    bool find_and_move_to_front(ggml_cgraph * cgraph) {
-        for (auto & graph_ptr : this->cache_list) {
-            if (graph_ptr->matches_cgraph(cgraph)) {
-                cache_list.remove(graph_ptr);
-                cache_list.push_front(graph_ptr);
+    bool find_and_move_to_front(
+            ggml_cgraph * cgraph,
+            const ggml_cann_q8_w8a8_graph_snapshot & q8_w8a8_snapshot) {
+        for (auto it = cache_list.begin(); it != cache_list.end(); ++it) {
+            if ((*it)->matches_cgraph(cgraph, q8_w8a8_snapshot)) {
+                cache_list.splice(cache_list.begin(), cache_list, it);
                 return true;
             }
         }
@@ -449,29 +513,54 @@ struct ggml_cann_graph_lru_cache {
 #endif  // USE_ACL_GRAPH
 
 struct ggml_cann_rope_cache {
-    ~ggml_cann_rope_cache() {
+    void release() {
         if (theta_scale_cache) {
             ACL_CHECK(aclrtFree(theta_scale_cache));
+            theta_scale_cache = nullptr;
         }
         if (sin_cache) {
             ACL_CHECK(aclrtFree(sin_cache));
+            sin_cache = nullptr;
         }
         if (cos_cache) {
             ACL_CHECK(aclrtFree(cos_cache));
+            cos_cache = nullptr;
         }
         if (position_select_index) {
             ACL_CHECK(aclrtFree(position_select_index));
+            position_select_index = nullptr;
         }
         if (theta_scale_exp_host) {
             free(theta_scale_exp_host);
+            theta_scale_exp_host = nullptr;
         }
         if (position_select_index_host) {
             free(position_select_index_host);
+            position_select_index_host = nullptr;
         }
         if (yarn_ramp_cache) {
             ACL_CHECK(aclrtFree(yarn_ramp_cache));
+            yarn_ramp_cache = nullptr;
         }
+
+        theta_scale_length = 0;
+        position_length = 0;
+        cached = false;
+        ext_factor = 0.0f;
+        theta_scale = 0.0f;
+        freq_scale = 0.0f;
+        attn_factor = 0.0f;
+        is_neox = false;
+        indep_sects = false;
+        mrope_used = false;
+        sections[0] = 0;
+        sections[1] = 0;
+        sections[2] = 0;
+        sections[3] = 0;
+        is_imrope = false;
     }
+
+    ~ggml_cann_rope_cache() { release(); }
 
     bool equal(int64_t theta_scale_length,
                int64_t position_length,
@@ -543,11 +632,15 @@ struct ggml_cann_rope_cache {
 };
 
 struct ggml_cann_tensor_cache {
-    ~ggml_cann_tensor_cache() {
+    void release() {
         if (cache != nullptr) {
             ACL_CHECK(aclrtFree(cache));
+            cache = nullptr;
         }
+        size = 0;
     }
+
+    ~ggml_cann_tensor_cache() { release(); }
 
     void *  cache = nullptr;
     int64_t size  = 0;
@@ -561,11 +654,15 @@ struct ggml_backend_cann_context {
     std::string name;                 /**< Name of the device. */
     std::string description;          /**< Description of the device. */
     aclrtEvent  copy_event = nullptr; /**< Event for managing copy operations. */
+    ggml_cann_graph_context_gate graph_transaction_gate;
 #ifdef USE_ACL_GRAPH
     /// Cached CANN ACL graph used for executing the current ggml computation graph.
     ggml_cann_graph_lru_cache graph_lru_cache;
+    ggml_cann_q8_w8a8_graph_snapshot candidate_q8_w8a8_snapshot;
     bool                      acl_graph_mode = true;
     ggml_cann_graph_bypass    graph_bypass;
+    ggml_cann_graph *         active_capture_graph = nullptr;
+    int                       active_capture_node = -1;
 #endif
     bool                   async_mode;
     // Rope Cache
@@ -594,17 +691,7 @@ struct ggml_backend_cann_context {
     /**
      * @brief Destructor for cleaning up resources.
      */
-    ~ggml_backend_cann_context() {
-        ggml_cann_set_device(device);
-        if (copy_event != nullptr) {
-            ACL_CHECK(aclrtDestroyEvent(copy_event));
-        }
-        for (int i = 0; i < GGML_CANN_MAX_STREAMS; ++i) {
-            if (streams[i] != nullptr) {
-                ACL_CHECK(aclrtDestroyStream(streams[i]));
-            }
-        }
-    }
+    ~ggml_backend_cann_context();
 
     /**
      * @brief Get or create a stream for a given index.

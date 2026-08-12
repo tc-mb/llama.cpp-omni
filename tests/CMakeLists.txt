@@ -326,6 +326,13 @@ target_compile_features(test-cann-attn-time-pack-policy PRIVATE cxx_std_17)
 llama_test(test-cann-attn-time-pack-policy)
 
 if (GGML_CANN)
+    llama_build_and_test(test-cann-q8-w8a8.cpp)
+    target_include_directories(test-cann-q8-w8a8 PRIVATE
+        ${PROJECT_SOURCE_DIR}/ggml/src
+        ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cann)
+    target_link_libraries(test-cann-q8-w8a8 PRIVATE ggml-cann)
+    target_compile_options(test-cann-q8-w8a8 PRIVATE -UNDEBUG)
+
     llama_build_and_test(test-cann-im2col1d.cpp)
     target_include_directories(test-cann-im2col1d PRIVATE
         ${PROJECT_SOURCE_DIR}/ggml/src

@@ -29,6 +29,7 @@
 #include "ggml-cann/im2col1d.h"
 #include "ggml-cann/kv_pair_update.h"
 #include "ggml-cann/modulate_fusion.h"
+#include "ggml-cann/q8-w8a8.h"
 #include "ggml-cann/common.h"
 #include "ggml-impl.h"
 #include "ggml.h"
@@ -78,17 +79,129 @@
 // Thread-local variable to record the current device of this thread.
 thread_local int g_current_cann_device = -1;
 
-// Serialize ACL GLOBAL graph capture against host/device copies and stream
-// synchronization on the same device. CaptureBegin(GLOBAL) forbids these APIs
-// from any thread until CaptureEnd;
-// omni runs LLM decode and TTS paths concurrently on one NPU, so without this
-// lock a sched input staging set_tensor can abort mid-capture.
-static std::mutex g_cann_device_op_mutexes[GGML_CANN_MAX_DEVICES];
+// GLOBAL capture and synchronous device mutations need exclusive access, while
+// cache-hit graph replays from independent contexts may submit concurrently.
+static ggml_cann_graph_device_gate g_cann_device_op_gates[GGML_CANN_MAX_DEVICES];
 
-static std::mutex & ggml_cann_device_op_mutex(int32_t device) {
+static ggml_cann_graph_device_gate & ggml_cann_device_op_gate(int32_t device) {
     GGML_ASSERT(device >= 0 && device < GGML_CANN_MAX_DEVICES);
-    return g_cann_device_op_mutexes[device];
+    return g_cann_device_op_gates[device];
 }
+
+#ifdef USE_ACL_GRAPH
+ggml_cann_q8_w8a8_workspace_slot::ggml_cann_q8_w8a8_workspace_slot(
+        int node_index,
+        int32_t device,
+        const ggml_cann_q8_w8a8_workspace_plan & plan) :
+    node_index(node_index), device(device), plan(plan) {
+}
+
+ggml_cann_q8_w8a8_workspace_slot::~ggml_cann_q8_w8a8_workspace_slot() {
+    if (data != nullptr) {
+        ggml_cann_set_device(device);
+        ACL_CHECK(aclrtFree(data));
+        ggml_cann_q8_w8a8_stats_note_graph_workspace_free();
+    }
+}
+
+void ggml_cann_q8_w8a8_workspace_slot::allocate() {
+    GGML_ASSERT(data == nullptr);
+    if (plan.total_bytes == 0) {
+        return;
+    }
+    ggml_cann_set_device(device);
+    ACL_CHECK(aclrtMalloc(&data, plan.total_bytes, ACL_MEM_MALLOC_HUGE_FIRST));
+    ggml_cann_q8_w8a8_stats_note_graph_workspace_allocation();
+}
+
+static void * ggml_cann_q8_w8a8_workspace_region(void * data, size_t offset, size_t bytes) {
+    if (bytes == 0) {
+        return nullptr;
+    }
+    GGML_ASSERT(data != nullptr);
+    return static_cast<uint8_t *>(data) + offset;
+}
+
+void * ggml_cann_q8_w8a8_workspace_slot::input_f16() const {
+    return ggml_cann_q8_w8a8_workspace_region(data, plan.input_f16_offset, plan.input_f16_bytes);
+}
+
+void * ggml_cann_q8_w8a8_workspace_slot::quant() const {
+    return ggml_cann_q8_w8a8_workspace_region(data, plan.quant_offset, plan.quant_bytes);
+}
+
+void * ggml_cann_q8_w8a8_workspace_slot::token_scale() const {
+    return ggml_cann_q8_w8a8_workspace_region(data, plan.token_scale_offset, plan.token_scale_bytes);
+}
+
+void * ggml_cann_q8_w8a8_workspace_slot::output_f16() const {
+    return ggml_cann_q8_w8a8_workspace_region(data, plan.output_f16_offset, plan.output_f16_bytes);
+}
+
+bool ggml_cann_graph::plan_q8_w8a8_workspaces(int32_t device) {
+    q8_w8a8_workspaces.clear();
+    for (size_t node_index = 0; node_index < ggml_graph_properties.size(); ++node_index) {
+        const auto & q8_w8a8 = ggml_graph_properties[node_index].q8_w8a8;
+        if (!q8_w8a8.registered) {
+            continue;
+        }
+
+        const ggml_cann_q8_w8a8_workspace_plan plan = ggml_cann_q8_w8a8_plan_workspace(
+            q8_w8a8.input_type, q8_w8a8.output_type,
+            q8_w8a8.layout.k, q8_w8a8.layout.n,
+            q8_w8a8.m, q8_w8a8.ne2, q8_w8a8.ne3);
+        if (plan.status != ggml_cann_q8_w8a8_workspace_status::ok) {
+            q8_w8a8_workspaces.clear();
+            return false;
+        }
+        q8_w8a8_workspaces.emplace_back(
+            std::make_unique<ggml_cann_q8_w8a8_workspace_slot>(static_cast<int>(node_index), device, plan));
+    }
+    return true;
+}
+
+void ggml_cann_graph::allocate_q8_w8a8_workspaces() {
+    for (const auto & workspace : q8_w8a8_workspaces) {
+        workspace->allocate();
+    }
+}
+
+ggml_cann_q8_w8a8_workspace_slot * ggml_cann_graph::q8_w8a8_workspace(
+        int node_index, ggml_tensor * node) {
+    const ggml_cann_q8_w8a8_layout * layout = q8_w8a8_layout(node_index, node);
+    if (layout == nullptr) {
+        return nullptr;
+    }
+
+    const auto & q8_w8a8 = ggml_graph_properties[static_cast<size_t>(node_index)].q8_w8a8;
+    for (const auto & workspace : q8_w8a8_workspaces) {
+        if (workspace->node_index != node_index) {
+            continue;
+        }
+        if (!ggml_cann_q8_w8a8_workspace_matches(
+                workspace->plan, q8_w8a8.input_type, q8_w8a8.output_type,
+                layout->k, layout->n, q8_w8a8.m, q8_w8a8.ne2, q8_w8a8.ne3)) {
+            return nullptr;
+        }
+        return workspace.get();
+    }
+    return nullptr;
+}
+
+const ggml_cann_q8_w8a8_layout * ggml_cann_graph::q8_w8a8_layout(
+        int node_index, ggml_tensor * node) const {
+    if (node_index < 0 || static_cast<size_t>(node_index) >= ggml_graph_properties.size()) {
+        return nullptr;
+    }
+
+    const auto & property = ggml_graph_properties[static_cast<size_t>(node_index)];
+    if (!property.q8_w8a8.registered || node == nullptr ||
+        !property.has_matching_properties(node, property.q8_w8a8)) {
+        return nullptr;
+    }
+    return &property.q8_w8a8.layout;
+}
+#endif
 
 /**
  * @brief Set the CANN device to be used.
@@ -111,6 +224,36 @@ void ggml_cann_set_device(const int32_t device) {
 
     // Update the global device record.
     g_current_cann_device = device;
+}
+
+ggml_backend_cann_context::~ggml_backend_cann_context() {
+    auto graph_lock = graph_transaction_gate.lock();
+    auto device_lock = ggml_cann_device_op_gate(device).lock_exclusive();
+    ggml_cann_set_device(device);
+    for (int i = 0; i < GGML_CANN_MAX_STREAMS; ++i) {
+        if (streams[i] != nullptr) {
+            ACL_CHECK(aclrtSynchronizeStream(streams[i]));
+        }
+    }
+#ifdef USE_ACL_GRAPH
+    active_capture_graph = nullptr;
+    active_capture_node = -1;
+    graph_lru_cache.clear();
+#endif
+    mem_pool.reset();
+    rope_cache.release();
+    rms_norm_one_tensor_cache.release();
+    rms_norm_zero_tensor_cache.release();
+    if (copy_event != nullptr) {
+        ACL_CHECK(aclrtDestroyEvent(copy_event));
+        copy_event = nullptr;
+    }
+    for (int i = 0; i < GGML_CANN_MAX_STREAMS; ++i) {
+        if (streams[i] != nullptr) {
+            ACL_CHECK(aclrtDestroyStream(streams[i]));
+            streams[i] = nullptr;
+        }
+    }
 }
 
 /**
@@ -791,6 +934,8 @@ std::unique_ptr<ggml_cann_pool> ggml_backend_cann_context::new_pool_for_device(i
 
 // cann buffer
 
+static bool ggml_backend_buft_is_cann(ggml_backend_buffer_type_t buft);
+
 /**
  * @brief Tracks multi-threaded write progress for a single tensor.
  *
@@ -818,6 +963,9 @@ struct ggml_backend_cann_buffer_context {
     std::mutex tracker_mutex;   ///< Protects the trackers map
     std::unordered_map<void *, std::unique_ptr<TensorSetTracker>> trackers;
 
+    std::mutex q8_w8a8_mutex;
+    std::unordered_map<const void *, ggml_cann_q8_w8a8_layout> q8_w8a8_layouts;
+
     /**
      * @brief Constructor to initialize the CANN buffer context.
      *
@@ -829,7 +977,11 @@ struct ggml_backend_cann_buffer_context {
     /**
      * @brief Destructor to free the device memory allocated for the buffer.
      */
-    ~ggml_backend_cann_buffer_context() { ACL_CHECK(aclrtFree(dev_ptr)); }
+    ~ggml_backend_cann_buffer_context() {
+        ggml_cann_set_device(device);
+        auto device_lock = ggml_cann_device_op_gate(device).lock_exclusive();
+        ACL_CHECK(aclrtFree(dev_ptr));
+    }
 
     /**
      * @brief Get or create a tracker for the given tensor.
@@ -855,7 +1007,66 @@ struct ggml_backend_cann_buffer_context {
         std::lock_guard<std::mutex> lock(tracker_mutex);
         trackers.erase(tensor->data);
     }
+
+    void set_q8_w8a8_layout(const ggml_tensor * tensor, const ggml_cann_q8_w8a8_layout & layout) {
+        std::lock_guard<std::mutex> lock(q8_w8a8_mutex);
+        q8_w8a8_layouts[tensor->data] = layout;
+    }
+
+    void erase_q8_w8a8_layout(const ggml_tensor * tensor) {
+        std::lock_guard<std::mutex> lock(q8_w8a8_mutex);
+        q8_w8a8_layouts.erase(tensor->data);
+    }
+
+    void clear_q8_w8a8_layouts() {
+        std::lock_guard<std::mutex> lock(q8_w8a8_mutex);
+        q8_w8a8_layouts.clear();
+    }
+
+    bool get_q8_w8a8_layout(const ggml_tensor * tensor, ggml_cann_q8_w8a8_layout * layout) {
+        std::lock_guard<std::mutex> lock(q8_w8a8_mutex);
+        const auto it = q8_w8a8_layouts.find(tensor->data);
+        if (it == q8_w8a8_layouts.end()) {
+            return false;
+        }
+        if (layout != nullptr) {
+            *layout = it->second;
+        }
+        return true;
+    }
 };
+
+bool ggml_cann_get_q8_w8a8_layout(
+        const ggml_tensor * tensor,
+        ggml_cann_q8_w8a8_layout * layout) {
+    if (tensor == nullptr || tensor->buffer == nullptr ||
+        !ggml_backend_buft_is_cann(tensor->buffer->buft)) {
+        return false;
+    }
+    auto * ctx = static_cast<ggml_backend_cann_buffer_context *>(tensor->buffer->context);
+    return ctx->get_q8_w8a8_layout(tensor, layout);
+}
+
+void ggml_cann_q8_w8a8_graph_snapshot::capture_from_cgraph(const ggml_cgraph * cgraph) {
+    nodes.clear();
+    nodes.resize(static_cast<size_t>(cgraph->n_nodes));
+    for (int node_index = 0; node_index < cgraph->n_nodes; ++node_index) {
+        const ggml_tensor * node = cgraph->nodes[node_index];
+        if (node->op != GGML_OP_MUL_MAT || node->src[0] == nullptr || node->src[1] == nullptr ||
+            node->src[0]->type != GGML_TYPE_Q8_0) {
+            continue;
+        }
+        auto & node_snapshot = nodes[static_cast<size_t>(node_index)];
+        node_snapshot.registered = ggml_cann_get_q8_w8a8_layout(node->src[0], &node_snapshot.layout);
+        if (node_snapshot.registered) {
+            node_snapshot.input_type = node->src[1]->type;
+            node_snapshot.output_type = node->type;
+            node_snapshot.m = node->src[1]->ne[1];
+            node_snapshot.ne2 = node->src[1]->ne[2];
+            node_snapshot.ne3 = node->src[1]->ne[3];
+        }
+    }
+}
 
 // cann buffer type
 /**
@@ -1172,6 +1383,9 @@ static enum ggml_status ggml_backend_cann_buffer_init_tensor(ggml_backend_buffer
         size_t padded_size   = ggml_backend_buft_get_alloc_size(buffer->buft, tensor);
 
         if (padded_size > original_size && tensor->view_src == nullptr) {
+            auto * ctx = static_cast<ggml_backend_cann_buffer_context *>(buffer->context);
+            ggml_cann_set_device(ctx->device);
+            auto device_lock = ggml_cann_device_op_gate(ctx->device).lock_exclusive();
             size_t memset_size = padded_size - original_size;
             ACL_CHECK(aclrtMemset((char *) tensor->data + original_size, memset_size, 0, memset_size));
         }
@@ -1299,14 +1513,19 @@ static void ggml_backend_cann_buffer_set_tensor(ggml_backend_buffer_t buffer,
 
     ggml_cann_set_device(ctx->device);
     // Must not overlap CaptureBegin(GLOBAL)..CaptureEnd on this device.
-    std::lock_guard<std::mutex> device_lock(ggml_cann_device_op_mutex(ctx->device));
+    auto device_lock = ggml_cann_device_op_gate(ctx->device).lock_exclusive();
 
     // Only check env once.
     static bool weight_to_nz = parse_bool(get_env_as_lowercase("GGML_CANN_WEIGHT_NZ").value_or(""));
+    static bool q8_w8a8 = parse_bool(get_env_as_lowercase("GGML_CANN_Q8_W8A8").value_or("off"));
 
     bool is_quantized = need_transform(tensor->type);
     bool is_nz        = !is_quantized && tensor->type != GGML_TYPE_BF16 && weight_to_nz &&
                  is_matmul_weight((const ggml_tensor *) tensor);
+
+    if (is_quantized && (offset != 0 || size != ggml_nbytes(tensor))) {
+        ctx->erase_q8_w8a8_layout(tensor);
+    }
 
     // Plain tensor (not quantized, not NZ): direct copy, no tracking needed
     if (!is_quantized && !is_nz) {
@@ -1317,10 +1536,27 @@ static void ggml_backend_cann_buffer_set_tensor(ggml_backend_buffer_t buffer,
     // Single-shot write (full tensor at once): handle directly without tracking overhead
     if (offset == 0 && size == ggml_nbytes(tensor)) {
         if (is_quantized) {
-            void * transform_buffer = malloc(size);
-            ggml_backend_cann_transform(tensor, data, transform_buffer);
-            ACL_CHECK(aclrtMemcpy(tensor->data, size, transform_buffer, size, ACL_MEMCPY_HOST_TO_DEVICE));
-            free(transform_buffer);
+            ggml_cann_q8_w8a8_layout layout = {};
+            const size_t allocation_size = ggml_backend_buft_get_alloc_size(buffer->buft, tensor);
+            const auto reject = ggml_cann_q8_w8a8_validate(
+                q8_w8a8, tensor->type, is_matmul_weight(tensor),
+                tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3],
+                allocation_size, &layout);
+            if (reject == ggml_cann_q8_w8a8_reject::none) {
+                std::vector<uint8_t> transform_buffer(layout.scale_offset + layout.scale_bytes, 0);
+                const auto result = ggml_cann_requantize_q8_0_per_channel(
+                    data, tensor->ne[0], tensor->ne[1], transform_buffer.data(), transform_buffer.size());
+                GGML_ASSERT(result.status == ggml_cann_q8_w8a8_status::ok);
+                ACL_CHECK(aclrtMemcpy(tensor->data, transform_buffer.size(), transform_buffer.data(),
+                                      transform_buffer.size(), ACL_MEMCPY_HOST_TO_DEVICE));
+                ctx->set_q8_w8a8_layout(tensor, layout);
+            } else {
+                void * transform_buffer = malloc(size);
+                ggml_backend_cann_transform(tensor, data, transform_buffer);
+                ACL_CHECK(aclrtMemcpy(tensor->data, size, transform_buffer, size, ACL_MEMCPY_HOST_TO_DEVICE));
+                free(transform_buffer);
+                ctx->erase_q8_w8a8_layout(tensor);
+            }
         } else {
             // NZ weight
             GGML_ASSERT(tensor->ne[2] == 1);
@@ -1351,10 +1587,29 @@ static void ggml_backend_cann_buffer_set_tensor(ggml_backend_buffer_t buffer,
     // All chunks received: perform deferred transform/conversion
     if (tracker->bytes_written >= tracker->total_bytes) {
         if (is_quantized) {
-            void * transform_buffer = malloc(tracker->total_bytes);
-            ggml_backend_cann_transform(tensor, tracker->host_buffer.data(), transform_buffer);
-            ACL_CHECK(aclrtMemcpy(tensor->data, tracker->total_bytes, transform_buffer, tracker->total_bytes, ACL_MEMCPY_HOST_TO_DEVICE));
-            free(transform_buffer);
+            ggml_cann_q8_w8a8_layout layout = {};
+            const size_t allocation_size = ggml_backend_buft_get_alloc_size(buffer->buft, tensor);
+            const auto reject = ggml_cann_q8_w8a8_validate(
+                q8_w8a8, tensor->type, is_matmul_weight(tensor),
+                tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3],
+                allocation_size, &layout);
+            if (reject == ggml_cann_q8_w8a8_reject::none) {
+                std::vector<uint8_t> transform_buffer(layout.scale_offset + layout.scale_bytes, 0);
+                const auto result = ggml_cann_requantize_q8_0_per_channel(
+                    tracker->host_buffer.data(), tensor->ne[0], tensor->ne[1],
+                    transform_buffer.data(), transform_buffer.size());
+                GGML_ASSERT(result.status == ggml_cann_q8_w8a8_status::ok);
+                ACL_CHECK(aclrtMemcpy(tensor->data, transform_buffer.size(), transform_buffer.data(),
+                                      transform_buffer.size(), ACL_MEMCPY_HOST_TO_DEVICE));
+                ctx->set_q8_w8a8_layout(tensor, layout);
+            } else {
+                void * transform_buffer = malloc(tracker->total_bytes);
+                ggml_backend_cann_transform(tensor, tracker->host_buffer.data(), transform_buffer);
+                ACL_CHECK(aclrtMemcpy(tensor->data, tracker->total_bytes, transform_buffer,
+                                      tracker->total_bytes, ACL_MEMCPY_HOST_TO_DEVICE));
+                free(transform_buffer);
+                ctx->erase_q8_w8a8_layout(tensor);
+            }
         }
 
         if (is_nz) {
@@ -1390,9 +1645,21 @@ static void ggml_backend_cann_buffer_get_tensor(ggml_backend_buffer_t buffer,
     ggml_backend_cann_buffer_context * ctx = (ggml_backend_cann_buffer_context *) buffer->context;
 
     ggml_cann_set_device(ctx->device);
-    std::lock_guard<std::mutex> device_lock(ggml_cann_device_op_mutex(ctx->device));
+    auto device_lock = ggml_cann_device_op_gate(ctx->device).lock_exclusive();
 
-    if (!need_transform(tensor->type)) {
+    ggml_cann_q8_w8a8_layout layout = {};
+    if (ctx->get_q8_w8a8_layout(tensor, &layout)) {
+        GGML_ASSERT(offset <= ggml_nbytes(tensor));
+        GGML_ASSERT(size <= ggml_nbytes(tensor) - offset);
+        std::vector<uint8_t> device_layout(layout.scale_offset + layout.scale_bytes);
+        std::vector<uint8_t> standard_q8(ggml_nbytes(tensor));
+        ACL_CHECK(aclrtMemcpy(device_layout.data(), device_layout.size(), tensor->data,
+                              device_layout.size(), ACL_MEMCPY_DEVICE_TO_HOST));
+        const auto result = ggml_cann_restore_q8_0_from_per_channel(
+            device_layout.data(), layout.k, layout.n, standard_q8.data(), standard_q8.size());
+        GGML_ASSERT(result.status == ggml_cann_q8_w8a8_status::ok);
+        memcpy(data, standard_q8.data() + offset, size);
+    } else if (!need_transform(tensor->type)) {
         ACL_CHECK(aclrtMemcpy(data, size, (char *) tensor->data + offset, size, ACL_MEMCPY_DEVICE_TO_HOST));
     } else {
         void * transform_buffer = malloc(size);
@@ -1423,11 +1690,31 @@ static bool ggml_backend_cann_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
         ggml_backend_cann_buffer_context * dst_ctx = (ggml_backend_cann_buffer_context *) buffer->context;
 
         size_t memcpy_size = ggml_nbytes(src);
+        ggml_cann_q8_w8a8_layout src_layout = {};
+        const bool is_q8_w8a8 = src_ctx->get_q8_w8a8_layout(src, &src_layout);
+        if (is_q8_w8a8) {
+            ggml_cann_q8_w8a8_layout dst_layout = {};
+            const size_t allocation_size = ggml_backend_buft_get_alloc_size(buffer->buft, dst);
+            const auto reject = ggml_cann_q8_w8a8_validate(
+                true, dst->type, is_matmul_weight(dst),
+                dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
+                allocation_size, &dst_layout);
+            if (reject != ggml_cann_q8_w8a8_reject::none ||
+                dst_layout.k != src_layout.k || dst_layout.n != src_layout.n) {
+                return false;
+            }
+            memcpy_size = src_layout.scale_offset + src_layout.scale_bytes;
+        }
         // Same device.
         if (src_ctx->device == dst_ctx->device) {
-            std::lock_guard<std::mutex> device_lock(ggml_cann_device_op_mutex(src_ctx->device));
+            auto device_lock = ggml_cann_device_op_gate(src_ctx->device).lock_exclusive();
             ACL_CHECK(aclrtMemcpy((char *) dst->data, memcpy_size, (const char *) src->data, memcpy_size,
                                   ACL_MEMCPY_DEVICE_TO_DEVICE));
+            if (is_q8_w8a8) {
+                dst_ctx->set_q8_w8a8_layout(dst, src_layout);
+            } else {
+                dst_ctx->erase_q8_w8a8_layout(dst);
+            }
             return true;
         } else {
 #ifdef ASCEND_310P
@@ -1441,12 +1728,17 @@ static bool ggml_backend_cann_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
                 // Lock both devices in a stable order to avoid A-B / B-A deadlock.
                 const int32_t dev_a = src_ctx->device < dst_ctx->device ? src_ctx->device : dst_ctx->device;
                 const int32_t dev_b = src_ctx->device < dst_ctx->device ? dst_ctx->device : src_ctx->device;
-                std::lock_guard<std::mutex> lock_a(ggml_cann_device_op_mutex(dev_a));
-                std::lock_guard<std::mutex> lock_b(ggml_cann_device_op_mutex(dev_b));
+                auto lock_a = ggml_cann_device_op_gate(dev_a).lock_exclusive();
+                auto lock_b = ggml_cann_device_op_gate(dev_b).lock_exclusive();
                 ggml_cann_set_device(src_ctx->device);
                 ACL_CHECK(aclrtDeviceEnablePeerAccess(dst_ctx->device, 0));
                 ACL_CHECK(aclrtMemcpy((char *) dst->data, memcpy_size, (const char *) src->data, memcpy_size,
                                       ACL_MEMCPY_DEVICE_TO_DEVICE));
+                if (is_q8_w8a8) {
+                    dst_ctx->set_q8_w8a8_layout(dst, src_layout);
+                } else {
+                    dst_ctx->erase_q8_w8a8_layout(dst);
+                }
                 return true;
             }
         }
@@ -1467,7 +1759,46 @@ static void ggml_backend_cann_buffer_memset_tensor(ggml_backend_buffer_t buffer,
     ggml_backend_cann_buffer_context * ctx = (ggml_backend_cann_buffer_context *) buffer->context;
 
     ggml_cann_set_device(ctx->device);
-    std::lock_guard<std::mutex> device_lock(ggml_cann_device_op_mutex(ctx->device));
+    auto device_lock = ggml_cann_device_op_gate(ctx->device).lock_exclusive();
+
+    ggml_cann_q8_w8a8_layout layout = {};
+    if (ctx->get_q8_w8a8_layout(tensor, &layout)) {
+        GGML_ASSERT(offset <= ggml_nbytes(tensor));
+        GGML_ASSERT(size <= ggml_nbytes(tensor) - offset);
+        std::vector<uint8_t> device_layout(layout.scale_offset + layout.scale_bytes);
+        std::vector<uint8_t> standard_q8(ggml_nbytes(tensor));
+        std::vector<uint8_t> transformed_q8(ggml_nbytes(tensor));
+        ACL_CHECK(aclrtMemcpy(device_layout.data(), device_layout.size(), tensor->data,
+                              device_layout.size(), ACL_MEMCPY_DEVICE_TO_HOST));
+        const auto result = ggml_cann_restore_q8_0_from_per_channel(
+            device_layout.data(), layout.k, layout.n, standard_q8.data(), standard_q8.size());
+        GGML_ASSERT(result.status == ggml_cann_q8_w8a8_status::ok);
+        memset(standard_q8.data() + offset, value, size);
+        ggml_backend_cann_transform(tensor, standard_q8.data(), transformed_q8.data());
+        ACL_CHECK(aclrtMemcpy(tensor->data, transformed_q8.size(), transformed_q8.data(),
+                              transformed_q8.size(), ACL_MEMCPY_HOST_TO_DEVICE));
+        ctx->erase_q8_w8a8_layout(tensor);
+        return;
+    }
+
+    if (need_transform(tensor->type)) {
+        GGML_ASSERT(offset <= ggml_nbytes(tensor));
+        GGML_ASSERT(size <= ggml_nbytes(tensor) - offset);
+        std::vector<uint8_t> device_layout(ggml_nbytes(tensor));
+        std::vector<uint8_t> standard_quant(ggml_nbytes(tensor));
+        std::vector<uint8_t> transformed_quant(ggml_nbytes(tensor));
+        ACL_CHECK(aclrtMemcpy(device_layout.data(), device_layout.size(), tensor->data,
+                              device_layout.size(), ACL_MEMCPY_DEVICE_TO_HOST));
+        ggml_backend_cann_transform_back(tensor, device_layout.data(), standard_quant.data());
+        memset(standard_quant.data() + offset, value, size);
+        ggml_backend_cann_transform(tensor, standard_quant.data(), transformed_quant.data());
+        ACL_CHECK(aclrtMemcpy(tensor->data, transformed_quant.size(), transformed_quant.data(),
+                              transformed_quant.size(), ACL_MEMCPY_HOST_TO_DEVICE));
+        ctx->erase_q8_w8a8_layout(tensor);
+        return;
+    }
+
+    ctx->erase_q8_w8a8_layout(tensor);
     ACL_CHECK(aclrtMemset((char *) tensor->data + offset, size, value, size));
 }
 
@@ -1484,6 +1815,8 @@ static void ggml_backend_cann_buffer_clear(ggml_backend_buffer_t buffer, uint8_t
     ggml_backend_cann_buffer_context * ctx = (ggml_backend_cann_buffer_context *) buffer->context;
 
     ggml_cann_set_device(ctx->device);
+    auto device_lock = ggml_cann_device_op_gate(ctx->device).lock_exclusive();
+    ctx->clear_q8_w8a8_layouts();
     ACL_CHECK(aclrtMemset(ctx->dev_ptr, buffer->size, value, buffer->size));
 }
 
@@ -1521,6 +1854,7 @@ static ggml_backend_buffer_t ggml_backend_cann_buffer_type_alloc_buffer(ggml_bac
     ggml_backend_cann_buffer_type_context * buft_ctx = (ggml_backend_cann_buffer_type_context *) buft->context;
 
     ggml_cann_set_device(buft_ctx->device);
+    auto device_lock = ggml_cann_device_op_gate(buft_ctx->device).lock_exclusive();
 
     const size_t alignment = 128;
     size                   = GGML_PAD(size, alignment);
@@ -2087,24 +2421,15 @@ static const char * ggml_backend_cann_name(ggml_backend_t backend) {
 /**
  * @brief Frees resources associated with the CANN backend.
  *
- * This function releases resources associated with the CANN backend context
- * and resets the device associated with the backend to its initial state.
+ * The context destructor synchronizes and destroys only this backend's
+ * streams, captured graphs, events, and persistent workspaces. Resetting the
+ * device here would destroy resources owned by peer backends on the same
+ * device.
  *
  * @param backend Pointer to the CANN backend structure to be freed.
  */
 static void ggml_backend_cann_free(ggml_backend_t backend) {
     ggml_backend_cann_context * cann_ctx = (ggml_backend_cann_context *) backend->context;
-
-    // Backend destruction may run on a WebSocket worker thread that never
-    // selected this device, or after another backend reset its thread-local
-    // ACL context. Rebind unconditionally before the final synchronize/reset.
-    g_current_cann_device = -1;
-    ggml_cann_set_device(cann_ctx->device);
-    std::lock_guard<std::mutex> device_lock(ggml_cann_device_op_mutex(cann_ctx->device));
-    ACL_CHECK(aclrtSynchronizeDevice());
-    ACL_CHECK(aclrtResetDevice(cann_ctx->device));
-    g_current_cann_device = -1;
-
     delete cann_ctx;
     delete backend;
 }
@@ -2135,7 +2460,7 @@ static void ggml_backend_cann_set_tensor_async(ggml_backend_t backend,
     // token2wav thread) may reach here as their first CANN call, and
     // aclrtMemcpyAsync requires a thread-local ACL context.
     ggml_cann_set_device(cann_ctx->device);
-    std::lock_guard<std::mutex> device_lock(ggml_cann_device_op_mutex(cann_ctx->device));
+    auto device_lock = ggml_cann_device_op_gate(cann_ctx->device).lock_exclusive();
     ACL_CHECK(aclrtMemcpyAsync((char *) tensor->data + offset, size, data, size, ACL_MEMCPY_HOST_TO_DEVICE,
                                cann_ctx->stream()));
 }
@@ -2164,7 +2489,7 @@ static void ggml_backend_cann_get_tensor_async(ggml_backend_t      backend,
 
     // Same as set_tensor_async: ensure this thread has an ACL context.
     ggml_cann_set_device(cann_ctx->device);
-    std::lock_guard<std::mutex> device_lock(ggml_cann_device_op_mutex(cann_ctx->device));
+    auto device_lock = ggml_cann_device_op_gate(cann_ctx->device).lock_exclusive();
     ACL_CHECK(aclrtMemcpyAsync(data, size, (char *) tensor->data + offset, size, ACL_MEMCPY_DEVICE_TO_HOST,
                                cann_ctx->stream()));
 }
@@ -2221,8 +2546,14 @@ static bool ggml_backend_cann_cpy_tensor_async(ggml_backend_t      backend_src,
             return false;
         }
 
-        // need open both directions for memcpyasync between devices.
-        ACL_CHECK(aclrtDeviceEnablePeerAccess(cann_ctx_src->device, 0));
+        // Bind the source context before enabling peer access. The generic
+        // tensor-parallel reduction copies in both directions, so lock the
+        // two devices in a stable order and let each directional call enable
+        // access from its source device to its destination device.
+        const int32_t dev_a = std::min(cann_ctx_src->device, cann_ctx_dst->device);
+        const int32_t dev_b = std::max(cann_ctx_src->device, cann_ctx_dst->device);
+        auto lock_a = ggml_cann_device_op_gate(dev_a).lock_exclusive();
+        auto lock_b = ggml_cann_device_op_gate(dev_b).lock_exclusive();
         ggml_cann_set_device(cann_ctx_src->device);
         ACL_CHECK(aclrtDeviceEnablePeerAccess(cann_ctx_dst->device, 0));
 
@@ -2242,6 +2573,8 @@ static bool ggml_backend_cann_cpy_tensor_async(ggml_backend_t      backend_src,
         ACL_CHECK(aclrtSynchronizeStream(cann_ctx_src->stream()));
     } else {
         // src and dst are on the same backend
+        ggml_cann_set_device(cann_ctx_dst->device);
+        auto device_lock = ggml_cann_device_op_gate(cann_ctx_dst->device).lock_exclusive();
         ACL_CHECK(aclrtMemcpyAsync(dst->data, copy_size, src->data, copy_size, ACL_MEMCPY_DEVICE_TO_DEVICE,
                                    cann_ctx_dst->stream()));
     }
@@ -2260,7 +2593,7 @@ static bool ggml_backend_cann_cpy_tensor_async(ggml_backend_t      backend_src,
 static void ggml_backend_cann_synchronize(ggml_backend_t backend) {
     ggml_backend_cann_context * cann_ctx = (ggml_backend_cann_context *) backend->context;
     ggml_cann_set_device(cann_ctx->device);
-    std::lock_guard<std::mutex> device_lock(ggml_cann_device_op_mutex(cann_ctx->device));
+    auto device_lock = ggml_cann_device_op_gate(cann_ctx->device).lock_exclusive();
     ACL_CHECK(aclrtSynchronizeStream(cann_ctx->stream()));
 }
 
@@ -2316,11 +2649,10 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
                                             bool                        use_cann_graph,
                                             bool                        cann_graph_capture_required) {
 #ifdef USE_ACL_GRAPH
-    // Hold the per-device op mutex across the entire GLOBAL capture window so
-    // concurrent threads cannot issue sync memcpy (set_tensor etc.) mid-capture.
-    std::unique_lock<std::mutex> capture_lock(ggml_cann_device_op_mutex(cann_ctx->device), std::defer_lock);
     if (use_cann_graph && cann_graph_capture_required) {  // Begin CANN graph capture
-        capture_lock.lock();
+        GGML_ASSERT(!cann_ctx->graph_lru_cache.cache_list.empty());
+        cann_ctx->active_capture_graph = cann_ctx->graph_lru_cache.cache_list.front();
+        cann_ctx->active_capture_node = -1;
         ACL_CHECK(aclmdlRICaptureBegin(cann_ctx->stream(), ACL_MODEL_RI_CAPTURE_MODE_GLOBAL));
     }
 #endif  // USE_ACL_GRAPH
@@ -2372,6 +2704,9 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
                 continue;
             }
             ggml_tensor * node = cgraph->nodes[i];
+#ifdef USE_ACL_GRAPH
+            cann_ctx->active_capture_node = -1;
+#endif
             if (im2col_ctb_split_enabled && node->op == GGML_OP_CONCAT) {
                 int permute_index = -1;
                 int im2col_index = -1;
@@ -2452,7 +2787,15 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
                 continue;
             }
 
+#ifdef USE_ACL_GRAPH
+            if (cann_ctx->active_capture_graph != nullptr) {
+                cann_ctx->active_capture_node = i;
+            }
+#endif
             bool ok = ggml_cann_compute_forward(*cann_ctx, node);
+#ifdef USE_ACL_GRAPH
+            cann_ctx->active_capture_node = -1;
+#endif
             if (!ok) {
                 GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
             }
@@ -2465,9 +2808,11 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
         GGML_ASSERT(!cann_ctx->graph_lru_cache.cache_list.empty());
         ggml_cann_graph * matched_graph = cann_ctx->graph_lru_cache.cache_list.front();
 
+        cann_ctx->active_capture_graph = nullptr;
+        cann_ctx->active_capture_node = -1;
+
         if (cann_graph_capture_required) {  // End CANN graph capture
             ACL_CHECK(aclmdlRICaptureEnd(cann_ctx->stream(), &matched_graph->graph));
-            capture_lock.unlock();
         }
 
         // Execute CANN graph
@@ -2491,12 +2836,7 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
 static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cann_context * cann_ctx = (ggml_backend_cann_context *) backend->context;
     ggml_cann_set_device(cann_ctx->device);
-    g_nz_workspaces[cann_ctx->device].clear();
 
-    // calculate rope cache for fist layer in current device.
-    cann_ctx->rope_cache.cached = false;
-
-    bool graph_capture_required = false;
 #ifdef USE_ACL_GRAPH
     bool use_cann_graph = !cann_ctx->graph_bypass.disabled();
 
@@ -2520,34 +2860,71 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, 
     }
 
     if (use_cann_graph) {
-        // If no matching graph is found, the graph needs to be recaptured.
-        graph_capture_required = !cann_ctx->graph_lru_cache.find_and_move_to_front(cgraph);
+        ggml_cann_graph_transaction transaction(
+            cann_ctx->graph_transaction_gate, ggml_cann_device_op_gate(cann_ctx->device));
+        cann_ctx->candidate_q8_w8a8_snapshot.capture_from_cgraph(cgraph);
+        if (cann_ctx->graph_lru_cache.find_and_move_to_front(
+                cgraph, cann_ctx->candidate_q8_w8a8_snapshot)) {
+            evaluate_and_capture_cann_graph(cann_ctx, cgraph, true, false);
+            return GGML_STATUS_SUCCESS;
+        }
 
-        if (graph_capture_required) {
-            // If no matching graph is found, add a new ACL graph.
-            ggml_cann_graph * new_graph = ggml_cann_graph::create_from_cgraph(cgraph);
-            cann_ctx->graph_lru_cache.push(new_graph);
+        // std::shared_mutex has no atomic upgrade. Rebuild the registry
+        // snapshot and repeat lookup after obtaining exclusive access so a
+        // synchronous tensor update cannot invalidate the capture plan in the
+        // upgrade window.
+        transaction.upgrade_to_exclusive();
+        cann_ctx->candidate_q8_w8a8_snapshot.capture_from_cgraph(cgraph);
+        if (cann_ctx->graph_lru_cache.find_and_move_to_front(
+                cgraph, cann_ctx->candidate_q8_w8a8_snapshot)) {
+            evaluate_and_capture_cann_graph(cann_ctx, cgraph, true, false);
+            return GGML_STATUS_SUCCESS;
+        }
 
-            // Pre-load rope cache before graph capture.  During capture the
-            // stream cannot perform host-to-device memcpy or device memory
-            // malloc/free.  Running the full cache init now populates the
-            // cache metadata so these branches are skipped during capture,
-            // while also warming up the memory pool.
-            for (int i = 0; i < cgraph->n_nodes; i++) {
-                ggml_tensor * node = cgraph->nodes[i];
-                if (node->op == GGML_OP_ROPE) {
-                    ggml_cann_rope_cache_preload(*cann_ctx, node);
-                    break;
-                }
+        g_nz_workspaces[cann_ctx->device].clear();
+        cann_ctx->rope_cache.cached = false;
+
+        // Build and validate all persistent workspace metadata before changing
+        // the cache. Unsupported plans execute eagerly without disturbing a
+        // reusable cached graph.
+        std::unique_ptr<ggml_cann_graph> new_graph(
+            ggml_cann_graph::create_from_cgraph(cgraph, cann_ctx->candidate_q8_w8a8_snapshot));
+        if (!new_graph->plan_q8_w8a8_workspaces(cann_ctx->device)) {
+            evaluate_and_capture_cann_graph(cann_ctx, cgraph, false, false);
+            return GGML_STATUS_SUCCESS;
+        }
+
+        // Evict before allocating the candidate so persistent W8A8 storage
+        // never reaches capacity + 1. Captured addresses are released only
+        // after the context stream is idle.
+        if (ggml_cann_graph * evicted = cann_ctx->graph_lru_cache.take_lru_if_full()) {
+            ACL_CHECK(aclrtSynchronizeStream(cann_ctx->stream()));
+            delete evicted;
+        }
+
+        new_graph->allocate_q8_w8a8_workspaces();
+        cann_ctx->graph_lru_cache.push(new_graph.release());
+
+        // Capture cannot allocate or perform synchronous H2D. Preload RoPE
+        // state while exclusive access is held and before CaptureBegin.
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            ggml_tensor * node = cgraph->nodes[i];
+            if (node->op == GGML_OP_ROPE) {
+                ggml_cann_rope_cache_preload(*cann_ctx, node);
+                break;
             }
         }
+
+        evaluate_and_capture_cann_graph(cann_ctx, cgraph, true, true);
+        return GGML_STATUS_SUCCESS;
     }
-
-#else
-    bool use_cann_graph = false;
 #endif  // USE_ACL_GRAPH
-    evaluate_and_capture_cann_graph(cann_ctx, cgraph, use_cann_graph, graph_capture_required);
 
+    auto context_lock = cann_ctx->graph_transaction_gate.lock();
+    auto exclusive_lock = ggml_cann_device_op_gate(cann_ctx->device).lock_exclusive();
+    g_nz_workspaces[cann_ctx->device].clear();
+    cann_ctx->rope_cache.cached = false;
+    evaluate_and_capture_cann_graph(cann_ctx, cgraph, false, false);
     return GGML_STATUS_SUCCESS;
 }
 
@@ -3155,7 +3532,6 @@ static bool ggml_backend_cann_graph_enabled(ggml_backend_t backend) {
     return false;
 #endif
 }
-
 
 static void * ggml_backend_cann_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);

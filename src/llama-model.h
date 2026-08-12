@@ -640,6 +640,7 @@ struct llama_model {
 
 protected:
     llama_model_params params;
+    std::vector<float> tensor_split_data;
 
     struct impl;
     std::unique_ptr<impl> pimpl;

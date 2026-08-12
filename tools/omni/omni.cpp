@@ -4203,6 +4203,91 @@ static struct llama_model * llama_init(common_params * params, std::string model
     llama_numa_init(params->numa);
     
     llama_model_params model_params = common_model_params_to_llama(*params);
+    std::vector<ggml_backend_dev_t> llm_devices;
+    std::vector<float> tensor_split;
+    if (const char * device_list = std::getenv("OMNI_LLM_DEVICES");
+        device_list != nullptr && device_list[0] != '\0') {
+        const bool auto_devices = std::strcmp(device_list, "auto") == 0;
+        if (auto_devices) {
+            for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                ggml_backend_dev_t device = ggml_backend_dev_get(i);
+                const char * name = ggml_backend_dev_name(device);
+                if (ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_GPU &&
+                    name != nullptr && std::strncmp(name, "CANN", 4) == 0) {
+                    llm_devices.push_back(device);
+                }
+            }
+        } else {
+            std::stringstream stream(device_list);
+            std::string name;
+            while (std::getline(stream, name, ',')) {
+                ggml_backend_dev_t device = omni_backend_device_by_name(name.c_str());
+                if (device == nullptr || ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                    LOG_ERR("%s: invalid OMNI_LLM_DEVICES entry '%s'\n", __func__, name.c_str());
+                    return nullptr;
+                }
+                llm_devices.push_back(device);
+            }
+        }
+        if (llm_devices.empty()) {
+            LOG_ERR("%s: OMNI_LLM_DEVICES did not contain a device\n", __func__);
+            return nullptr;
+        }
+        const size_t llm_device_count = llm_devices.size();
+        llm_devices.push_back(nullptr);
+        model_params.devices = llm_devices.data();
+
+        const char * split_mode = std::getenv("OMNI_LLM_SPLIT_MODE");
+        if (split_mode == nullptr || split_mode[0] == '\0' || std::strcmp(split_mode, "none") == 0) {
+            model_params.split_mode = LLAMA_SPLIT_MODE_NONE;
+        } else if (std::strcmp(split_mode, "row") == 0) {
+            model_params.split_mode = LLAMA_SPLIT_MODE_ROW;
+        } else if (std::strcmp(split_mode, "layer") == 0) {
+            model_params.split_mode = LLAMA_SPLIT_MODE_LAYER;
+        } else if (std::strcmp(split_mode, "tensor") == 0) {
+            // CANN does not export the legacy row-split buffer type.  Use the
+            // Meta backend path for actual per-layer tensor parallelism.
+            model_params.split_mode = LLAMA_SPLIT_MODE_TENSOR;
+        } else {
+            LOG_ERR("%s: invalid OMNI_LLM_SPLIT_MODE='%s'\n", __func__, split_mode);
+            return nullptr;
+        }
+        if (llm_device_count == 1 && model_params.split_mode != LLAMA_SPLIT_MODE_NONE) {
+            LOG_WRN("%s: only one CANN device is available; falling back to split_mode=none\n", __func__);
+            model_params.split_mode = LLAMA_SPLIT_MODE_NONE;
+        }
+
+        if (const char * raw_split = std::getenv("OMNI_LLM_TENSOR_SPLIT");
+            raw_split != nullptr && raw_split[0] != '\0') {
+            tensor_split.assign(llama_max_devices(), 0.0f);
+            std::stringstream split_stream(raw_split);
+            std::string value;
+            size_t index = 0;
+            while (std::getline(split_stream, value, ',')) {
+                if (index >= tensor_split.size()) {
+                    LOG_ERR("%s: too many OMNI_LLM_TENSOR_SPLIT values\n", __func__);
+                    return nullptr;
+                }
+                char * end = nullptr;
+                errno = 0;
+                const float parsed = std::strtof(value.c_str(), &end);
+                if (errno != 0 || end == value.c_str() || *end != '\0' ||
+                    !std::isfinite(parsed) || parsed < 0.0f) {
+                    LOG_ERR("%s: invalid OMNI_LLM_TENSOR_SPLIT value '%s'\n", __func__, value.c_str());
+                    return nullptr;
+                }
+                tensor_split[index++] = parsed;
+            }
+            if (llm_device_count > 1) {
+                model_params.tensor_split = tensor_split.data();
+            }
+        }
+        print_with_timestamp("LLM model: devices=%s split_mode=%d%s\n",
+                             device_list, static_cast<int>(model_params.split_mode),
+                             model_params.split_mode == LLAMA_SPLIT_MODE_TENSOR
+                                 ? " (tensor parallel, experimental)"
+                                 : "");
+    }
     llama_model * model = llama_load_model_from_file(model_path.c_str(), model_params);
     if (model == NULL) {
         LOG_ERR("%s: unable to load model\n" , __func__);

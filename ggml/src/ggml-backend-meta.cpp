@@ -1063,7 +1063,10 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     const std::pair key = std::make_pair(tensor, assume_sync);
     auto it = buf_ctx->split_state_cache.find(key);
     if (it != buf_ctx->split_state_cache.end() && memcmp(it->second.second, (const char *) tensor, sizeof(it->second.second)) != 0) {
-        buf_ctx->split_state_cache.clear();
+        // Tensor structs in compute arenas can reuse the same address across graph rebuilds.
+        // Only this entry is stale; clearing the whole cache can discard split states that
+        // are still needed by the recursive traversal and lead to unbounded recursion.
+        buf_ctx->split_state_cache.erase(it);
         it = buf_ctx->split_state_cache.end();
     }
 

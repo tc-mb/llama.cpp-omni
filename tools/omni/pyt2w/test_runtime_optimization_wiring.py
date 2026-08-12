@@ -7,6 +7,7 @@ from pathlib import Path
 
 OMNI_CPP = Path(__file__).resolve().parents[1] / "omni.cpp"
 OMNI_H = Path(__file__).resolve().parents[1] / "omni.h"
+META_BACKEND_CPP = Path(__file__).resolve().parents[3] / "ggml" / "src" / "ggml-backend-meta.cpp"
 
 
 class RuntimeOptimizationWiringTests(unittest.TestCase):
@@ -14,6 +15,7 @@ class RuntimeOptimizationWiringTests(unittest.TestCase):
     def setUpClass(cls):
         cls.source = OMNI_CPP.read_text(encoding="utf-8")
         cls.header = OMNI_H.read_text(encoding="utf-8")
+        cls.meta_backend_source = META_BACKEND_CPP.read_text(encoding="utf-8")
 
     def test_sampler_reuses_workspace_and_partial_topk(self):
         self.assertIn("thread_local tts_sampling_workspace workspace;", self.source)
@@ -49,6 +51,33 @@ class RuntimeOptimizationWiringTests(unittest.TestCase):
             self.assertIn(symbol, self.source)
             self.assertIn(symbol, self.header)
 
+    def test_main_llm_tensor_parallel_configuration_is_validated(self):
+        for variable in (
+            "OMNI_LLM_DEVICES",
+            "OMNI_LLM_SPLIT_MODE",
+            "OMNI_LLM_TENSOR_SPLIT",
+        ):
+            self.assertIn(f'std::getenv("{variable}")', self.source)
+        for mode in (
+            "LLAMA_SPLIT_MODE_NONE",
+            "LLAMA_SPLIT_MODE_ROW",
+            "LLAMA_SPLIT_MODE_LAYER",
+            "LLAMA_SPLIT_MODE_TENSOR",
+        ):
+            self.assertIn(mode, self.source)
+        self.assertIn('std::strcmp(split_mode, "tensor")', self.source)
+        self.assertIn("Meta backend path", self.source)
+        self.assertIn("tensor parallel, experimental", self.source)
+        self.assertIn("GGML_BACKEND_DEVICE_TYPE_CPU", self.source)
+        self.assertIn('std::strcmp(device_list, "auto")', self.source)
+        self.assertIn("ggml_backend_dev_count()", self.source)
+        self.assertIn('std::strncmp(name, "CANN", 4)', self.source)
+        self.assertIn("only one CANN device is available", self.source)
+        self.assertIn("index >= tensor_split.size()", self.source)
+        self.assertIn("!std::isfinite(parsed)", self.source)
+        self.assertIn("parsed < 0.0f", self.source)
+        self.assertIn("model_params.tensor_split = tensor_split.data();", self.source)
+
     def test_generation_limit_is_capped_by_remaining_context(self):
         self.assertGreaterEqual(
             self.source.count("params->n_ctx - ctx_omni->n_past"), 2
@@ -56,6 +85,18 @@ class RuntimeOptimizationWiringTests(unittest.TestCase):
         self.assertGreaterEqual(
             self.source.count("generation_hit_limit.store(true)"), 2
         )
+
+    def test_meta_split_state_address_reuse_evicts_only_stale_entry(self):
+        mismatch_start = self.meta_backend_source.index(
+            "if (it != buf_ctx->split_state_cache.end() && memcmp("
+        )
+        mismatch_body = self.meta_backend_source[
+            mismatch_start:self.meta_backend_source.index(
+                "if (it == buf_ctx->split_state_cache.end())", mismatch_start
+            )
+        ]
+        self.assertIn("buf_ctx->split_state_cache.erase(it);", mismatch_body)
+        self.assertNotIn("buf_ctx->split_state_cache.clear();", mismatch_body)
 
 
 if __name__ == "__main__":
