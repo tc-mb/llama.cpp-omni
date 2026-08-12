@@ -216,6 +216,9 @@ endif()
 
 if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS)
     add_subdirectory(tools)
+    if (TARGET omni)
+        target_sources(omni PRIVATE tools/omni/tts-head-code-executor.cpp)
+    endif()
 endif()
 
 if (LLAMA_BUILD_APP)

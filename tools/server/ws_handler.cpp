@@ -15,6 +15,7 @@
 #include "protocol.h"
 #include "omni.h"
 #include "common.h"
+#include "common/sampling.h"
 #include "llama.h"
 #include "log.h"
 #include "audition.h"
@@ -180,9 +181,11 @@ static void reset_octx_for_session(omni_context * octx, const ParsedSessionInit 
     octx->duplex_mode = duplex_mode;
     octx->base_output_dir = output_dir;
 
-    octx->break_event.store(false);
+    omni_reset_break_state(octx);
     octx->current_turn_ended = false;
     octx->llm_generation_done = false;
+    octx->generated_tokens.store(0);
+    octx->generation_hit_limit.store(false);
     octx->need_speek = false;
     octx->speek_done = true;
 
@@ -203,6 +206,13 @@ static void reset_octx_for_session(omni_context * octx, const ParsedSessionInit 
     octx->tts_condition_n_embd = 0;
 
     clear_text_stream_state(octx);
+
+    if (octx->ctx_sampler) {
+        common_sampler_reset(octx->ctx_sampler);
+    }
+    if (octx->ctx_tts_sampler) {
+        common_sampler_reset(octx->ctx_tts_sampler);
+    }
 
     if (octx->ctx_llama) {
         llama_memory_t mem = llama_get_memory(octx->ctx_llama);
@@ -494,10 +504,18 @@ static void configure_turn_based_prompt(omni_context * octx,
     }
 
     if (use_tts_template) {
-        octx->audio_voice_clone_prompt = "<|im_start|>system\n模仿音频样本的音色并生成新的内容。\n<|audio_start|>";
-        octx->audio_assistant_prompt = "<|audio_end|>你的任务是用这种声音模式来当一个助手。请认真、高质量地回复用户的问题。请用高自然度的方式和用户聊天。你是由面壁智能开发的人工智能助手：面壁小钢炮。<|im_end|>\n<|im_start|>user\n";
-        octx->omni_voice_clone_prompt = "<|im_start|>system\n模仿音频样本的音色并生成新的内容。\n<|audio_start|>";
-        octx->omni_assistant_prompt = "<|audio_end|>你的任务是用这种声音模式来当一个助手。请认真、高质量地回复用户的问题。请用高自然度的方式和用户聊天。<|im_end|>\n<|im_start|>user\n";
+        // MiniCPM-o 4.5 uses this universal zero-shot voice-cloning prompt for
+        // both English and Chinese synthesis.  Keep the exact punctuation and
+        // newline boundary because they change the TTS condition hidden states.
+        const std::string voice_prefix =
+            "<|im_start|>system\n模仿音频样本的音色并生成新的内容。\n<|audio_start|>";
+        const std::string voice_suffix =
+            "<|audio_end|>\n请用这种声音风格来为用户提供帮助。 直接作答，不要有冗余内容"
+            "<|im_end|>\n<|im_start|>user\n";
+        octx->audio_voice_clone_prompt = voice_prefix;
+        octx->audio_assistant_prompt = voice_suffix;
+        octx->omni_voice_clone_prompt = voice_prefix;
+        octx->omni_assistant_prompt = voice_suffix;
         return;
     }
 
@@ -525,9 +543,9 @@ static omni_context * create_session_octx(common_params & params, const ParsedSe
     bool duplex_mode = (init.mode == "full_duplex");
     bool use_tts = init.use_tts;
 
-    // Build params for omni_init
+    // Build params for omni_init. Per-request generation limits are applied
+    // from input.append; do not replace the configured/default budget here.
     auto & p = params;
-    p.n_predict = 2048;
     ensure_omni_model_paths(p);
 
     // Reuse the server-owned context if it matches this session's mode (avoids
@@ -546,7 +564,7 @@ static omni_context * create_session_octx(common_params & params, const ParsedSe
     }
 
     omni_context * octx = omni_init(&p, media_type, use_tts, p.tts_bin_dir, /*tts_gpu_layers*/99,
-                                     /*token2wav_device*/"gpu:0", duplex_mode,
+                                     omni_default_token2wav_device(), duplex_mode,
                                      model, ctx, output_dir);
     if (!octx) {
         LOG_ERR("create_session_octx: omni_init failed\n");
@@ -653,6 +671,14 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
         return;
     }
 
+    // session.init carries the reference audio and triggers its system-prompt
+    // prefill before input.append arrives.  Select the TTS template here so
+    // the first session uses the same prompt as all reused sessions.
+    if (parsed_init.mode == "turn_based" && parsed_init.use_tts) {
+        std::lock_guard<std::mutex> lock(octx_mutex);
+        configure_turn_based_prompt(octx, /*use_tts_template*/true, /*system_text*/"");
+    }
+
     // Full-duplex requires index=0 prefill before the first frame. This
     // initializes the system prompt and starts the duplex encoder/LLM pipeline.
     if (parsed_init.mode == "full_duplex" || !parsed_init.ref_audio_b64.empty()) {
@@ -664,14 +690,23 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
             fail_fast(session_id, "voice_audio_decode_failed");
             return;
         }
-        std::lock_guard<std::mutex> lock(octx_mutex);
-        if (!stream_prefill(octx, voice_wav, /*img*/"", /*index*/0)) {
-            LOG_ERR("WS /backend: voice prefill failed\n");
-            if (!voice_wav.empty()) fs::remove(voice_wav);
-            fail_fast(session_id, "voice_prefill_failed");
-            return;
+        if (!voice_wav.empty()) {
+            retained_media_files.push_back(voice_wav);
         }
-        if (!voice_wav.empty()) fs::remove(voice_wav);
+        {
+            std::lock_guard<std::mutex> lock(octx_mutex);
+            if (!voice_wav.empty() && octx->use_python_token2wav &&
+                !omni_set_token2wav_ref_audio(octx, voice_wav)) {
+                LOG_ERR("WS /backend: Token2Wav reference audio update failed\n");
+                fail_fast(session_id, "token2wav_ref_audio_failed");
+                return;
+            }
+            if (!stream_prefill(octx, voice_wav, /*img*/"", /*index*/0)) {
+                LOG_ERR("WS /backend: voice prefill failed\n");
+                fail_fast(session_id, "voice_prefill_failed");
+                return;
+            }
+        }
         if (octx->llm_thread_info) {
             octx->llm_thread_info->start = std::chrono::steady_clock::now();
         }
@@ -818,7 +853,7 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
             }
 
             TempMediaFiles tmp_files;
-            std::vector<std::string> extra_image_paths;
+            std::vector<std::string> image_paths;
             std::vector<std::string> turn_temp_paths;
             int turn_vision_slices = 0;
 
@@ -832,17 +867,17 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
             }
 
             if (last_user_msg) {
-                int input_index = ++msg_counter;
                 for (const auto & img_b64 : last_user_msg->image_b64s) {
-                    std::string ipath = TempMediaFiles::write_image_jpeg(img_b64, temp_dir, input_index);
+                    std::string ipath = TempMediaFiles::write_image_jpeg(
+                        img_b64, temp_dir, ++msg_counter);
                     if (!ipath.empty()) {
-                        tmp_files.image_path = ipath; // last image wins
+                        image_paths.push_back(ipath);
                     }
                 }
                 // Audio: use the first audio from the last user message
                 if (!last_user_msg->audio_b64s.empty()) {
                     tmp_files.audio_path = TempMediaFiles::write_audio_wav(
-                        last_user_msg->audio_b64s[0], temp_dir, input_index);
+                        last_user_msg->audio_b64s[0], temp_dir, ++msg_counter);
                 }
                 for (size_t i = 0; i < last_user_msg->video_b64s.size(); ++i) {
                     const int stack_frames = i < last_user_msg->video_stack_frames.size()
@@ -859,14 +894,11 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
                         turn_temp_paths.push_back(video.audio_path);
                     }
                     for (const auto & frame_path : video.frame_paths) {
-                        if (tmp_files.image_path.empty()) {
-                            tmp_files.image_path = frame_path;
-                        } else {
-                            extra_image_paths.push_back(frame_path);
-                        }
+                        image_paths.push_back(frame_path);
                     }
                     if (video.frame_paths.empty()) {
                         tmp_files.cleanup();
+                        for (const auto & path : image_paths) fs::remove(path);
                         for (const auto & path : turn_temp_paths) fs::remove(path);
                         fail_fast(session_id, "video_decode_failed");
                         return;
@@ -879,8 +911,12 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
             // summarizing history into a single natural-language prompt.
             const std::string system_text = first_system_text(parsed_msgs);
             std::string prompt = build_turn_based_chatml_body(parsed_msgs, last_user_msg);
+            const bool has_visual_input = !image_paths.empty();
+            const bool has_audio_input = !tmp_files.audio_path.empty();
+            const std::string prompt_after_media =
+                (has_visual_input || has_audio_input) ? "\n" + prompt : prompt;
 
-            turn_vision_slices = (tmp_files.image_path.empty() ? 0 : 1) + (int)extra_image_paths.size();
+            turn_vision_slices = (int) image_paths.size();
             double prefill_ms = 0.0;
             double generate_ms = 0.0;
             int n_past_before_decode = 0;
@@ -900,30 +936,40 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
                     if (!stream_prefill(octx, /*aud*/"", /*img*/"", /*index*/0)) {
                         octx->use_tts = prev_use_tts;
                         tmp_files.cleanup();
-                        for (const auto & path : extra_image_paths) fs::remove(path);
+                        for (const auto & path : image_paths) fs::remove(path);
                         for (const auto & path : turn_temp_paths) fs::remove(path);
                         fail_fast(session_id, "system_prefill_failed");
                         return;
                     }
                 }
-                int input_index = msg_counter > 0 ? msg_counter : ++msg_counter;
-                if (!stream_prefill(octx, tmp_files.audio_path, tmp_files.image_path,
-                                    input_index, parsed_input.max_slice_nums, prompt)) {
-                    octx->use_tts = prev_use_tts;
-                    tmp_files.cleanup();
-                    for (const auto & path : extra_image_paths) fs::remove(path);
-                    for (const auto & path : turn_temp_paths) fs::remove(path);
-                    fail_fast(session_id, "prefill_failed");
-                    return;
-                }
-                for (const auto & image_path : extra_image_paths) {
-                    if (!stream_prefill(octx, /*aud*/"", image_path,
-                                        ++msg_counter, parsed_input.max_slice_nums, /*text*/"")) {
+                for (size_t i = 0; i < image_paths.size(); ++i) {
+                    const bool is_last_image = i + 1 == image_paths.size();
+                    const std::string image_suffix = !is_last_image
+                        ? ""
+                        : (has_audio_input ? "\n" : prompt_after_media);
+                    if (!stream_prefill(octx, /*aud*/"", image_paths[i],
+                                        ++msg_counter, parsed_input.max_slice_nums,
+                                        image_suffix)) {
                         octx->use_tts = prev_use_tts;
                         tmp_files.cleanup();
-                        for (const auto & path : extra_image_paths) fs::remove(path);
+                        for (const auto & path : image_paths) fs::remove(path);
                         for (const auto & path : turn_temp_paths) fs::remove(path);
                         fail_fast(session_id, "video_frame_prefill_failed");
+                        return;
+                    }
+                }
+                // vLLM joins multimodal content parts with a newline. Treat all
+                // extracted frames as one visual part, then preserve the visual
+                // -> audio and final media -> text boundaries.
+                if (has_audio_input || !has_visual_input) {
+                    if (!stream_prefill(octx, tmp_files.audio_path, /*img*/"",
+                                        ++msg_counter, parsed_input.max_slice_nums,
+                                        prompt_after_media)) {
+                        octx->use_tts = prev_use_tts;
+                        tmp_files.cleanup();
+                        for (const auto & path : image_paths) fs::remove(path);
+                        for (const auto & path : turn_temp_paths) fs::remove(path);
+                        fail_fast(session_id, "prefill_failed");
                         return;
                     }
                 }
@@ -933,11 +979,9 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
             }
 
             if (!tmp_files.audio_path.empty()) retained_media_files.push_back(tmp_files.audio_path);
-            if (!tmp_files.image_path.empty()) retained_media_files.push_back(tmp_files.image_path);
-            for (const auto & path : extra_image_paths) retained_media_files.push_back(path);
+            for (const auto & path : image_paths) retained_media_files.push_back(path);
             for (const auto & path : turn_temp_paths) retained_media_files.push_back(path);
             tmp_files.audio_path.clear();
-            tmp_files.image_path.clear();
 
             // Decode
             bool streaming = parsed_input.streaming;
@@ -1257,7 +1301,7 @@ cleanup:
         std::lock_guard<std::mutex> lock(octx_mutex);
         OmniSession * session = session_mgr.get(session_id);
         if (session && session->octx) {
-            session->octx->break_event = true;
+            omni_request_break(session->octx);
             {
                 std::lock_guard<std::mutex> lk(session->octx->text_mtx);
                 session->octx->text_queue.clear();

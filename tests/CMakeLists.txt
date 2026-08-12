@@ -243,6 +243,98 @@ endif()
 llama_build_and_test(test-gguf.cpp)
 llama_build_and_test(test-backend-ops.cpp)
 
+add_executable(test-token2wav-graph-policy test-token2wav-graph-policy.cpp)
+target_include_directories(test-token2wav-graph-policy PRIVATE
+    ${PROJECT_SOURCE_DIR}/tools/omni/token2wav)
+target_compile_features(test-token2wav-graph-policy PRIVATE cxx_std_17)
+llama_test(test-token2wav-graph-policy)
+
+add_executable(test-token2wav-conv-state-policy test-token2wav-conv-state-policy.cpp)
+target_include_directories(test-token2wav-conv-state-policy PRIVATE
+    ${PROJECT_SOURCE_DIR}/tools/omni/token2wav)
+target_compile_features(test-token2wav-conv-state-policy PRIVATE cxx_std_17)
+llama_test(test-token2wav-conv-state-policy)
+
+add_executable(test-token2wav-adaln-silu-policy test-token2wav-adaln-silu-policy.cpp)
+target_include_directories(test-token2wav-adaln-silu-policy PRIVATE
+    ${PROJECT_SOURCE_DIR}/tools/omni/token2wav)
+target_compile_features(test-token2wav-adaln-silu-policy PRIVATE cxx_std_17)
+llama_test(test-token2wav-adaln-silu-policy)
+
+add_executable(test-token2wav-adaln-cache-policy test-token2wav-adaln-cache-policy.cpp)
+target_include_directories(test-token2wav-adaln-cache-policy PRIVATE
+    ${PROJECT_SOURCE_DIR}/tools/omni/token2wav)
+target_compile_features(test-token2wav-adaln-cache-policy PRIVATE cxx_std_17)
+llama_test(test-token2wav-adaln-cache-policy)
+
+add_executable(test-token2wav-est-att-writeback-policy test-token2wav-est-att-writeback-policy.cpp)
+target_include_directories(test-token2wav-est-att-writeback-policy PRIVATE
+    ${PROJECT_SOURCE_DIR}/tools/omni/token2wav)
+target_compile_features(test-token2wav-est-att-writeback-policy PRIVATE cxx_std_17)
+llama_test(test-token2wav-est-att-writeback-policy)
+
+find_package(Threads REQUIRED)
+add_executable(test-tts-head-code-executor
+    test-tts-head-code-executor.cpp
+    ${PROJECT_SOURCE_DIR}/tools/omni/tts-head-code-executor.cpp)
+target_include_directories(test-tts-head-code-executor PRIVATE
+    ${PROJECT_SOURCE_DIR}/tools/omni)
+target_compile_features(test-tts-head-code-executor PRIVATE cxx_std_17)
+target_link_libraries(test-tts-head-code-executor PRIVATE Threads::Threads)
+llama_test(test-tts-head-code-executor)
+
+add_executable(test-duplex-terminal-tracker test-duplex-terminal-tracker.cpp)
+target_include_directories(test-duplex-terminal-tracker PRIVATE
+    ${PROJECT_SOURCE_DIR}/tools/omni)
+target_compile_features(test-duplex-terminal-tracker PRIVATE cxx_std_17)
+target_link_libraries(test-duplex-terminal-tracker PRIVATE Threads::Threads)
+llama_test(test-duplex-terminal-tracker)
+
+add_executable(test-cann-graph-bypass test-cann-graph-bypass.cpp)
+target_include_directories(test-cann-graph-bypass PRIVATE
+    ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cann)
+target_compile_features(test-cann-graph-bypass PRIVATE cxx_std_17)
+target_link_libraries(test-cann-graph-bypass PRIVATE Threads::Threads)
+llama_test(test-cann-graph-bypass)
+
+add_executable(test-cann-set-rows-f32-f16-policy
+    test-cann-set-rows-f32-f16-policy.cpp)
+target_include_directories(test-cann-set-rows-f32-f16-policy PRIVATE
+    ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cann)
+target_compile_features(test-cann-set-rows-f32-f16-policy PRIVATE cxx_std_17)
+llama_test(test-cann-set-rows-f32-f16-policy)
+
+add_executable(test-cann-kv-pair-update-policy
+    test-cann-kv-pair-update-policy.cpp)
+target_include_directories(test-cann-kv-pair-update-policy PRIVATE
+    ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cann)
+target_compile_features(test-cann-kv-pair-update-policy PRIVATE cxx_std_17)
+llama_test(test-cann-kv-pair-update-policy)
+
+add_executable(test-cann-modulate-fusion-policy
+    test-cann-modulate-fusion-policy.cpp)
+target_include_directories(test-cann-modulate-fusion-policy PRIVATE
+    ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cann)
+target_compile_features(test-cann-modulate-fusion-policy PRIVATE cxx_std_17)
+llama_test(test-cann-modulate-fusion-policy)
+
+add_executable(test-cann-attn-time-pack-policy
+    test-cann-attn-time-pack-policy.cpp)
+target_include_directories(test-cann-attn-time-pack-policy PRIVATE
+    ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cann)
+target_compile_features(test-cann-attn-time-pack-policy PRIVATE cxx_std_17)
+llama_test(test-cann-attn-time-pack-policy)
+
+if (GGML_CANN)
+    llama_build_and_test(test-cann-im2col1d.cpp)
+    target_include_directories(test-cann-im2col1d PRIVATE
+        ${PROJECT_SOURCE_DIR}/ggml/src
+        ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cann
+        ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cann/ascendc/im2col1d)
+    target_link_libraries(test-cann-im2col1d PRIVATE ggml-cann)
+    target_compile_options(test-cann-im2col1d PRIVATE -UNDEBUG)
+endif()
+
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")

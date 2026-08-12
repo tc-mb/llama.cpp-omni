@@ -22,6 +22,8 @@
 
 #include "aclnn_ops.h"
 
+#include "set_rows_f32_f16.h"
+
 #include "ggml-impl.h"
 #include "ggml.h"
 
@@ -539,6 +541,32 @@ void ggml_cann_norm(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     acl_int_array_ptr    norm     = ggml_cann_create_int_array(normData.data(), normData.size());
     GGML_CANN_CALL_ACLNN_OP(ctx, LayerNorm, acl_src.get(), norm.get(), nullptr, nullptr, eps, acl_dst.get(), nullptr,
                             nullptr);
+}
+
+void ggml_cann_norm_affine(ggml_backend_cann_context & ctx,
+                           ggml_tensor * norm,
+                           ggml_tensor * weight,
+                           ggml_tensor * bias,
+                           ggml_tensor * dst) {
+    ggml_tensor * src = norm->src[0];
+    acl_tensor_ptr acl_src = ggml_cann_create_tensor(src);
+    acl_tensor_ptr acl_dst = ggml_cann_create_tensor(dst);
+
+    int64_t affine_ne[] = { weight->ne[0] };
+    size_t affine_nb[] = { weight->nb[0] };
+    acl_tensor_ptr acl_weight = ggml_cann_create_tensor(
+        weight->data, ACL_FLOAT, sizeof(float), affine_ne, affine_nb, 1);
+    acl_tensor_ptr acl_bias = ggml_cann_create_tensor(
+        bias->data, ACL_FLOAT, sizeof(float), affine_ne, affine_nb, 1);
+
+    float eps;
+    memcpy(&eps, norm->op_params, sizeof(float));
+    std::vector<int64_t> norm_data = { norm->ne[0] };
+    acl_int_array_ptr normalized_shape =
+        ggml_cann_create_int_array(norm_data.data(), norm_data.size());
+    GGML_CANN_CALL_ACLNN_OP(ctx, LayerNorm, acl_src.get(),
+                            normalized_shape.get(), acl_weight.get(),
+                            acl_bias.get(), eps, acl_dst.get(), nullptr, nullptr);
 }
 
 void ggml_cann_l2_norm(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
@@ -1990,6 +2018,10 @@ void ggml_cann_get_rows(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
 }
 
 void ggml_cann_set_rows(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
+    if (ggml_cann_set_rows_f32_f16_try(ctx, dst)) {
+        return;
+    }
+
     ggml_tensor * src0 = dst->src[0];  // source values
     ggml_tensor * src1 = dst->src[1];  // row indices
 
@@ -2123,7 +2155,7 @@ static void ggml_cann_mat_mul_fp(ggml_backend_cann_context & ctx, ggml_tensor * 
     acl_tensor_ptr acl_weight_tensor;
 
     // Only check env once.
-    static bool weight_to_nz = parse_bool(get_env_as_lowercase("GGML_CANN_WEIGHT_NZ").value_or("on"));
+    static bool weight_to_nz = parse_bool(get_env_as_lowercase("GGML_CANN_WEIGHT_NZ").value_or(""));
     if (weight_to_nz && weight->type != GGML_TYPE_BF16 && is_matmul_weight(weight)) {
         acl_weight_tensor = ggml_cann_create_tensor(weight, transpose_ne, transpose_nb, n_dims, ACL_FORMAT_FRACTAL_NZ);
     } else {
@@ -4400,4 +4432,3 @@ void ggml_cann_gated_linear_attn(ggml_backend_cann_context & ctx, ggml_tensor * 
         }
     }
 }
-

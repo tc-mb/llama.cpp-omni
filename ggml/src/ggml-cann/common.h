@@ -26,6 +26,7 @@
 #include "../ggml-impl.h"
 #include "../include/ggml-cann.h"
 #include "../include/ggml.h"
+#include "graph-bypass.h"
 
 #include <acl/acl.h>
 #include <unistd.h>
@@ -564,6 +565,7 @@ struct ggml_backend_cann_context {
     /// Cached CANN ACL graph used for executing the current ggml computation graph.
     ggml_cann_graph_lru_cache graph_lru_cache;
     bool                      acl_graph_mode = true;
+    ggml_cann_graph_bypass    graph_bypass;
 #endif
     bool                   async_mode;
     // Rope Cache
@@ -583,7 +585,7 @@ struct ggml_backend_cann_context {
         description = aclrtGetSocName();
 
 #ifdef USE_ACL_GRAPH
-        acl_graph_mode = parse_bool(get_env_as_lowercase("GGML_CANN_ACL_GRAPH").value_or("on"));
+        acl_graph_mode = parse_bool(get_env_as_lowercase("GGML_CANN_ACL_GRAPH").value_or(""));
         GGML_LOG_INFO("%s: device %d execution mode is %s (%s)\n", __func__, device, acl_graph_mode ? "GRAPH" : "EAGER",
                       acl_graph_mode ? "acl graph enabled" : "acl graph disabled");
 #endif

@@ -7,7 +7,10 @@ Token2Wav 服务进程 - 用于 C++ 调用 Python 的 stepaudio2 Token2wav
 命令格式:
 - init: {"cmd": "init", "model_dir": "/path/to/model", "device": "cuda:0", "float16": true, "n_timesteps": 5}
 - set_ref_audio: {"cmd": "set_ref_audio", "ref_audio_path": "/path/to/ref.wav"}
-- process: {"cmd": "process", "tokens": [1,2,3,...], "last_chunk": false, "output_path": "/path/to/output.wav"}
+- process（新 stream session 的首个 chunk 必须带 seed）:
+  {"cmd": "process", "tokens": [1,2,3,...], "last_chunk": false, "output_path": "/path/to/output.wav", "seed": 42}
+- process_oneshot（每次请求必须带 seed）:
+  {"cmd": "process_oneshot", "tokens": [1,2,3,...], "ref_audio_path": "/path/to/ref.wav", "output_path": "/path/to/output.wav", "seed": 42}
 - reset: {"cmd": "reset"}
 - quit: {"cmd": "quit"}
 
@@ -18,7 +21,9 @@ Token2Wav 服务进程 - 用于 C++ 调用 Python 的 stepaudio2 Token2wav
 注意: CUDA_VISIBLE_DEVICES 必须在启动脚本前通过环境变量设置！
 """
 
+import math
 import os
+import random
 import sys
 
 # 🔧 重定向库的 stdout 输出到 stderr，避免干扰 JSON 协议
@@ -53,17 +58,232 @@ def log(msg):
 
 
 class Token2WavService:
+    _MAX_SEED = (1 << 32) - 1
+    # CosyVoice registers a persistent, non-checkpointed rand_noise buffer
+    # while constructing the flow model. Seed model construction explicitly
+    # so identical request seeds remain reproducible across service processes.
+    _MODEL_INIT_SEED = 0x4D43504D
+    _WARMUP_SEED = 0x5EED5EED
+
     def __init__(self):
         self.token2wav = None
         self.stream_cache = None
         self.hift_cache = None
+        self.stream_cache_base = None
+        self.hift_cache_base = None
         self.ref_audio_path = None
         self.initialized = False
         self.device = "cuda:0"
+        self.warmed_up = False
+        self.stream_session_seed = None
+        self.flow_temperature = 1.0
+
+    @staticmethod
+    def _validate_flow_temperature(value):
+        """Validate the flow-matching noise scale used by both T2W paths."""
+        if isinstance(value, bool) or not isinstance(value, (int, float, np.integer, np.floating)):
+            raise ValueError("flow_temperature must be a finite number in (0, 2]")
+        value = float(value)
+        if not math.isfinite(value) or value <= 0.0 or value > 2.0:
+            raise ValueError("flow_temperature must be a finite number in (0, 2]")
+        return value
+
+    def _patch_flow_temperature(self):
+        """Override stepaudio2's hard-coded temperature=1.0 call sites.
+
+        ``CausalConditionalCFM.forward`` and ``forward_chunk`` already expose
+        the parameter, but the public flow wrapper fixes it to 1.0. Wrapping
+        the decoder methods keeps one-shot and streaming on the same audited
+        value without copying the upstream inference implementation.
+        """
+        flow = getattr(self.token2wav, "flow", None)
+        decoder = getattr(flow, "decoder", None)
+        if decoder is None:
+            raise RuntimeError("Token2Wav flow decoder is unavailable")
+
+        for method_name in ("forward", "forward_chunk"):
+            original = getattr(decoder, method_name, None)
+            if not callable(original):
+                raise RuntimeError(f"Token2Wav flow decoder has no {method_name} method")
+
+            def with_temperature(*args, _original=original, **kwargs):
+                kwargs["temperature"] = self.flow_temperature
+                return _original(*args, **kwargs)
+
+            setattr(decoder, method_name, with_temperature)
+
+    @classmethod
+    def _validate_seed(cls, seed):
+        """Validate the JSON seed contract and return a plain Python int."""
+        if seed is None:
+            return None, {
+                "status": "error",
+                "code": "missing_seed",
+                "message": "seed is required for a new Token2Wav request/session",
+            }
+        if isinstance(seed, bool) or not isinstance(seed, (int, np.integer)):
+            return None, {
+                "status": "error",
+                "code": "invalid_seed",
+                "message": "seed must be an unsigned 32-bit integer",
+            }
+        seed = int(seed)
+        if seed < 0 or seed > cls._MAX_SEED:
+            return None, {
+                "status": "error",
+                "code": "invalid_seed",
+                "message": f"seed must be between 0 and {cls._MAX_SEED}",
+            }
+        return seed, None
+
+    @staticmethod
+    def _available_backend(torch_module, name):
+        backend = getattr(torch_module, name, None)
+        if backend is None:
+            return None
+        is_available = getattr(backend, "is_available", None)
+        try:
+            if callable(is_available) and not is_available():
+                return None
+        except Exception as exc:
+            log(f"检查 torch.{name} RNG 可用性失败，跳过该后端: {exc}")
+            return None
+        return backend
+
+    def _seed_all(self, seed: int):
+        """Seed every RNG used by Token2Wav on the available device stack."""
+        import torch
+
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+
+        for backend_name in ("cuda", "npu"):
+            backend = self._available_backend(torch, backend_name)
+            if backend is None:
+                continue
+            seed_fn = getattr(backend, "manual_seed_all", None)
+            if seed_fn is None:
+                seed_fn = getattr(backend, "manual_seed", None)
+            if not callable(seed_fn):
+                raise RuntimeError(
+                    f"torch.{backend_name} is available but exposes no RNG seeding API"
+                )
+            seed_fn(seed)
+
+    def _capture_rng_state(self):
+        """Capture global RNG state so warmup cannot perturb its caller."""
+        import torch
+
+        state = {
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "torch_cpu": torch.get_rng_state(),
+            "devices": {},
+        }
+        for backend_name in ("cuda", "npu"):
+            backend = self._available_backend(torch, backend_name)
+            get_state = getattr(backend, "get_rng_state_all", None) if backend else None
+            if callable(get_state):
+                try:
+                    state["devices"][backend_name] = get_state()
+                except Exception as exc:
+                    log(f"保存 torch.{backend_name} RNG 状态失败: {exc}")
+        return state
+
+    def _restore_rng_state(self, state):
+        """Best-effort restoration paired with _capture_rng_state()."""
+        import torch
+
+        random.setstate(state["python"])
+        np.random.set_state(state["numpy"])
+        torch.set_rng_state(state["torch_cpu"])
+        for backend_name, backend_state in state["devices"].items():
+            backend = self._available_backend(torch, backend_name)
+            set_state = getattr(backend, "set_rng_state_all", None) if backend else None
+            if callable(set_state):
+                try:
+                    set_state(backend_state)
+                except Exception as exc:
+                    log(f"恢复 torch.{backend_name} RNG 状态失败: {exc}")
+
+    def _end_stream_session(self):
+        self.stream_session_seed = None
+
+    def _resolve_stream_seed(self, seed):
+        """Start a stream RNG once, or validate an already-active session."""
+        if self.stream_session_seed is None:
+            effective_seed, error = self._validate_seed(seed)
+            if error is not None:
+                return None, error
+            self._seed_all(effective_seed)
+            self.stream_session_seed = effective_seed
+            return effective_seed, None
+
+        if seed is None:
+            return self.stream_session_seed, None
+
+        supplied_seed, error = self._validate_seed(seed)
+        if error is not None:
+            return None, error
+        if supplied_seed != self.stream_session_seed:
+            return None, {
+                "status": "error",
+                "code": "stream_seed_mismatch",
+                "message": (
+                    f"active stream seed is {self.stream_session_seed}, "
+                    f"but request supplied {supplied_seed}; reset before changing seed"
+                ),
+                "effective_seed": self.stream_session_seed,
+            }
+        # Repeated seed fields are accepted for migration convenience, but an
+        # active session is never reseeded between chunks.
+        return self.stream_session_seed, None
+
+    def _set_stream_cache(self, ref_audio_path: str):
+        """Initialize streaming state with the official Token2wav padding."""
+        import torch
+
+        core = getattr(self.token2wav, "_core", None)
+        if core is None:
+            return self.token2wav.set_stream_cache(ref_audio_path)
+
+        prompt_cache = core._prepare_prompt(ref_audio_path)
+        core.cache[ref_audio_path] = prompt_cache
+        prompt_speech_tokens, _, spk_emb, prompt_mels, _ = prompt_cache
+
+        right_pad_speech_tokens = torch.full(
+            (prompt_speech_tokens.shape[0], 3),
+            4218,
+            device=prompt_speech_tokens.device,
+            dtype=prompt_speech_tokens.dtype,
+        )
+        stream_cache = core.flow.setup_cache(
+            torch.cat([prompt_speech_tokens, right_pad_speech_tokens], dim=1),
+            prompt_mels,
+            spk_emb,
+            n_timesteps=self.token2wav.n_timesteps,
+        )
+        hift_cache = {
+            "mel": torch.zeros(1, prompt_mels.shape[2], 0, device=prompt_mels.device),
+            "source": torch.zeros(1, 1, 0, device=prompt_mels.device),
+            "speech": torch.zeros(1, 0, device=prompt_mels.device),
+        }
+        self.token2wav.stream_cache = stream_cache
+        self.token2wav.hift_cache_dict = hift_cache
+        return stream_cache, hift_cache
         
-    def init(self, model_dir: str, device: str = "cuda:0", float16: bool = True, n_timesteps: int = 5):
+    def init(
+        self,
+        model_dir: str,
+        device: str = "cuda:0",
+        float16: bool = True,
+        n_timesteps: int = 5,
+        flow_temperature: float = 1.0,
+    ):
         """初始化 Token2Wav 模型"""
         try:
+            self.flow_temperature = self._validate_flow_temperature(flow_temperature)
             # 🔧 在导入可能有输出的库之前，临时重定向 stdout 到 stderr
             import sys
             original_stdout = sys.stdout
@@ -88,9 +308,35 @@ class Token2WavService:
                 
                 import torch
                 log(f"PyTorch CUDA available: {torch.cuda.is_available()}, device_count: {torch.cuda.device_count()}")
-                
-                from stepaudio2 import Token2wav
-                self.token2wav = Token2wav(model_dir, float16=float16, n_timesteps=n_timesteps)
+
+                init_rng_state = self._capture_rng_state()
+                try:
+                    self._seed_all(self._MODEL_INIT_SEED)
+                    if device.startswith("npu"):
+                        vllm_omni_root = os.environ.get("OMNI_VLLM_OMNI_ROOT", "").strip()
+                        if vllm_omni_root and vllm_omni_root not in sys.path:
+                            sys.path.insert(0, vllm_omni_root)
+                        from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_token2wav import (
+                            MiniCPMO45Token2wav,
+                        )
+
+                        self.token2wav = MiniCPMO45Token2wav(
+                            model_dir,
+                            float16=float16,
+                            n_timesteps=n_timesteps,
+                            device=device,
+                        )
+                        npu_available = hasattr(torch, "npu") and torch.npu.is_available()
+                        log(f"使用 vLLM-Omni NPU Token2Wav, NPU available: {npu_available}")
+                    else:
+                        from stepaudio2 import Token2wav
+
+                        self.token2wav = Token2wav(model_dir, float16=float16, n_timesteps=n_timesteps)
+                finally:
+                    self._restore_rng_state(init_rng_state)
+
+                self._patch_flow_temperature()
+                log(f"Flow matching temperature={self.flow_temperature}")
                 
                 # 🔧 修复 float16 模式下的 dtype bug
                 # stepaudio2 库的 setup_cache 方法在 float16 模式下会出现输入是 float32 但权重是 float16 的问题
@@ -110,13 +356,19 @@ class Token2WavService:
                     log("已应用 float16 dtype 修复补丁")
                 
                 self.initialized = True
+                self._end_stream_session()
                 
                 log("Token2Wav 初始化成功")
             finally:
                 # 恢复原始 stdout
                 sys.stdout = original_stdout
             
-            return {"status": "ok", "message": "Token2Wav initialized"}
+            return {
+                "status": "ok",
+                "message": "Token2Wav initialized",
+                "model_init_seed": self._MODEL_INIT_SEED,
+                "flow_temperature": self.flow_temperature,
+            }
             
         except Exception as e:
             log(f"Token2Wav 初始化失败: {e}")
@@ -127,6 +379,10 @@ class Token2WavService:
         """设置参考音频，初始化流式缓存"""
         if not self.initialized:
             return {"status": "error", "message": "Token2Wav not initialized"}
+
+        # A reference change is a stream-session boundary even when validation
+        # of the new path subsequently fails.
+        self._end_stream_session()
         
         try:
             # 🔧 临时重定向 stdout 到 stderr，避免库的打印输出干扰 JSON 协议
@@ -143,9 +399,23 @@ class Token2WavService:
                     return {"status": "error", "message": f"Reference audio not found: {ref_audio_path}"}
                 
                 self.ref_audio_path = ref_audio_path
+
+                # The WS server reuses the same temporary filename across
+                # sequential sessions. vLLM-Omni caches prompt features by
+                # pathname, so invalidate that entry before reading the new
+                # file contents or every later request would keep speaker #1.
+                prompt_caches = [
+                    getattr(self.token2wav, "cache", None),
+                    getattr(getattr(self.token2wav, "_core", None), "cache", None),
+                ]
+                for prompt_cache in prompt_caches:
+                    if isinstance(prompt_cache, dict):
+                        prompt_cache.pop(ref_audio_path, None)
                 
-                # 调用 set_stream_cache 设置缓存
-                self.stream_cache, self.hift_cache = self.token2wav.set_stream_cache(ref_audio_path)
+                # The NPU facade used the prompt's first three speech tokens as
+                # lookahead.  Official stepaudio2 pads with three 4218 silence
+                # tokens instead; preserve that contract across devices.
+                self.stream_cache, self.hift_cache = self._set_stream_cache(ref_audio_path)
                 
                 # 深拷贝基础缓存，用于后续重置
                 self.stream_cache_base = self._clone_cache(self.stream_cache)
@@ -153,32 +423,40 @@ class Token2WavService:
                 
                 log("参考音频设置成功")
                 
-                # 🔧 Warmup: 用 dummy tokens 跑一次推理，预编译 CUDA kernels
-                # 这样首次真正推理就不会有冷启动延迟
-                log("开始 warmup (预编译 CUDA kernels)...")
-                warmup_start = time.time()
-                
-                # 使用 audio_bos token (4218) 作为 dummy tokens
-                dummy_tokens = [4218, 4218, 4218] + [1000] * 25  # 28 tokens
-                
-                # 设置缓存
-                self.token2wav.stream_cache = self._clone_cache(self.stream_cache_base)
-                self.token2wav.hift_cache_dict = self._clone_cache(self.hift_cache_base)
-                
-                # 跑一次推理
-                _ = self.token2wav.stream(
-                    generated_speech_tokens=dummy_tokens,
-                    prompt_wav=ref_audio_path,
-                    last_chunk=True,
-                    return_waveform=True
-                )
-                
-                # 重置缓存到初始状态
+                # Warmup 只在服务进程首次设置参考音频时执行。后续每个请求只
+                # 重建 voice-clone cache，避免把每条 Seed-TTS 的耗时放大一轮。
+                if not self.warmed_up:
+                    log("开始首次 warmup...")
+                    warmup_start = time.time()
+
+                    # Warmup owns a reserved RNG stream. Restore the previous
+                    # global states afterwards; a formal stream will still be
+                    # explicitly seeded by its first process request.
+                    rng_state = self._capture_rng_state()
+                    try:
+                        self._seed_all(self._WARMUP_SEED)
+                        dummy_tokens = [4218, 4218, 4218] + [1000] * 25
+                        self.token2wav.stream_cache = self._clone_cache(self.stream_cache_base)
+                        self.token2wav.hift_cache_dict = self._clone_cache(self.hift_cache_base)
+
+                        _ = self.token2wav.stream(
+                            generated_speech_tokens=dummy_tokens,
+                            prompt_wav=ref_audio_path,
+                            last_chunk=True,
+                            return_waveform=True,
+                        )
+                        self.warmed_up = True
+                    finally:
+                        self._restore_rng_state(rng_state)
+                        self.token2wav.stream_cache = self._clone_cache(self.stream_cache_base)
+                        self.token2wav.hift_cache_dict = self._clone_cache(self.hift_cache_base)
+
+                    warmup_time = time.time() - warmup_start
+                    log(f"warmup 完成，耗时 {warmup_time*1000:.1f}ms")
+
+                # 无论是否 warmup，都恢复到当前参考音频的初始 cache。
                 self.stream_cache = self._clone_cache(self.stream_cache_base)
                 self.hift_cache = self._clone_cache(self.hift_cache_base)
-                
-                warmup_time = time.time() - warmup_start
-                log(f"warmup 完成，耗时 {warmup_time*1000:.1f}ms")
             finally:
                 # 恢复原始 stdout
                 sys.stdout = original_stdout
@@ -203,14 +481,51 @@ class Token2WavService:
             return type(cache)(self._clone_cache(v) for v in cache)
         else:
             return cache
+
+    def _trim_stream_cache(self):
+        """Apply the official Token2wav streaming-cache retention policy."""
+        import torch
+
+        core = getattr(self.token2wav, "_core", None)
+        cache = getattr(self.token2wav, "stream_cache", None)
+        if core is None or not isinstance(cache, dict):
+            return
+
+        prompt_cache = core.cache.get(self.ref_audio_path)
+        if prompt_cache is None:
+            return
+        prompt_mels = prompt_cache[3]
+        prompt_frames = prompt_mels.shape[1]
+
+        conformer_cache = cache.get("conformer_att_cache")
+        if (
+            isinstance(conformer_cache, torch.Tensor)
+            and conformer_cache.ndim >= 4
+            and conformer_cache.shape[3] > prompt_frames + 100
+        ):
+            cache["conformer_att_cache"] = torch.cat(
+                [
+                    conformer_cache[:, :, :, :prompt_frames, ...],
+                    conformer_cache[:, :, :, -100:, ...],
+                ],
+                dim=3,
+            )
     
-    def process(self, tokens: list, last_chunk: bool, output_path: str):
+    def process(self, tokens: list, last_chunk: bool, output_path: str, seed=None):
         """处理 tokens 并生成 WAV 文件"""
         if not self.initialized:
             return {"status": "error", "message": "Token2Wav not initialized"}
         
         if self.stream_cache is None:
             return {"status": "error", "message": "Reference audio not set"}
+
+        try:
+            effective_seed, seed_error = self._resolve_stream_seed(seed)
+        except Exception as e:
+            log(f"设置 stream RNG 失败: {e}")
+            return {"status": "error", "code": "seed_failed", "message": str(e)}
+        if seed_error is not None:
+            return seed_error
         
         try:
             # 🔧 临时重定向 stdout 到 stderr
@@ -236,6 +551,7 @@ class Token2WavService:
                 )
                 
                 # 更新缓存
+                self._trim_stream_cache()
                 self.stream_cache = self.token2wav.stream_cache
                 self.hift_cache = self.token2wav.hift_cache_dict
                 
@@ -262,20 +578,98 @@ class Token2WavService:
                         "audio_duration": audio_duration,
                         "inference_time_ms": inference_time * 1000,
                         "sample_rate": sample_rate,
-                        "num_samples": len(wav_data)
+                        "num_samples": len(wav_data),
+                        "effective_seed": effective_seed,
                     }
                 else:
-                    result = {"status": "ok", "message": "No audio generated", "output_path": None}
+                    result = {
+                        "status": "ok",
+                        "message": "No audio generated",
+                        "output_path": None,
+                        "effective_seed": effective_seed,
+                    }
             finally:
                 # 恢复原始 stdout
                 sys.stdout = original_stdout
-            
+
+            if last_chunk:
+                self._end_stream_session()
             return result
                 
         except Exception as e:
             log(f"处理失败: {e}")
             traceback.print_exc(file=sys.stderr)
-            return {"status": "error", "message": str(e)}
+            # The model/cache/RNG may all have advanced partially. Do not let a
+            # caller continue that stream under a misleading deterministic ID.
+            self._end_stream_session()
+            return {
+                "status": "error",
+                "message": str(e),
+                "effective_seed": effective_seed,
+            }
+
+    def process_oneshot(self, tokens: list, ref_audio_path: str, output_path: str, seed=None):
+        """Run the model's non-streaming Token2Wav path for HF parity checks."""
+        if not self.initialized:
+            return {"status": "error", "message": "Token2Wav not initialized"}
+        effective_seed, seed_error = self._validate_seed(seed)
+        if seed_error is not None:
+            return seed_error
+        if self.stream_session_seed is not None:
+            return {
+                "status": "error",
+                "code": "stream_session_active",
+                "message": "reset or finish the active stream before process_oneshot",
+                "effective_seed": self.stream_session_seed,
+            }
+        if not os.path.isfile(ref_audio_path):
+            return {"status": "error", "message": f"Reference audio not found: {ref_audio_path}"}
+        if not tokens:
+            return {"status": "error", "message": "No audio tokens supplied"}
+
+        rng_state = None
+        try:
+            start_time = time.time()
+            rng_state = self._capture_rng_state()
+            self._seed_all(effective_seed)
+            core = getattr(self.token2wav, "_core", None)
+            if core is not None:
+                waveform = core.forward(tokens, ref_audio_path, return_bytes=False)
+                wav_data = waveform.detach().float().cpu().numpy()
+                sample_rate = 24000
+            else:
+                import io
+                import soundfile as sf
+
+                wav_bytes = self.token2wav(tokens, ref_audio_path)
+                wav_data, sample_rate = sf.read(io.BytesIO(wav_bytes), dtype="float32")
+            wav_data = np.asarray(wav_data).squeeze()
+            if wav_data.ndim > 1:
+                wav_data = wav_data.mean(axis=1)
+            self._write_wav(output_path, wav_data, int(sample_rate))
+            inference_time = time.time() - start_time
+            audio_duration = len(wav_data) / int(sample_rate)
+            return {
+                "status": "ok",
+                "message": "One-shot WAV generated",
+                "output_path": output_path,
+                "audio_duration": audio_duration,
+                "inference_time_ms": inference_time * 1000,
+                "sample_rate": int(sample_rate),
+                "num_samples": len(wav_data),
+                "effective_seed": effective_seed,
+            }
+        except Exception as e:
+            log(f"one-shot 处理失败: {e}")
+            traceback.print_exc(file=sys.stderr)
+            return {
+                "status": "error",
+                "message": str(e),
+                "effective_seed": effective_seed,
+            }
+        finally:
+            if rng_state is not None:
+                self._restore_rng_state(rng_state)
     
     def _write_wav(self, path: str, wav_data: np.ndarray, sample_rate: int):
         """写入 WAV 文件"""
@@ -320,6 +714,8 @@ class Token2WavService:
         """重置流式缓存到初始状态"""
         if not self.initialized:
             return {"status": "error", "message": "Token2Wav not initialized"}
+
+        self._end_stream_session()
         
         try:
             if self.stream_cache_base is not None:
@@ -334,15 +730,50 @@ class Token2WavService:
             return {"status": "error", "message": str(e)}
 
 
+def dispatch_command(service, cmd):
+    """Dispatch one decoded RPC command; kept separate for protocol tests."""
+    cmd_type = cmd.get("cmd", "")
+    if cmd_type == "init":
+        return service.init(
+            model_dir=cmd.get("model_dir", ""),
+            device=cmd.get("device", "cuda:0"),
+            float16=cmd.get("float16", True),
+            n_timesteps=cmd.get("n_timesteps", 5),
+            flow_temperature=cmd.get("flow_temperature", 1.0),
+        )
+    if cmd_type == "set_ref_audio":
+        return service.set_ref_audio(cmd.get("ref_audio_path", ""))
+    if cmd_type == "process":
+        return service.process(
+            tokens=cmd.get("tokens", []),
+            last_chunk=cmd.get("last_chunk", False),
+            output_path=cmd.get("output_path", ""),
+            seed=cmd.get("seed"),
+        )
+    if cmd_type == "process_oneshot":
+        return service.process_oneshot(
+            tokens=cmd.get("tokens", []),
+            ref_audio_path=cmd.get("ref_audio_path", ""),
+            output_path=cmd.get("output_path", ""),
+            seed=cmd.get("seed"),
+        )
+    if cmd_type == "reset":
+        return service.reset()
+    if cmd_type == "quit":
+        log("收到退出命令")
+        return {"status": "ok", "message": "Goodbye"}
+    return {"status": "error", "message": f"Unknown command: {cmd_type}"}
+
+
 def main():
     """主循环：从 stdin 读取命令，处理后写入 stdout"""
     log("Token2Wav 服务启动")
-    
+
     service = Token2WavService()
-    
+
     # 发送就绪信号
     print(json.dumps({"status": "ready", "message": "Token2Wav service ready"}), flush=True)
-    
+
     while True:
         try:
             # 读取一行 JSON 命令
@@ -350,11 +781,11 @@ def main():
             if not line:
                 log("stdin 关闭，退出")
                 break
-            
+
             line = line.strip()
             if not line:
                 continue
-            
+
             # 解析命令
             try:
                 cmd = json.loads(line)
@@ -362,44 +793,18 @@ def main():
                 response = {"status": "error", "message": f"Invalid JSON: {e}"}
                 print(json.dumps(response), flush=True)
                 continue
-            
-            cmd_type = cmd.get("cmd", "")
-            
-            # 处理命令
-            if cmd_type == "init":
-                response = service.init(
-                    model_dir=cmd.get("model_dir", ""),
-                    device=cmd.get("device", "cuda:0"),
-                    float16=cmd.get("float16", True),
-                    n_timesteps=cmd.get("n_timesteps", 5)
-                )
-            elif cmd_type == "set_ref_audio":
-                response = service.set_ref_audio(cmd.get("ref_audio_path", ""))
-            elif cmd_type == "process":
-                response = service.process(
-                    tokens=cmd.get("tokens", []),
-                    last_chunk=cmd.get("last_chunk", False),
-                    output_path=cmd.get("output_path", "")
-                )
-            elif cmd_type == "reset":
-                response = service.reset()
-            elif cmd_type == "quit":
-                log("收到退出命令")
-                response = {"status": "ok", "message": "Goodbye"}
-                print(json.dumps(response), flush=True)
-                break
-            else:
-                response = {"status": "error", "message": f"Unknown command: {cmd_type}"}
-            
-            # 发送响应
+
+            response = dispatch_command(service, cmd)
             print(json.dumps(response), flush=True)
-            
+            if cmd.get("cmd", "") == "quit":
+                break
+
         except Exception as e:
             log(f"主循环异常: {e}")
             traceback.print_exc(file=sys.stderr)
             response = {"status": "error", "message": str(e)}
             print(json.dumps(response), flush=True)
-    
+
     log("Token2Wav 服务退出")
 
 

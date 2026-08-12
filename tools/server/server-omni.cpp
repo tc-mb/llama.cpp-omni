@@ -89,6 +89,7 @@ struct omni_server_state {
 };
 
 int main(int argc, char ** argv) {
+    omni_bind_device();
     common_params params;
 
     common_init();
@@ -158,7 +159,7 @@ int main(int argc, char ** argv) {
         bool use_tts   = data.value("use_tts", true);
         bool duplex_mode = data.value("duplex_mode", false);
         int tts_gpu_layers = data.value("tts_gpu_layers", 100);
-        std::string token2wav_device = data.value("token2wav_device", "gpu:0");
+        std::string token2wav_device = data.value("token2wav_device", omni_default_token2wav_device());
         std::string output_dir = data.value("output_dir", "./tools/omni/output");
         std::string voice_audio = data.value("voice_audio", "");
 
@@ -503,7 +504,7 @@ int main(int argc, char ** argv) {
             std::lock_guard<std::mutex> octx_lock(state.octx_mutex);
             auto * closing = state.session_mgr.get(session_id);
             if (closing && closing->octx) {
-                closing->octx->break_event = true;
+                omni_request_break(closing->octx);
                 {
                     std::lock_guard<std::mutex> lk(closing->octx->text_mtx);
                     closing->octx->text_queue.clear();

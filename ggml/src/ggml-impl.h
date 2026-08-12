@@ -150,6 +150,11 @@ static void ggml_set_op_params(struct ggml_tensor * tensor, const void * params,
     memcpy(tensor->op_params, params, params_size);
 }
 
+// op_params[0..6] remain standard Im2col params; slot 7 is a versioned 1D discriminator.
+#define GGML_IM2COL_CAUSAL_1D_MARKER_V1 INT32_C(0x31444331)
+#define GGML_IM2COL_CAUSAL_CTB_1D_MARKER_V1 INT32_C(0x32444331)
+#define GGML_IM2COL_VOCODER_1D_MARKER_V1 INT32_C(0x31445631)
+
 static int32_t ggml_get_op_params_i32(const struct ggml_tensor * tensor, uint32_t i) {
     assert(i < GGML_MAX_OP_PARAMS / sizeof(int32_t));
     return ((const int32_t *)(tensor->op_params))[i];

@@ -37,6 +37,7 @@ namespace omni {
 namespace flow_matching {
 class fmCausalConditionalCFM;
 struct fmCFMCache;
+struct fmAdaLNModulationCache;
 }  // namespace flow_matching
 namespace upsample_encoder_v2 {
 class ueUpsampleConformerEncoderV2;
@@ -101,7 +102,9 @@ class flowCausalMaskedDiffWithXvec {
                                                       const flow_matching::fmCFMCache * estimator_cache_in,
                                                       int                               n_timesteps,
                                                       float                             temperature,
-                                                      flow_matching::fmCFMCache *       estimator_cache_out) const;
+                                                      flow_matching::fmCFMCache *       estimator_cache_out,
+                                                      const flow_matching::fmAdaLNModulationCache * adaln_cache = nullptr,
+                                                      std::vector<ggml_tensor *> * adaln_timestep_inputs = nullptr) const;
     // ANE 路径用：只 build encoder + projector + spk affine，输出 mu / spk_proj / 新 conformer cache。
     // 与 build_inference_chunk_graph 前半段语义完全一致，仅去掉 decoder/CFG/ODE 部分。
     flowEncoderOnlyOut build_inference_chunk_encoder_only_graph(
@@ -240,6 +243,24 @@ struct fmCFMCache {
         att_cache                             = nullptr;
     }
 };
+// Session-owned, backend-resident AdaLN modulation results. Blocks are packed as
+// [9*hidden, 1, cfg_batch, step*depth+block], final modulation as
+// [2*hidden, 1, cfg_batch, step]. The runner owns one instance for each hot
+// call-id (non-last and last), so a one-off cache fill never aliases another graph.
+struct fmAdaLNModulationCache {
+    int depth       = 0;
+    int hidden_size = 0;
+    int n_timesteps = 0;
+    int64_t cfg_batch = 0;
+    ggml_tensor * block_packed = nullptr;
+    ggml_tensor * final_packed = nullptr;
+    void clear() {
+        depth = hidden_size = n_timesteps = 0;
+        cfg_batch = 0;
+        block_packed = nullptr;
+        final_packed = nullptr;
+    }
+};
 class fmCausalConditionalCFM {
   public:
     fmCausalConditionalCFM(std::shared_ptr<fmDiT> estimator, float inference_cfg_rate = 0.7f);
@@ -262,7 +283,9 @@ class fmCausalConditionalCFM {
                                             int                n_timesteps,
                                             float              temperature,
                                             const fmCFMCache * cache_in,
-                                            fmCFMCache *       cache_out) const;
+                                            fmCFMCache *       cache_out,
+                                            const fmAdaLNModulationCache * adaln_cache = nullptr,
+                                            std::vector<ggml_tensor *> * adaln_timestep_inputs = nullptr) const;
   private:
     std::shared_ptr<fmDiT> estimator_;
     float                  inference_cfg_rate_ = 0.7f;
@@ -352,6 +375,14 @@ class fmDiT {
     int num_heads() const { return num_heads_; }
     int head_dim() const { return head_dim_; }
     int hidden_size() const { return hidden_size_; }
+    bool create_adaln_modulation_cache(ggml_context * ctx,
+                                       int            n_timesteps,
+                                       int64_t        cfg_batch,
+                                       fmAdaLNModulationCache & cache) const;
+    ggml_cgraph * build_adaln_modulation_cache_init_graph(
+        ggml_context *                       ctx,
+        const std::vector<ggml_tensor *> &  timestep_inputs,
+        fmAdaLNModulationCache &             cache) const;
     ggml_tensor * build_forward_graph(ggml_context * ctx,
                                       ggml_tensor *  x,
                                       ggml_tensor *  mask,
@@ -389,7 +420,9 @@ class fmDiT {
                                                 const std::vector<ggml_tensor *> & prev_cnn_cache,
                                                 const std::vector<ggml_tensor *> & prev_att_cache,
                                                 std::vector<ggml_tensor *> &       new_cnn_cache,
-                                                std::vector<ggml_tensor *> &       new_att_cache) const;
+                                                std::vector<ggml_tensor *> &       new_att_cache,
+                                                const fmAdaLNModulationCache *     adaln_cache = nullptr,
+                                                int                               adaln_step = -1) const;
     ggml_tensor * build_blocks_forward_chunk_graph(ggml_context *                     ctx,
                                                    ggml_tensor *                      x,
                                                    ggml_tensor *                      t_embed,
@@ -397,7 +430,9 @@ class fmDiT {
                                                    const std::vector<ggml_tensor *> & prev_cnn_cache,
                                                    const std::vector<ggml_tensor *> & prev_att_cache,
                                                    std::vector<ggml_tensor *> &       new_cnn_cache,
-                                                   std::vector<ggml_tensor *> &       new_att_cache) const;
+                                                   std::vector<ggml_tensor *> &       new_att_cache,
+                                                   const fmAdaLNModulationCache *     adaln_cache = nullptr,
+                                                   int                               adaln_step = -1) const;
   private:
     int   in_channels_;
     int   out_channels_;
@@ -462,7 +497,9 @@ class fmDiTBlock {
     ggml_tensor * build_forward_graph(ggml_context * ctx,
                                       ggml_tensor *  x,
                                       ggml_tensor *  c,
-                                      ggml_tensor *  attn_mask) const;
+                                      ggml_tensor *  attn_mask,
+                                      ggml_tensor *  shared_c_silu = nullptr,
+                                      ggml_tensor *  cached_ada_out = nullptr) const;
     ggml_tensor * build_forward_chunk_graph(ggml_context * ctx,
                                             ggml_tensor *  x,
                                             ggml_tensor *  c,
@@ -470,7 +507,12 @@ class fmDiTBlock {
                                             ggml_tensor *  att_cache,
                                             ggml_tensor *  mask,
                                             ggml_tensor ** new_cnn_cache,
-                                            ggml_tensor ** new_att_cache) const;
+                                            ggml_tensor ** new_att_cache,
+                                            ggml_tensor *  shared_c_silu = nullptr,
+                                            ggml_tensor *  cached_ada_out = nullptr) const;
+    ggml_tensor * build_adaln_modulation_graph(ggml_context * ctx,
+                                                ggml_tensor *  c,
+                                                ggml_tensor *  shared_c_silu = nullptr) const;
     int hidden_size() const { return hidden_size_; }
     int num_heads() const { return num_heads_; }
     int head_dim() const { return head_dim_; }
@@ -506,7 +548,14 @@ class fmFinalLayer {
                         ggml_tensor * ln_bias,
                         ggml_tensor * linear_weight,
                         ggml_tensor * linear_bias);
-    ggml_tensor * build_forward_graph(ggml_context * ctx, ggml_tensor * x, ggml_tensor * c) const;
+    ggml_tensor * build_forward_graph(ggml_context * ctx,
+                                      ggml_tensor *  x,
+                                      ggml_tensor *  c,
+                                      ggml_tensor *  shared_c_silu = nullptr,
+                                      ggml_tensor *  cached_ada_out = nullptr) const;
+    ggml_tensor * build_adaln_modulation_graph(ggml_context * ctx,
+                                                ggml_tensor *  c,
+                                                ggml_tensor *  shared_c_silu = nullptr) const;
   private:
     int hidden_size_;
     int out_channels_;
@@ -2073,6 +2122,7 @@ class Token2Mel {
     }
 
     void reset_stream();
+    uint64_t debug_stream_cache_checksum() const;
 
     bool is_ane_mode() const { return backend_kind_ == Backend::ANE; }
 
@@ -2230,6 +2280,7 @@ class Token2Wav {
     }
 
     void reset_stream();
+    uint64_t debug_stream_cache_checksum() const;
 
     static constexpr int32_t kSampleRate = omni::vocoder::hifigan2::hg2_hift_generator::HG2_SAMPLING_RATE;
 

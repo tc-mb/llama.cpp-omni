@@ -3,6 +3,7 @@
 #include "audition.h"
 #include "omni.h"
 #include "token2wav/token2wav-impl.h"
+#include "tts-head-code-executor.h"
 
 #include "llama.h"
 #include "common/common.h"
@@ -134,9 +135,48 @@ static bool start_python_t2w_service(struct omni_context * ctx_omni);
 static void stop_python_t2w_service(struct omni_context * ctx_omni);
 static bool send_python_t2w_command(struct omni_context * ctx_omni, const std::string& cmd_json, std::string& response);
 static bool init_python_t2w_model(struct omni_context * ctx_omni, const std::string& device);
+static void append_python_t2w_json_string(std::string & out, const std::string & value);
 static bool set_python_t2w_ref_audio(struct omni_context * ctx_omni, const std::string& ref_audio_path);
-static bool process_python_t2w_tokens(struct omni_context * ctx_omni, const std::vector<int32_t>& tokens, bool last_chunk, const std::string& output_path, double& inference_time_ms, double& audio_duration);
+static bool process_python_t2w_tokens(struct omni_context * ctx_omni, const std::vector<int32_t>& tokens, bool last_chunk, uint32_t seed, const std::string& output_path, double& inference_time_ms, double& audio_duration);
+static bool process_python_t2w_tokens_oneshot(struct omni_context * ctx_omni, const std::vector<int32_t>& tokens, uint32_t seed, const std::string& output_path, double& inference_time_ms, double& audio_duration);
 static bool reset_python_t2w_cache(struct omni_context * ctx_omni);
+
+static bool omni_tts_nonstream_precision_enabled() {
+    const char * value = std::getenv("OMNI_TTS_NONSTREAM_PRECISION");
+    return value && value[0] == '1' && value[1] == '\0';
+}
+
+static bool omni_tts_legacy_first_prefill_enabled() {
+    const char * value = std::getenv("OMNI_TTS_LEGACY_FIRST_PREFILL");
+    return value && value[0] == '1' && value[1] == '\0';
+}
+
+static bool omni_tts_legacy_sampler_full_sort_enabled() {
+    static const bool enabled = []() {
+        const char * value = std::getenv("OMNI_TTS_LEGACY_SAMPLER_FULL_SORT");
+        return value && value[0] == '1' && value[1] == '\0';
+    }();
+    return enabled;
+}
+
+static bool omni_tts_legacy_duplex_chunk_reset_enabled() {
+    static const bool enabled = []() {
+        const char * value = std::getenv("OMNI_TTS_LEGACY_DUPLEX_CHUNK_RESET");
+        return value == nullptr || !(value[0] == '0' && value[1] == '\0');
+    }();
+    return enabled;
+}
+
+static bool omni_tts_debug_artifacts_enabled() {
+    const char * value = std::getenv("OMNI_TTS_DEBUG_ARTIFACTS");
+    return value && value[0] == '1' && value[1] == '\0';
+}
+
+static bool resolve_python_t2w_seed(const common_params * params, uint32_t & seed) {
+    if (!params) return false;
+    seed = params->sampling.seed == LLAMA_DEFAULT_SEED ? 0u : params->sampling.seed;
+    return true;
+}
 
 static bool read_wav_pcm16_data(const std::string & wav_path, std::vector<int16_t> & pcm) {
     FILE * f = fopen(wav_path.c_str(), "rb");
@@ -244,7 +284,9 @@ static OmniTokenType get_token_type(struct omni_context * ctx, llama_token token
         return OmniTokenType::TURN_EOS;
     } else if (token == ctx->special_token_tts_eos) {
         return OmniTokenType::TTS_EOS;
-    } else if (token == ctx->special_token_eos) {
+    } else if (token == ctx->special_token_im_end ||
+               token == ctx->special_token_slash_s ||
+               token == ctx->special_token_eos) {
         return OmniTokenType::EOS;
     }
     return OmniTokenType::NORMAL;
@@ -324,6 +366,9 @@ struct LLMOut {
     // 此状态随数据一起传递，避免全局状态 current_turn_ended 的时序问题
     // 只有当 LLM 检测到 TURN_EOS/TTS_EOS/EOS 时才设置为 true
     bool is_end_of_turn = false;
+    // Immutable correlation key carried through the TTS queue.  Reading the
+    // shared current_turn_id in the consumer races the decode-side increment.
+    int turn_id = -1;
 };
 
  struct TTSThreadInfo{
@@ -1422,12 +1467,31 @@ static std::mt19937* get_sampler_rng(struct common_sampler * smpl) {
     return static_cast<std::mt19937*>(rng_ptr);
 }
 
+static ggml_backend_dev_t omni_backend_device_by_name(const char * device_name) {
+    if (!device_name || !*device_name) return nullptr;
+    ggml_backend_load_all();
+    if (ggml_backend_dev_t device = ggml_backend_dev_by_name(device_name)) return device;
+#ifdef GGML_USE_CANN
+    if (std::strncmp(device_name, "CANN", 4) == 0) {
+        char * end = nullptr;
+        const long index = std::strtol(device_name + 4, &end, 10);
+        ggml_backend_reg_t registry = ggml_backend_cann_reg();
+        if (end != device_name + 4 && *end == '\0' && index >= 0 &&
+            (size_t) index < ggml_backend_reg_dev_count(registry)) {
+            return ggml_backend_reg_dev_get(registry, (size_t) index);
+        }
+    }
+#endif
+    return nullptr;
+}
+
 // ==============================================================================
 // Projector Semantic 实现 (精度验证版本)
 // 使用 ggml 后端进行计算，支持 CUDA 加速
 // forward(x): relu(linear1(x)) -> linear2
 // ==============================================================================
-bool projector_init(projector_model & model, const std::string & fname, bool use_cuda) {
+bool projector_init(projector_model & model, const std::string & fname, bool use_cuda,
+                    const char * device_name) {
     
     struct gguf_init_params params = {
         /*.no_alloc = */ true,
@@ -1442,8 +1506,18 @@ bool projector_init(projector_model & model, const std::string & fname, bool use
     
 #if defined(GGML_USE_CUDA) || defined(GGML_USE_CANN)
     if (use_cuda) {
-        model.backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, NULL);
-        if (!model.backend) {
+        if (device_name && *device_name) {
+            ggml_backend_dev_t device = omni_backend_device_by_name(device_name);
+            if (!device || ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                LOG_ERR("Projector: invalid accelerator device '%s'\n", device_name);
+                gguf_free(ctx_gguf);
+                return false;
+            }
+            model.backend = ggml_backend_dev_init(device, nullptr);
+        } else {
+            model.backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, NULL);
+        }
+        if (!model.backend && (!device_name || !*device_name)) {
             model.backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, NULL);
         }
     } else {
@@ -2533,42 +2607,113 @@ static void save_hidden_states_to_file(const char* filepath, const float* hidden
 
 // Nucleus sampling (top-p + top-k)
 // Returns a sampled token index from the logits
+struct tts_sampling_workspace {
+    std::vector<float> probabilities;
+    std::vector<std::pair<float, int>> ranked;
+    std::vector<float> filtered_probabilities;
+    std::vector<int> filtered_indices;
+    std::vector<int> repetition_tokens;
+    std::vector<int> repetition_counts;
+    std::vector<int> recent_relative_tokens;
+    std::vector<float> logits;
+};
+
+static tts_sampling_workspace & get_tts_sampling_workspace() {
+    thread_local tts_sampling_workspace workspace;
+    return workspace;
+}
+
+static size_t rank_tts_probabilities(
+        tts_sampling_workspace & workspace,
+        int num_tokens,
+        int top_k) {
+    const size_t count = static_cast<size_t>(num_tokens);
+    const size_t keep = std::min(
+        count,
+        static_cast<size_t>(std::max(1, top_k)));
+
+    workspace.ranked.resize(count);
+    for (int i = 0; i < num_tokens; ++i) {
+        workspace.ranked[static_cast<size_t>(i)] = {
+            workspace.probabilities[static_cast<size_t>(i)], i};
+    }
+
+    const auto probability_descending = [](const auto & lhs, const auto & rhs) {
+        return lhs.first != rhs.first ? lhs.first > rhs.first : lhs.second < rhs.second;
+    };
+    if (omni_tts_legacy_sampler_full_sort_enabled() || keep == count) {
+        std::sort(workspace.ranked.begin(), workspace.ranked.end(), probability_descending);
+    } else {
+        std::partial_sort(
+            workspace.ranked.begin(),
+            workspace.ranked.begin() + static_cast<std::ptrdiff_t>(keep),
+            workspace.ranked.end(),
+            probability_descending);
+    }
+    return keep;
+}
+
+static const std::vector<int> & collect_recent_relative_tokens(
+        const std::vector<llama_token> * tokens,
+        int audio_bos_token_id,
+        int num_audio_tokens,
+        int past_window) {
+    tts_sampling_workspace & workspace = get_tts_sampling_workspace();
+    std::vector<int> & recent = workspace.recent_relative_tokens;
+    recent.clear();
+    if (tokens == nullptr || past_window <= 0) {
+        return recent;
+    }
+
+    const size_t window = static_cast<size_t>(past_window);
+    const size_t begin = tokens->size() > window ? tokens->size() - window : 0;
+    recent.reserve(window);
+    for (size_t i = begin; i < tokens->size(); ++i) {
+        const int relative_idx = (*tokens)[i] - audio_bos_token_id;
+        if (relative_idx >= 0 && relative_idx < num_audio_tokens) {
+            recent.push_back(relative_idx);
+        }
+    }
+    return recent;
+}
+
+// Nucleus sampling (top-p + top-k)
+// Returns a sampled token index from the logits
 static int nucleus_sampling_tts(const float* logits, int num_tokens, float top_p, int top_k, std::mt19937& rng) {
+    tts_sampling_workspace & workspace = get_tts_sampling_workspace();
+
     // 1. Compute softmax probabilities
     float max_logit = logits[0];
     for (int i = 1; i < num_tokens; ++i) {
         if (logits[i] > max_logit) max_logit = logits[i];
     }
     
-    std::vector<float> probs(num_tokens);
+    workspace.probabilities.resize(static_cast<size_t>(num_tokens));
     float sum = 0.0f;
     for (int i = 0; i < num_tokens; ++i) {
-        probs[i] = expf(logits[i] - max_logit);
-        sum += probs[i];
+        workspace.probabilities[static_cast<size_t>(i)] = expf(logits[i] - max_logit);
+        sum += workspace.probabilities[static_cast<size_t>(i)];
     }
     for (int i = 0; i < num_tokens; ++i) {
-        probs[i] /= sum;
+        workspace.probabilities[static_cast<size_t>(i)] /= sum;
     }
-    
-    // 2. Sort by probability descending
-    std::vector<std::pair<float, int>> sorted_probs;
-    sorted_probs.reserve(num_tokens);
-    for (int i = 0; i < num_tokens; ++i) {
-        sorted_probs.push_back({probs[i], i});
-    }
-    std::sort(sorted_probs.begin(), sorted_probs.end(), 
-              [](const auto& a, const auto& b) { return a.first > b.first; });
+
+    // 2. Only rank the prefix that TopK can consume.
+    const size_t ranked_count = rank_tts_probabilities(workspace, num_tokens, top_k);
     
     // 3. Collect tokens within top_p and top_k
-    std::vector<float> filtered_probs;
-    std::vector<int> filtered_indices;
+    workspace.filtered_probabilities.clear();
+    workspace.filtered_indices.clear();
+    workspace.filtered_probabilities.reserve(ranked_count);
+    workspace.filtered_indices.reserve(ranked_count);
     float cum_prob = 0.0f;
-    
-    for (const auto& p : sorted_probs) {
-        if (cum_prob < top_p && (int)filtered_probs.size() < top_k) {
+
+    for (size_t i = 0; i < ranked_count; ++i) {
+        const auto & p = workspace.ranked[i];
+        if (cum_prob < top_p && workspace.filtered_probabilities.size() < ranked_count) {
             cum_prob += p.first;
-            filtered_probs.push_back(p.first);
-            filtered_indices.push_back(p.second);
+            workspace.filtered_probabilities.push_back(p.first);
+            workspace.filtered_indices.push_back(p.second);
         } else {
             break;
         }
@@ -2576,10 +2721,10 @@ static int nucleus_sampling_tts(const float* logits, int num_tokens, float top_p
     
     // 4. Renormalize filtered probs
     float filtered_sum = 0.0f;
-    for (float p : filtered_probs) {
+    for (float p : workspace.filtered_probabilities) {
         filtered_sum += p;
     }
-    for (float& p : filtered_probs) {
+    for (float& p : workspace.filtered_probabilities) {
         p /= filtered_sum;
     }
     
@@ -2587,31 +2732,33 @@ static int nucleus_sampling_tts(const float* logits, int num_tokens, float top_p
     std::uniform_real_distribution<float> dist(0.0f, 1.0f);
     float r = dist(rng);
     float cum = 0.0f;
-    for (size_t i = 0; i < filtered_probs.size(); ++i) {
-        cum += filtered_probs[i];
+    for (size_t i = 0; i < workspace.filtered_probabilities.size(); ++i) {
+        cum += workspace.filtered_probabilities[i];
         if (r <= cum) {
-            return filtered_indices[i];
+            return workspace.filtered_indices[i];
         }
     }
-    return filtered_indices.back();  // Fallback
+    return workspace.filtered_indices.back();  // Fallback
 }
 
 // Random sampling (uniform multinomial from all tokens)
 static int random_sampling_tts(const float* logits, int num_tokens, std::mt19937& rng) {
+    tts_sampling_workspace & workspace = get_tts_sampling_workspace();
+
     // 1. Compute softmax probabilities
     float max_logit = logits[0];
     for (int i = 1; i < num_tokens; ++i) {
         if (logits[i] > max_logit) max_logit = logits[i];
     }
     
-    std::vector<float> probs(num_tokens);
+    workspace.probabilities.resize(static_cast<size_t>(num_tokens));
     float sum = 0.0f;
     for (int i = 0; i < num_tokens; ++i) {
-        probs[i] = expf(logits[i] - max_logit);
-        sum += probs[i];
+        workspace.probabilities[static_cast<size_t>(i)] = expf(logits[i] - max_logit);
+        sum += workspace.probabilities[static_cast<size_t>(i)];
     }
     for (int i = 0; i < num_tokens; ++i) {
-        probs[i] /= sum;
+        workspace.probabilities[static_cast<size_t>(i)] /= sum;
     }
     
     // 2. Multinomial sampling
@@ -2619,7 +2766,7 @@ static int random_sampling_tts(const float* logits, int num_tokens, std::mt19937
     float r = dist(rng);
     float cum = 0.0f;
     for (int i = 0; i < num_tokens; ++i) {
-        cum += probs[i];
+        cum += workspace.probabilities[static_cast<size_t>(i)];
         if (r <= cum) {
             return i;
         }
@@ -2679,29 +2826,42 @@ static void apply_repetition_penalty_tts(
         return;
     }
     
-    // Get the window of recent tokens
+    tts_sampling_workspace & workspace = get_tts_sampling_workspace();
+    workspace.repetition_tokens.clear();
+    workspace.repetition_counts.clear();
+
+    // Get the window of recent tokens.  At most past_window entries can be
+    // present, so avoid clearing and scanning a num_tokens-sized frequency map.
     int start_idx = std::max(0, (int)decoded_tokens.size() - past_window);
-    
-    // Count frequency of each token in the window
-    std::vector<int> freq(num_tokens, 0);
+    workspace.repetition_tokens.reserve(static_cast<size_t>(past_window));
+    workspace.repetition_counts.reserve(static_cast<size_t>(past_window));
     for (int i = start_idx; i < (int)decoded_tokens.size(); ++i) {
-        int tok = decoded_tokens[i];
-        if (tok >= 0 && tok < num_tokens) {
-            freq[tok]++;
+        const int token = decoded_tokens[static_cast<size_t>(i)];
+        if (token < 0 || token >= num_tokens) {
+            continue;
+        }
+        const auto found = std::find(
+            workspace.repetition_tokens.begin(),
+            workspace.repetition_tokens.end(), token);
+        if (found == workspace.repetition_tokens.end()) {
+            workspace.repetition_tokens.push_back(token);
+            workspace.repetition_counts.push_back(1);
+        } else {
+            const size_t index = static_cast<size_t>(found - workspace.repetition_tokens.begin());
+            ++workspace.repetition_counts[index];
         }
     }
-    
+
     // Apply penalty: alpha = penalty ^ freq
     // For positive logits: divide by alpha (makes them smaller, lower probability)
     // For negative logits: multiply by alpha (makes them more negative, lower probability)
-    for (int i = 0; i < num_tokens; ++i) {
-        if (freq[i] > 0) {
-            float alpha = powf(penalty, (float)freq[i]);
-            if (logits[i] < 0) {
-                logits[i] *= alpha;  // More negative
-            } else {
-                logits[i] /= alpha;  // Smaller positive
-            }
+    for (size_t i = 0; i < workspace.repetition_tokens.size(); ++i) {
+        const int token = workspace.repetition_tokens[i];
+        const float alpha = powf(penalty, (float)workspace.repetition_counts[i]);
+        if (logits[token] < 0) {
+            logits[token] *= alpha;  // More negative
+        } else {
+            logits[token] /= alpha;  // Smaller positive
         }
     }
 }
@@ -2713,50 +2873,50 @@ static int nucleus_sampling_with_min_keep_tts(
     float top_p, 
     int top_k, 
     int min_tokens_to_keep,  // Python default: 3
-    std::mt19937& rng
+    std::mt19937& rng,
+    int excluded_idx = -1
 ) {
+    tts_sampling_workspace & workspace = get_tts_sampling_workspace();
+
     // 1. Compute softmax probabilities
     float max_logit = logits[0];
     for (int i = 1; i < num_tokens; ++i) {
         if (logits[i] > max_logit) max_logit = logits[i];
     }
     
-    std::vector<float> probs(num_tokens);
+    workspace.probabilities.resize(static_cast<size_t>(num_tokens));
     float sum = 0.0f;
     for (int i = 0; i < num_tokens; ++i) {
-        probs[i] = expf(logits[i] - max_logit);
-        sum += probs[i];
+        workspace.probabilities[static_cast<size_t>(i)] = expf(logits[i] - max_logit);
+        sum += workspace.probabilities[static_cast<size_t>(i)];
     }
     for (int i = 0; i < num_tokens; ++i) {
-        probs[i] /= sum;
+        workspace.probabilities[static_cast<size_t>(i)] /= sum;
     }
-    
-    // 2. Sort by probability descending
-    std::vector<std::pair<float, int>> sorted_probs;
-    sorted_probs.reserve(num_tokens);
-    for (int i = 0; i < num_tokens; ++i) {
-        sorted_probs.push_back({probs[i], i});
-    }
-    std::sort(sorted_probs.begin(), sorted_probs.end(), 
-              [](const auto& a, const auto& b) { return a.first > b.first; });
+
+    // 2. Only rank the prefix that TopK can consume.
+    const size_t ranked_count = rank_tts_probabilities(workspace, num_tokens, top_k);
     
     // 3. Collect tokens within top_p and top_k, but keep at least min_tokens_to_keep
-    std::vector<float> filtered_probs;
-    std::vector<int> filtered_indices;
+    workspace.filtered_probabilities.clear();
+    workspace.filtered_indices.clear();
+    workspace.filtered_probabilities.reserve(ranked_count);
+    workspace.filtered_indices.reserve(ranked_count);
     float cum_prob = 0.0f;
-    
-    for (const auto& p : sorted_probs) {
+
+    for (size_t i = 0; i < ranked_count; ++i) {
+        const auto & p = workspace.ranked[i];
         // Always keep min_tokens_to_keep tokens
-        if ((int)filtered_probs.size() < min_tokens_to_keep) {
+        if ((int)workspace.filtered_probabilities.size() < min_tokens_to_keep) {
             cum_prob += p.first;
-            filtered_probs.push_back(p.first);
-            filtered_indices.push_back(p.second);
+            workspace.filtered_probabilities.push_back(p.first);
+            workspace.filtered_indices.push_back(p.second);
         }
         // After min_tokens_to_keep, apply top_p and top_k
-        else if (cum_prob < top_p && (int)filtered_probs.size() < top_k) {
+        else if (cum_prob < top_p && workspace.filtered_probabilities.size() < ranked_count) {
             cum_prob += p.first;
-            filtered_probs.push_back(p.first);
-            filtered_indices.push_back(p.second);
+            workspace.filtered_probabilities.push_back(p.first);
+            workspace.filtered_indices.push_back(p.second);
         } else {
             break;
         }
@@ -2764,31 +2924,43 @@ static int nucleus_sampling_with_min_keep_tts(
     
     // 4. Renormalize filtered probs
     float filtered_sum = 0.0f;
-    for (float p : filtered_probs) {
-        filtered_sum += p;
+    for (size_t i = 0; i < workspace.filtered_probabilities.size(); ++i) {
+        if (workspace.filtered_indices[i] != excluded_idx) {
+            filtered_sum += workspace.filtered_probabilities[i];
+        }
     }
-    for (float& p : filtered_probs) {
-        p /= filtered_sum;
+    if (filtered_sum <= 0.0f) {
+        return workspace.ranked.front().second == excluded_idx && ranked_count > 1
+            ? workspace.ranked[1].second
+            : workspace.ranked.front().second;
     }
-    
+
     // 5. Multinomial sampling
     std::uniform_real_distribution<float> dist(0.0f, 1.0f);
     float r = dist(rng);
     float cum = 0.0f;
-    for (size_t i = 0; i < filtered_probs.size(); ++i) {
-        cum += filtered_probs[i];
+    for (size_t i = 0; i < workspace.filtered_probabilities.size(); ++i) {
+        if (workspace.filtered_indices[i] == excluded_idx) {
+            continue;
+        }
+        cum += workspace.filtered_probabilities[i] / filtered_sum;
         if (r <= cum) {
-            return filtered_indices[i];
+            return workspace.filtered_indices[i];
         }
     }
-    return filtered_indices.back();  // Fallback
+    for (size_t i = workspace.filtered_indices.size(); i > 0; --i) {
+        if (workspace.filtered_indices[i - 1] != excluded_idx) {
+            return workspace.filtered_indices[i - 1];
+        }
+    }
+    return 0;
 }
 
 // ==================== 单工版本的 sample_tts_token ====================
 // 直接从 omni_sinplex.cpp 复制，保证单工模式行为完全一致
-// 🔧 [与 Python 对齐] 添加 is_final_text_chunk 参数：
-//    - 非 final chunk：采样到 EOS 时不 prefill，避免污染 KV cache
-//    - final chunk：采样到 EOS 时正常 prefill
+// Match the official llama.cpp-omni simplex path. A non-final EOS terminates
+// the current chunk without entering the KV cache; the final phase forwards it
+// before text_eos/audio_bos is injected.
 static llama_token sample_tts_token_simplex(struct common_sampler * smpl, struct omni_context * ctx_omni, common_params* params, int * n_past_tts, const std::vector<llama_token> * all_generated_tokens, int token_index_in_chunk, bool force_no_eos = false, bool is_final_text_chunk = false) {
     const char* logits_debug_dir = getenv("TTS_LOGITS_DEBUG_DIR");
     
@@ -2841,32 +3013,27 @@ static llama_token sample_tts_token_simplex(struct common_sampler * smpl, struct
     const float * head_code_w = ctx_omni->head_code_weight;
     const int hidden_size = ctx_omni->head_code_hidden_size;
     
-    for (int i = 0; i < num_audio_tokens; ++i) {
-        const float * row = head_code_w + i * hidden_size;
-        float sum = 0.0f;
-        for (int j = 0; j < hidden_size; ++j) {
-            sum += hidden_state[j] * row[j];
-        }
-        audio_logits[i] = sum;
+    if (!ctx_omni->tts_head_code_executor) {
+        const size_t threads = std::max<size_t>(1, std::min<size_t>(8, std::thread::hardware_concurrency()));
+        ctx_omni->tts_head_code_executor = std::make_shared<TtsHeadCodeExecutor>(threads);
+        LOG_INF("TTS head projection executor: threads=%zu\n",
+                ctx_omni->tts_head_code_executor->thread_count());
     }
+    ctx_omni->tts_head_code_executor->compute(hidden_state, head_code_w,
+                                               audio_logits.data(), num_audio_tokens, hidden_size);
     
     std::mt19937* rng = get_sampler_rng(smpl);
     std::mt19937 local_rng;
     if (rng == nullptr) {
-        local_rng = std::mt19937(std::random_device{}());
+        uint32_t seed = 0;
+        resolve_python_t2w_seed(params, seed);
+        local_rng.seed(seed);
         rng = &local_rng;
     }
     
     // 单工版本：使用 all_generated_tokens 做 repetition penalty
-    std::vector<int> decoded_tokens_relative;
-    if (all_generated_tokens != nullptr) {
-        for (llama_token tid : *all_generated_tokens) {
-            int relative_idx = tid - audio_bos_token_id;
-            if (relative_idx >= 0 && relative_idx < num_audio_tokens) {
-                decoded_tokens_relative.push_back(relative_idx);
-            }
-        }
-    }
+    const std::vector<int> & decoded_tokens_relative = collect_recent_relative_tokens(
+        all_generated_tokens, audio_bos_token_id, num_audio_tokens, 8);
     
     // 🔧 [与 Python streaming 对齐] TTS 采样参数
     // Python tts_streaming_generate.py 使用：
@@ -3114,14 +3281,14 @@ llama_token sample_tts_token(struct common_sampler * smpl, struct omni_context *
     
     // ⚡ 优化：head_code_weight已转置为[6562, 768]，每行连续存储
     // 连续内存访问，cache友好
-    for (int i = 0; i < num_audio_tokens; ++i) {
-        const float * row = head_code_w + i * hidden_size;
-        float sum = 0.0f;
-        for (int j = 0; j < hidden_size; ++j) {
-            sum += hidden_state[j] * row[j];
-        }
-        audio_logits[i] = sum;
+    if (!ctx_omni->tts_head_code_executor) {
+        const size_t threads = std::max<size_t>(1, std::min<size_t>(8, std::thread::hardware_concurrency()));
+        ctx_omni->tts_head_code_executor = std::make_shared<TtsHeadCodeExecutor>(threads);
+        LOG_INF("TTS head projection executor: threads=%zu\n",
+                ctx_omni->tts_head_code_executor->thread_count());
     }
+    ctx_omni->tts_head_code_executor->compute(hidden_state, head_code_w,
+                                               audio_logits.data(), num_audio_tokens, hidden_size);
     
     int eos_relative_idx = num_audio_tokens - 1;  // EOS token relative index: 6561
     
@@ -3165,9 +3332,10 @@ llama_token sample_tts_token(struct common_sampler * smpl, struct omni_context *
     std::mt19937* rng = get_sampler_rng(smpl);
     std::mt19937 local_rng;
     if (rng == nullptr) {
-        // Fallback to local RNG
-        LOG_WRN("TTS: sampler RNG not available, using local RNG\n");
-        local_rng = std::mt19937(std::random_device{}());
+        uint32_t seed = 0;
+        resolve_python_t2w_seed(params, seed);
+        LOG_WRN("TTS: sampler RNG not available, using deterministic seed=%u\n", seed);
+        local_rng.seed(seed);
         rng = &local_rng;
     }
     
@@ -3176,7 +3344,6 @@ llama_token sample_tts_token(struct common_sampler * smpl, struct omni_context *
     //   Python generate_chunk: input_ids_sliced = new_tokens[:, 0:t]
     // - 单工模式：使用 all_generated_tokens（所有生成的 tokens）
     //   Python TTSStreamingGenerator: self.all_generated_tokens
-    std::vector<int> decoded_tokens_relative;
     const std::vector<llama_token> * tokens_for_penalty;
     if (ctx_omni->duplex_mode) {
         // 双工模式：优先使用当前 chunk 的 tokens
@@ -3185,15 +3352,8 @@ llama_token sample_tts_token(struct common_sampler * smpl, struct omni_context *
         // 单工模式：使用所有生成的 tokens
         tokens_for_penalty = all_generated_tokens;
     }
-    if (tokens_for_penalty != nullptr) {
-        for (llama_token tid : *tokens_for_penalty) {
-            // Convert absolute token ID to relative index
-            int relative_idx = tid - audio_bos_token_id;
-            if (relative_idx >= 0 && relative_idx < num_audio_tokens) {
-                decoded_tokens_relative.push_back(relative_idx);
-            }
-        }
-    }
+    const std::vector<int> & decoded_tokens_relative = collect_recent_relative_tokens(
+        tokens_for_penalty, audio_bos_token_id, num_audio_tokens, 16);
     
     // 🔧 [与 Python TTSSamplingParams 对齐] (modeling_minicpmo.py line 69-76)
     float temperature = 0.8f;       // TTSSamplingParams.temperature = 0.8
@@ -3911,6 +4071,18 @@ struct DuplexPrefillPacket {
     DuplexChunkTimings              timings;
 };
 
+enum class DuplexApmAbMode {
+    DISABLED,
+    BASELINE,
+    REPLAY,
+};
+
+struct DuplexApmReplayEntry {
+    std::vector<float> embed;
+    int n_pos = 0;
+    uint64_t hash = 0;
+};
+
 struct DuplexDecodeReq {
     std::string        debug_dir;
     int                round_idx = -1;
@@ -3960,7 +4132,35 @@ struct DuplexPipeline {
     // 业务上 prefill/decode 是严格交替的（每秒 1 对），不会有 race。
     std::atomic<int> in_flight_prefill{0};
     std::condition_variable in_flight_cv;
+
+    DuplexApmAbMode apm_ab_mode = DuplexApmAbMode::DISABLED;
+    std::atomic<bool> apm_replay_preparing{false};
+    std::atomic<bool> apm_replay_enabled{false};
+    std::vector<DuplexApmReplayEntry> apm_replay_entries;
+    std::atomic<int> apm_prepared{0};
+    std::atomic<int> apm_live_calls{0};
+    std::atomic<int> apm_replay_hits{0};
+    std::atomic<int> apm_replay_misses{0};
 };
+
+static const char * duplex_apm_ab_mode_name(DuplexApmAbMode mode) {
+    switch (mode) {
+        case DuplexApmAbMode::BASELINE: return "baseline";
+        case DuplexApmAbMode::REPLAY:   return "replay";
+        default:                        return "disabled";
+    }
+}
+
+static uint64_t duplex_apm_stable_hash64(const float * data, size_t count) {
+    const auto * bytes = reinterpret_cast<const unsigned char *>(data);
+    const size_t n_bytes = count * sizeof(float);
+    uint64_t hash = UINT64_C(14695981039346656037);
+    for (size_t i = 0; i < n_bytes; ++i) {
+        hash ^= bytes[i];
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
 
 static void duplex_start_threads(omni_context * ctx_omni, common_params * params);
 static void duplex_stop_threads(omni_context * ctx_omni);
@@ -4011,6 +4211,28 @@ static struct llama_model * llama_init(common_params * params, std::string model
     return model;
 }
 
+std::string omni_default_token2wav_device() {
+    if (const char * configured = std::getenv("OMNI_T2W_DEVICE")) {
+        if (*configured) return configured;
+    }
+#ifdef GGML_USE_CANN
+    return "npu:0";
+#else
+    return "gpu:0";
+#endif
+}
+
+void omni_bind_device() {
+#ifdef GGML_USE_CANN
+    int device = 0;
+    if (const char * raw = std::getenv("DEVICE_ID")) device = std::max(0, std::atoi(raw));
+    const aclError error = aclrtSetDevice(device);
+    if (error != ACL_SUCCESS) {
+        LOG_ERR("CANN: aclrtSetDevice(%d) failed before omni lifecycle operation: %d\n", device, error);
+    }
+#endif
+}
+
 // TTS专用模型加载 - 支持独立的GPU层数设置
 // 通过环境变量 TTS_GPU_LAYERS 控制，-1 表示使用与LLM相同的设置
 static struct llama_model * llama_init_tts(common_params * params, std::string model_path, int n_gpu_layers_override = -1) {
@@ -4019,6 +4241,20 @@ static struct llama_model * llama_init_tts(common_params * params, std::string m
     
     llama_model_params model_params = common_model_params_to_llama(*params);
     model_params.partial_load = true;  // TTS GGUF contains extra tensors (emb_code, head_code, projector_*) beyond standard llama
+
+    std::vector<ggml_backend_dev_t> tts_devices;
+    if (const char * device_name = std::getenv("OMNI_TTS_DEVICE"); device_name && *device_name) {
+        ggml_backend_dev_t device = omni_backend_device_by_name(device_name);
+        if (!device || ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            LOG_ERR("%s: invalid OMNI_TTS_DEVICE='%s'\n", __func__, device_name);
+            return nullptr;
+        }
+        tts_devices = {device, nullptr};
+        model_params.devices = tts_devices.data();
+        model_params.split_mode = LLAMA_SPLIT_MODE_NONE;
+        model_params.main_gpu = 0;
+        print_with_timestamp("TTS model: device overridden by OMNI_TTS_DEVICE=%s\n", device_name);
+    }
 
     // 如果指定了override值(>=0)，使用它；否则保持与LLM相同的设置
     if (n_gpu_layers_override >= 0) {
@@ -4222,7 +4458,11 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
         // 路径: {tts_bin_dir}/MiniCPM-o-4_5-projector-F16.gguf
         std::string projector_path = tts_bin_dir + "/MiniCPM-o-4_5-projector-F16.gguf";
         print_with_timestamp("Projector: loading from %s\n", projector_path.c_str());
-        if (projector_init(ctx_omni->projector, projector_path, true)) {
+        const char * projector_device = std::getenv("OMNI_PROJECTOR_DEVICE");
+        if (!projector_device || !*projector_device) {
+            projector_device = std::getenv("OMNI_TTS_DEVICE");
+        }
+        if (projector_init(ctx_omni->projector, projector_path, true, projector_device)) {
             print_with_timestamp("Projector: loaded successfully\n");
         } else {
             print_with_timestamp("Projector: failed to load, will use fallback implementation\n");
@@ -4610,6 +4850,8 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
         ctx_omni->special_token_chunk_tts_eos = find_token("<|chunk_tts_eos|>");
         ctx_omni->special_token_turn_eos = find_token("<|turn_eos|>");
         ctx_omni->special_token_tts_eos = find_token("<|tts_eos|>");
+        ctx_omni->special_token_im_end = find_token("<|im_end|>");
+        ctx_omni->special_token_slash_s = find_token("</s>");
         ctx_omni->special_token_eos = llama_vocab_eos(vocab);
         
         // 同时初始化 tts_bos_token_id（用于双工模式强制继续说话）
@@ -4671,6 +4913,22 @@ bool omni_tts_queues_empty(struct omni_context * ctx_omni) {
         t2w_empty = ctx_omni->t2w_thread_info->queue.empty();
     }
     return tts_empty && t2w_empty;
+}
+
+uint64_t omni_request_break(struct omni_context * ctx_omni) {
+    if (!ctx_omni) return 0;
+    const bool require_llm = ctx_omni->duplex && ctx_omni->duplex->running.load();
+    const bool require_tts = ctx_omni->use_tts && ctx_omni->tts_thread_info && tts_thread_running.load();
+    const bool require_t2w = require_tts && ctx_omni->t2w_thread_info && t2w_thread_running.load();
+    const uint64_t generation = ctx_omni->break_event.request(require_llm, require_tts, require_t2w);
+    if (ctx_omni->llm_thread_info) ctx_omni->llm_thread_info->cv.notify_all();
+    if (ctx_omni->tts_thread_info) ctx_omni->tts_thread_info->cv.notify_all();
+    if (ctx_omni->t2w_thread_info) ctx_omni->t2w_thread_info->cv.notify_all();
+    return generation;
+}
+
+void omni_reset_break_state(struct omni_context * ctx_omni) {
+    if (ctx_omni) ctx_omni->break_event.reset();
 }
 
 // 停止所有线程（发送信号，不等待）
@@ -4760,6 +5018,8 @@ void omni_prepare_for_reuse(struct omni_context * ctx_omni) {
             ctx_omni->t2w_thread_info->queue.pop();
         }
     }
+
+    omni_reset_break_state(ctx_omni);
 
     print_with_timestamp("omni_prepare_for_reuse: inference threads stopped and queues cleared\n");
 }
@@ -5348,6 +5608,7 @@ static bool generate_audio_tokens_local_simplex(
     const std::string& output_dir = "",
     bool is_final_text_chunk = false  // 🔧 [与 Python 对齐] 是否是最后一个 text chunk
 ) {
+    const bool nonstream_precision = omni_tts_nonstream_precision_enabled();
     print_with_timestamp("TTS Simplex: generating audio tokens for chunk %d (n_tokens=%d, tts_n_embd=%d)\n",
                         chunk_idx, n_tokens, tts_n_embd);
     
@@ -5425,7 +5686,9 @@ static bool generate_audio_tokens_local_simplex(
     }
     
     // 使用包含 audio_bos 的 condition 进行 prefill
-    if (!prefill_with_emb_tts(ctx_omni, params, 
+    const bool first_token_will_reforward = chunk_idx == 0 && ctx_omni->tts_all_generated_tokens.empty();
+    if ((!first_token_will_reforward || omni_tts_legacy_first_prefill_enabled()) &&
+        !prefill_with_emb_tts(ctx_omni, params,
                               condition_with_bos.data(),
                               n_tokens_with_bos, params->n_batch, &n_past_tts)) {
         LOG_ERR("TTS Simplex: prefill_with_emb_tts failed\n");
@@ -5519,7 +5782,7 @@ static bool generate_audio_tokens_local_simplex(
         }
         
         // 🔧 [与 Python 对齐] 当 buffer >= chunk_size 时，yield 出 chunk_size 个
-        while ((int)ctx_omni->tts_token_buffer.size() >= CHUNK_SIZE && ctx_omni->t2w_thread_info) {
+        while (!nonstream_precision && (int)ctx_omni->tts_token_buffer.size() >= CHUNK_SIZE && ctx_omni->t2w_thread_info) {
             T2WOut *t2w_out = new T2WOut();
             t2w_out->audio_tokens.assign(ctx_omni->tts_token_buffer.begin(), 
                                          ctx_omni->tts_token_buffer.begin() + CHUNK_SIZE);
@@ -5615,7 +5878,7 @@ static bool generate_audio_tokens_local_simplex(
                 }
                 
                 // yield audio chunks
-                while ((int)ctx_omni->tts_token_buffer.size() >= CHUNK_SIZE && ctx_omni->t2w_thread_info) {
+                while (!nonstream_precision && (int)ctx_omni->tts_token_buffer.size() >= CHUNK_SIZE && ctx_omni->t2w_thread_info) {
                     T2WOut *t2w_out = new T2WOut();
                     t2w_out->audio_tokens.assign(ctx_omni->tts_token_buffer.begin(), 
                                                  ctx_omni->tts_token_buffer.begin() + CHUNK_SIZE);
@@ -5640,6 +5903,12 @@ static bool generate_audio_tokens_local_simplex(
         }
     }
     
+    if (nonstream_precision) {
+        ctx_omni->tts_token_buffer.clear();
+        print_with_timestamp("TTS precision: retained %zu verified audio tokens for terminal one-shot\n",
+                             output_audio_tokens.size());
+    }
+
     // 🔧 [与 Python 对齐] chunk 结束时，tts_token_buffer 中可能有剩余的 tokens (< CHUNK_SIZE)
     // 这些 tokens 保留在 buffer 中，等下一个 text chunk 继续累积
     // 只有 is_final_text_chunk 时才 flush 所有剩余
@@ -5648,7 +5917,7 @@ static bool generate_audio_tokens_local_simplex(
     
     // 🔧 [与 Python 对齐] 只有最后一个 text chunk 时才 flush 剩余的 buffer
     // Python: if finished.all() and text_finished: yield all remaining; buffer = []
-    if (is_final_text_chunk && !ctx_omni->tts_token_buffer.empty() && ctx_omni->t2w_thread_info) {
+    if (!nonstream_precision && is_final_text_chunk && !ctx_omni->tts_token_buffer.empty() && ctx_omni->t2w_thread_info) {
         T2WOut *t2w_out = new T2WOut();
         t2w_out->audio_tokens.assign(ctx_omni->tts_token_buffer.begin(), 
                                      ctx_omni->tts_token_buffer.end());
@@ -5668,7 +5937,7 @@ static bool generate_audio_tokens_local_simplex(
     
     // 🔧 [与 Python 对齐] 只有 duplex_mode 时才发送 is_chunk_end 信号
     // 单工模式下，T2W 依赖滑动窗口机制，中间 chunk 不需要 flush
-    if (ctx_omni->duplex_mode && ctx_omni->t2w_thread_info) {
+    if (!nonstream_precision && ctx_omni->duplex_mode && ctx_omni->t2w_thread_info) {
         T2WOut *t2w_out = new T2WOut();
         t2w_out->audio_tokens.clear();  // 空的 token 列表
         t2w_out->is_final = false;  // Not final (turn not ended)
@@ -5860,7 +6129,9 @@ static bool generate_audio_tokens_local(
         print_with_timestamp("TTS Local: chunk %d - keeping KV cache, n_past_tts=%d\n", chunk_idx, n_past_tts);
     }
     // 使用包含 audio_bos 的 condition 进行 prefill
-    if (!prefill_with_emb_tts(ctx_omni, params, 
+    const bool first_token_will_reforward = chunk_idx == 0 && ctx_omni->tts_all_generated_tokens.empty();
+    if ((!first_token_will_reforward || omni_tts_legacy_first_prefill_enabled()) &&
+        !prefill_with_emb_tts(ctx_omni, params,
                               condition_with_bos.data(),
                               n_tokens_with_bos, params->n_batch, &n_past_tts)) {
         LOG_ERR("TTS Local: prefill_with_emb_tts failed\n");
@@ -6299,6 +6570,7 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
     bool tts_finish = false;
     bool llm_finish = false;
     int chunk_idx = 0;
+    int active_turn_id = -1;
     std::string incomplete_bytes;
     
     // 双工模式：固定输出目录（不使用 round_XXX 子目录）
@@ -6319,7 +6591,7 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
     
     // 创建输出目录
     create_dir(tts_output_dir);
-    create_dir(llm_debug_output_dir);
+    if (omni_tts_debug_artifacts_enabled()) create_dir(llm_debug_output_dir);
     create_dir(tts_wav_output_dir);
     
     // TTS model constants
@@ -6358,6 +6630,7 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
             llm_finish = false;
             tts_finish = false;
             chunk_idx = 0;
+            active_turn_id = -1;
             tts_n_past = 0;
             audio_tokens.clear();
             all_audio_tokens.clear();
@@ -6381,6 +6654,7 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
         
         // 🔧 [修复双工缺字问题] 从 LLMOut 获取 is_end_of_turn 状态
         bool accumulated_is_end_of_turn = false;
+        int accumulated_turn_id = -1;
             
         // Wait for queue
         if (!llm_finish || (llm_finish && llm_text.empty())) {
@@ -6411,6 +6685,9 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
                 llm_finish |= llm_out->llm_finish;
                 bool item_is_eot = llm_out->is_end_of_turn;
                 accumulated_is_end_of_turn |= item_is_eot;
+                if (llm_out->turn_id >= 0) {
+                    accumulated_turn_id = llm_out->turn_id;
+                }
                 
                 if (!ctx_omni->speek_done || ctx_omni->duplex_mode) {
                     llm_text += llm_out->text;
@@ -6450,8 +6727,11 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
             
             if (ctx_omni->speek_done && llm_finish) {
                 if (ctx_omni->duplex_mode && !current_chunk_token_ids.empty()) {
-                    // 新一轮 SPEAK：重置 TTS 状态，防止上轮残留污染
-                    if (chunk_idx > 0) {
+                    const bool same_turn = active_turn_id >= 0 &&
+                                           accumulated_turn_id == active_turn_id;
+                    const bool reset_for_fragment =
+                        omni_tts_legacy_duplex_chunk_reset_enabled() || !same_turn;
+                    if (chunk_idx > 0 && reset_for_fragment) {
                         chunk_idx = 0;
                         tts_n_past = 0;
                         audio_tokens.clear();
@@ -6462,6 +6742,12 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
                         ctx_omni->tts_n_past_accumulated = 0;
                         ctx_omni->tts_all_generated_tokens.clear();
                         ctx_omni->tts_condition_saved = false;
+                    } else if (chunk_idx > 0) {
+                        print_with_timestamp("[tts-opt] same turn %d - preserving KV cache at chunk_idx=%d\n",
+                                             accumulated_turn_id, chunk_idx);
+                    }
+                    if (accumulated_turn_id >= 0) {
+                        active_turn_id = accumulated_turn_id;
                     }
                     ctx_omni->speek_done = false;
                 } else if (ctx_omni->duplex_mode && accumulated_is_end_of_turn) {
@@ -6909,6 +7195,7 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
 }
 
 void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
+    const bool nonstream_precision = omni_tts_nonstream_precision_enabled();
     // TTS model state
     int tts_n_past = 0;  // TTS model's n_past counter
     std::vector<llama_token> audio_tokens;  // Collected audio tokens
@@ -6973,7 +7260,7 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
         // 只在新的 round 时创建目录
         if (ctx_omni->simplex_round_idx != last_created_round_idx || ctx_omni->duplex_mode) {
             create_dir(tts_output_dir);
-            create_dir(llm_debug_output_dir);
+            if (omni_tts_debug_artifacts_enabled()) create_dir(llm_debug_output_dir);
             create_dir(tts_wav_output_dir);
             last_created_round_idx = ctx_omni->simplex_round_idx;
             
@@ -7246,7 +7533,12 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
                 }
                 
                 T2WOut *t2w_final = new T2WOut();
-                t2w_final->audio_tokens.clear();
+                if (nonstream_precision) {
+                    t2w_final->audio_tokens.assign(all_audio_tokens.begin(),
+                                                   all_audio_tokens.end());
+                } else {
+                    t2w_final->audio_tokens.clear();
+                }
                 t2w_final->is_final = true;
                 t2w_final->round_idx = current_round_idx;  // 🔧 使用递增前的值
                 {
@@ -7415,6 +7707,8 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
                 print_with_timestamp("TTS: WARNING - TTS condition graph weights not loaded, skipping merged embedding computation\n");
             }
             
+            if (merged_success) merged_success = !merged_embeddings.empty();
+
             // Save LLM debug data: text, token_ids, hidden_states, and merged embeddings
             {
                 // Create chunk-specific directory
@@ -8212,7 +8506,12 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
             // T2W 端 buffer 已经累积了所有 tokens，这里只是通知它 flush
             if (ctx_omni->t2w_thread_info && !all_audio_tokens.empty()) {
                 T2WOut *t2w_out = new T2WOut();
-                t2w_out->audio_tokens.clear();  // 空tokens，只是通知final
+                if (nonstream_precision) {
+                    t2w_out->audio_tokens.assign(all_audio_tokens.begin(),
+                                                 all_audio_tokens.end());
+                } else {
+                    t2w_out->audio_tokens.clear();  // 空tokens，只是通知final
+                }
                 t2w_out->is_final = true;
                 t2w_out->round_idx = ctx_omni->simplex_round_idx;  // 🔧 传递轮次索引
                 
@@ -8605,14 +8904,33 @@ static bool set_python_t2w_ref_audio(struct omni_context * ctx_omni, const std::
     }
     
     print_with_timestamp("Python T2W set_ref_audio 响应: %s\n", response.c_str());
-    return response.find("\"status\":\"ok\"") != std::string::npos ||
-           response.find("\"status\": \"ok\"") != std::string::npos;
+    const bool success = response.find("\"status\":\"ok\"") != std::string::npos ||
+                         response.find("\"status\": \"ok\"") != std::string::npos;
+    if (success) ctx_omni->python_t2w_ref_audio_path = ref_audio_path;
+    return success;
+}
+
+bool omni_set_token2wav_ref_audio(struct omni_context * ctx_omni, const std::string & ref_audio_path) {
+    if (!ctx_omni || !ctx_omni->use_python_token2wav || ref_audio_path.empty()) return false;
+    if (!set_python_t2w_ref_audio(ctx_omni, ref_audio_path)) return false;
+    ctx_omni->ref_audio_path = ref_audio_path;
+    return true;
+}
+
+static void append_python_t2w_json_string(std::string & out, const std::string & value) {
+    out.push_back('"');
+    for (char ch : value) {
+        if (ch == '"' || ch == '\\') out.push_back('\\');
+        out.push_back(ch);
+    }
+    out.push_back('"');
 }
 
 // 处理 tokens 并生成 WAV
 static bool process_python_t2w_tokens(struct omni_context * ctx_omni, 
                                 const std::vector<int32_t>& tokens, 
                                 bool last_chunk, 
+                                uint32_t seed,
                                 const std::string& output_path,
                                 double& inference_time_ms,
                                 double& audio_duration) {
@@ -8626,10 +8944,10 @@ static bool process_python_t2w_tokens(struct omni_context * ctx_omni,
     
     char cmd[8192];
     snprintf(cmd, sizeof(cmd), 
-             "{\"cmd\":\"process\",\"tokens\":%s,\"last_chunk\":%s,\"output_path\":\"%s\"}",
+             "{\"cmd\":\"process\",\"tokens\":%s,\"last_chunk\":%s,\"output_path\":\"%s\",\"seed\":%u}",
              tokens_json.c_str(), 
              last_chunk ? "true" : "false",
-             output_path.c_str());
+             output_path.c_str(), seed);
     
     std::string response;
     if (!send_python_t2w_command(ctx_omni, cmd, response)) {
@@ -8652,6 +8970,33 @@ static bool process_python_t2w_tokens(struct omni_context * ctx_omni,
            response.find("\"status\": \"ok\"") != std::string::npos;
 }
 
+static bool process_python_t2w_tokens_oneshot(struct omni_context * ctx_omni,
+                                               const std::vector<int32_t>& tokens,
+                                               uint32_t seed,
+                                               const std::string& output_path,
+                                               double& inference_time_ms,
+                                               double& audio_duration) {
+    if (tokens.empty()) return false;
+    const std::string & ref_audio_path = ctx_omni->ref_audio_path.empty()
+        ? ctx_omni->python_t2w_ref_audio_path : ctx_omni->ref_audio_path;
+    if (ref_audio_path.empty()) return false;
+    std::string cmd = "{\"cmd\":\"process_oneshot\",\"tokens\":[";
+    for (size_t i = 0; i < tokens.size(); ++i) { if (i) cmd.push_back(','); cmd += std::to_string(tokens[i]); }
+    cmd += "],\"ref_audio_path\":";
+    append_python_t2w_json_string(cmd, ref_audio_path);
+    cmd += ",\"output_path\":";
+    append_python_t2w_json_string(cmd, output_path);
+    cmd += ",\"seed\":" + std::to_string(seed) + "}";
+    std::string response;
+    if (!send_python_t2w_command(ctx_omni, cmd, response)) return false;
+    size_t pos = response.find("\"inference_time_ms\":");
+    if (pos != std::string::npos) inference_time_ms = atof(response.c_str() + pos + 20);
+    pos = response.find("\"audio_duration\":");
+    if (pos != std::string::npos) audio_duration = atof(response.c_str() + pos + 17);
+    return response.find("\"status\":\"ok\"") != std::string::npos ||
+           response.find("\"status\": \"ok\"") != std::string::npos;
+}
+
 // 重置 Python T2W 缓存
 static bool reset_python_t2w_cache(struct omni_context * ctx_omni) {
     std::string response;
@@ -8667,6 +9012,8 @@ static bool reset_python_t2w_cache(struct omni_context * ctx_omni) {
 
 // Python Token2Wav thread function
 void t2w_thread_func_python(struct omni_context * ctx_omni, common_params *params) {
+    uint32_t python_t2w_seed = 0;
+    if (!resolve_python_t2w_seed(params, python_t2w_seed)) return;
     print_with_timestamp("T2W thread (Python) started\n");
     fflush(stdout);
     
@@ -8678,9 +9025,11 @@ void t2w_thread_func_python(struct omni_context * ctx_omni, common_params *param
     constexpr int32_t CHUNK_SIZE = 25;      // Main chunk size (25 tokens = 1s audio)
     constexpr int32_t PRE_LOOKAHEAD = 3;    // Lookahead for overlap
     constexpr int32_t WINDOW_SIZE = CHUNK_SIZE + PRE_LOOKAHEAD;  // 28
+    const bool nonstream_precision = omni_tts_nonstream_precision_enabled();
     
     // Buffer to accumulate tokens (for sliding window)
     std::vector<int32_t> token_buffer = {4218, 4218, 4218};
+    std::vector<int32_t> oneshot_token_buffer;
     
     // 使用可配置的 base_output_dir
     const std::string& base_output_dir = ctx_omni->base_output_dir;
@@ -8710,14 +9059,15 @@ void t2w_thread_func_python(struct omni_context * ctx_omni, common_params *param
     while (t2w_thread_running) {
         // 检测打断事件
         if (ctx_omni->break_event.load()) {
+            const uint64_t break_generation = ctx_omni->break_event.generation();
             std::lock_guard<std::mutex> lock(mtx);
             while (!queue.empty()) {
                 T2WOut *t2w_out = queue.front();
                 queue.pop();
                 delete t2w_out;
             }
-            ctx_omni->break_event = false;
             token_buffer = {4218, 4218, 4218};
+            oneshot_token_buffer.clear();
             wav_idx = 0;
             
             if (!ctx_omni->duplex_mode) {
@@ -8730,8 +9080,11 @@ void t2w_thread_func_python(struct omni_context * ctx_omni, common_params *param
                 cross_platform_mkdir_p(tts_wav_output_dir);
             }
             
-            // 重置 Python 缓存
-            reset_python_t2w_cache(ctx_omni);
+            if (nonstream_precision) {
+                ctx_omni->break_event.acknowledge(DuplexBreakStage::T2W, break_generation);
+            } else if (reset_python_t2w_cache(ctx_omni)) {
+                ctx_omni->break_event.acknowledge(DuplexBreakStage::T2W, break_generation);
+            }
             continue;
         }
         
@@ -8784,11 +9137,45 @@ void t2w_thread_func_python(struct omni_context * ctx_omni, common_params *param
             wav_idx = 0;
         }
         
-        // Add new tokens to buffer
-        token_buffer.insert(token_buffer.end(), new_tokens.begin(), new_tokens.end());
+        if (nonstream_precision) {
+            oneshot_token_buffer.insert(oneshot_token_buffer.end(), new_tokens.begin(), new_tokens.end());
+        } else {
+            token_buffer.insert(token_buffer.end(), new_tokens.begin(), new_tokens.end());
+        }
         
         // 检查 Python 服务是否初始化
         if (!ctx_omni->python_t2w_initialized) {
+            continue;
+        }
+
+        if (nonstream_precision) {
+            if (!is_final) continue;
+            std::string wav_path = tts_wav_output_dir + "/wav_" +
+                                   std::to_string(ctx_omni->wav_turn_base + wav_idx) + ".wav";
+            double inference_time_ms = 0.0;
+            double audio_duration = 0.0;
+            if (!process_python_t2w_tokens_oneshot(ctx_omni, oneshot_token_buffer,
+                    python_t2w_seed, wav_path, inference_time_ms, audio_duration)) {
+                oneshot_token_buffer.clear();
+                continue;
+            }
+            std::vector<int16_t> pcm;
+            if (!read_wav_pcm16_data(wav_path, pcm) || audio_duration <= 0.0) {
+                oneshot_token_buffer.clear();
+                continue;
+            }
+            std::string done_flag_path = tts_wav_output_dir + "/generation_done.flag";
+            if (FILE * flag = fopen(done_flag_path.c_str(), "w")) {
+                fprintf(flag, "%d\n", ctx_omni->wav_turn_base + wav_idx);
+                fclose(flag);
+            }
+            if (ctx_omni->audio_output_cb) {
+                std::vector<float> samples(pcm.size());
+                for (size_t i = 0; i < pcm.size(); ++i) samples[i] = (float) pcm[i] / 32768.0f;
+                ctx_omni->audio_output_cb(samples.data(), (int) samples.size(), sample_rate, true);
+            }
+            ++wav_idx;
+            oneshot_token_buffer.clear();
             continue;
         }
         
@@ -8824,7 +9211,7 @@ void t2w_thread_func_python(struct omni_context * ctx_omni, common_params *param
             double inference_time_ms = 0;
             double audio_duration = 0;
             
-            if (process_python_t2w_tokens(ctx_omni, window, is_last_window, wav_path, inference_time_ms, audio_duration)) {
+            if (process_python_t2w_tokens(ctx_omni, window, is_last_window, python_t2w_seed, wav_path, inference_time_ms, audio_duration)) {
                 // Audio output callback (for WS protocol) — read the WAV and pass float32 samples
                 if (ctx_omni->audio_output_cb && audio_duration > 0) {
                     std::vector<int16_t> pcm;
@@ -9529,13 +9916,44 @@ static void duplex_encoder_thread_func(omni_context * ctx_omni, common_params * 
         // ---- APM 任务 ----
         auto apm_task = [&]() -> double {
             if (!has_aud) return 0.0;
+
+            if (dup->apm_ab_mode == DuplexApmAbMode::REPLAY) {
+                if (!dup->apm_replay_enabled.load()
+                    || req->index <= 0
+                    || static_cast<size_t>(req->index) > dup->apm_replay_entries.size()) {
+                    dup->apm_replay_misses.fetch_add(1);
+                    LOG_ERR("[apm-ab] frame=%d source=replay miss=1\n", req->index);
+                    return 0.0;
+                }
+                const DuplexApmReplayEntry & entry =
+                    dup->apm_replay_entries[static_cast<size_t>(req->index - 1)];
+                packet->audio_embed = entry.embed;
+                dup->apm_replay_hits.fetch_add(1);
+                print_with_timestamp(
+                    "[apm-ab] frame=%d source=replay n_pos=%d size=%zu hash=%016llx\n",
+                    req->index, entry.n_pos, entry.embed.size(),
+                    static_cast<unsigned long long>(entry.hash));
+                return 0.0;
+            }
+
             auto t0 = std::chrono::high_resolution_clock::now();
+            if (dup->apm_ab_mode == DuplexApmAbMode::BASELINE) {
+                dup->apm_live_calls.fetch_add(1);
+            }
             auto * audio_embeds = omni_audio_embed_make_with_filename(
                 ctx_omni->ctx_audio, params->cpuparams.n_threads, req->aud_fname);
             if (audio_embeds != nullptr && audio_embeds->n_pos > 0) {
                 packet->audio_embed.resize(audio_embeds->n_pos * hidden_size);
                 std::memcpy(packet->audio_embed.data(), audio_embeds->embed,
                             packet->audio_embed.size() * sizeof(float));
+                if (dup->apm_ab_mode == DuplexApmAbMode::BASELINE) {
+                    const uint64_t hash = duplex_apm_stable_hash64(
+                        packet->audio_embed.data(), packet->audio_embed.size());
+                    print_with_timestamp(
+                        "[apm-ab] frame=%d source=live n_pos=%d size=%zu hash=%016llx\n",
+                        req->index, audio_embeds->n_pos, packet->audio_embed.size(),
+                        static_cast<unsigned long long>(hash));
+                }
                 omni_embed_free(audio_embeds);
             } else {
                 LOG_WRN("Duplex encoder: audio encode returned empty for %s\n",
@@ -9991,9 +10409,12 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
     }
 
     // ---- 采样主循环（搬自老 stream_decode duplex 分支） ----
-    const int max_tgt_len = params->n_predict < 0 ? params->n_ctx : params->n_predict;
+    const int available_ctx = std::max(0, params->n_ctx - ctx_omni->n_past);
+    const int max_tgt_len = params->n_predict < 0
+        ? available_ctx
+        : std::min(params->n_predict, available_ctx);
     const int step_size   = 10;   // chunk 推送给 TTS 的 LLM token 数量
-    bool llm_finish                  = false;
+    bool llm_finish                  = max_tgt_len <= 0;
     bool local_is_end_of_turn        = false;
     int  current_chunk_tokens        = 0;
     const int max_chunk_tokens       = ctx_omni->max_new_speak_tokens_per_chunk;
@@ -10002,6 +10423,9 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
     // 本帧是否产出过任何有效 TTS token（跨所有 chunk 批次累计）。
     // IDLE 判据用它，而不是 response 是否为空。
     bool produced_tts_tokens         = false;
+    int generated_tokens             = 0;
+    ctx_omni->generated_tokens.store(0);
+    ctx_omni->generation_hit_limit.store(max_tgt_len == 0);
 
     std::string response;
     for (int il = 0; il < max_tgt_len; ) {
@@ -10030,6 +10454,8 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
                 ctx_omni->n_past, hidden_states, sampled_token);
 
             total_tokens_generated++;
+            ++generated_tokens;
+            ctx_omni->generated_tokens.store(generated_tokens);
 
             if (tmp != nullptr && hidden_states != nullptr
                 && is_valid_tts_token(sampled_token)) {
@@ -10089,6 +10515,12 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
             }
 
             response += std::string(tmp);
+            if (generated_tokens >= max_tgt_len) {
+                ctx_omni->generation_hit_limit.store(true);
+                llm_finish = true;
+                print_with_timestamp("Duplex decode: generation safety limit reached (%d tokens)\n",
+                                     generated_tokens);
+            }
         }
 
         // chunk 限制：强制补 <|chunk_eos|> token 结束本轮
@@ -10149,6 +10581,7 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
             llm_out->hidden_states   = chunk_hidden_states;
             llm_out->n_embd          = llm_n_embd;
             llm_out->is_end_of_turn  = local_is_end_of_turn;
+            llm_out->turn_id         = ctx_omni->current_turn_id;
 
             {
                 std::unique_lock<std::mutex> lock(ctx_omni->tts_thread_info->mtx);
@@ -11029,9 +11462,13 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
     }
     LOG_INF("<user>%s\n", ctx_omni->params->prompt.c_str());
     LOG_INF("<assistant>");
-    const int max_tgt_len = ctx_omni->params->n_predict < 0 ? ctx_omni->params->n_ctx : ctx_omni->params->n_predict;
-    print_with_timestamp("LLM decode: max_tgt_len = %d, n_predict = %d, n_ctx = %d\n", 
-                         max_tgt_len, ctx_omni->params->n_predict, ctx_omni->params->n_ctx);
+    const int available_ctx = std::max(0, ctx_omni->params->n_ctx - ctx_omni->n_past);
+    const int max_tgt_len = ctx_omni->params->n_predict < 0
+        ? available_ctx
+        : std::min(ctx_omni->params->n_predict, available_ctx);
+    print_with_timestamp("LLM decode: max_tgt_len = %d, n_predict = %d, n_ctx = %d, n_past = %d\n",
+                         max_tgt_len, ctx_omni->params->n_predict,
+                         ctx_omni->params->n_ctx, ctx_omni->n_past);
     // LLM chunk size: 每chunk推送给TTS的LLM tokens数量
     // 原始Python: generate_chunk_size=10
     // 注意：step_size影响TTS条件长度，可能影响音质
@@ -11047,7 +11484,7 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
     // TODO write to specific buffers
     std::vector<float> tts_output;
     tts_output.resize(1/* batch_size */ * (ctx_omni->params->n_ctx /* seq_len */ * 2) * 256);
-    bool llm_finish = false;
+    bool llm_finish = max_tgt_len <= 0;
     bool llm_first_token_logged = false;
     
     // 🔧 [修复双工缺字问题] 记录当前 chunk 是否是 turn 的结束
@@ -11055,6 +11492,12 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
     bool local_is_end_of_turn = false;
     // 🔧 [P0-打断检测] 双工模式下记录当前 chunk 生成的 token 数
     int current_chunk_tokens = 0;
+    int generated_tokens = 0;
+    ctx_omni->generated_tokens.store(0);
+    ctx_omni->generation_hit_limit.store(max_tgt_len == 0);
+    if (llm_finish && !ctx_omni->duplex_mode) {
+        ctx_omni->llm_generation_done.store(true);
+    }
     for (int il = 0; il < max_tgt_len; ) {
         // 🔧 [P0-打断检测] 外层循环也检测 break_event
         if (ctx_omni->break_event.load()) {
@@ -11105,6 +11548,8 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
                 }
                 
                 total_tokens_generated++;
+                ++generated_tokens;
+                ctx_omni->generated_tokens.store(generated_tokens);
                 
                 // 🔧 [过滤逻辑] 只收集有效的 TTS token
                 // 特殊 token（如 <think>, </think>, 换行等）不计入 step_size
@@ -11242,6 +11687,15 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
                 // Copy tmp to a local string immediately to avoid issues with static string
                 std::string tmp_str(tmp);
                 response += tmp_str;
+                if (generated_tokens >= max_tgt_len) {
+                    ctx_omni->generation_hit_limit.store(true);
+                    llm_finish = true;
+                    print_with_timestamp("LLM: generation safety limit reached (%d tokens)\n",
+                                         generated_tokens);
+                    if (!ctx_omni->duplex_mode) {
+                        ctx_omni->llm_generation_done.store(true);
+                    }
+                }
                 fflush(stdout);
             }
             fflush(stdout);
@@ -11352,6 +11806,7 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
                 // 🔧 [修复双工缺字问题] 传递 is_end_of_turn 状态
                 // 此状态随数据一起传递，确保 TTS 处理的是与当前 chunk 对应的状态
                 llm_out->is_end_of_turn = local_is_end_of_turn;
+                llm_out->turn_id = ctx_omni->current_turn_id;
                 
                 // 🔧 [诊断日志] 打印 LLM 推送给 TTS 的数据
                 {
@@ -11730,6 +12185,17 @@ bool omni_duplex_session_begin(struct omni_context * ctx_omni,
         return false;
     }
 
+    if (ctx_omni->duplex) {
+        ctx_omni->duplex->apm_ab_mode = DuplexApmAbMode::DISABLED;
+        ctx_omni->duplex->apm_replay_preparing.store(false);
+        ctx_omni->duplex->apm_replay_enabled.store(false);
+        ctx_omni->duplex->apm_replay_entries.clear();
+        ctx_omni->duplex->apm_prepared.store(0);
+        ctx_omni->duplex->apm_live_calls.store(0);
+        ctx_omni->duplex->apm_replay_hits.store(0);
+        ctx_omni->duplex->apm_replay_misses.store(0);
+    }
+
     // 2. 创建 session 并启动 worker 线程
     auto * sess = new DuplexSession();
     sess->running.store(true);
@@ -11743,11 +12209,136 @@ bool omni_duplex_session_begin(struct omni_context * ctx_omni,
     return true;
 }
 
+bool omni_duplex_set_apm_ab_mode(struct omni_context * ctx_omni,
+                                const std::string & mode) {
+    if (!ctx_omni) return false;
+    std::lock_guard<std::mutex> api_lock(ctx_omni->duplex_session_api_mtx);
+    if (!ctx_omni->duplex || !ctx_omni->duplex_session) {
+        LOG_ERR("[apm-ab] configure requires an active duplex session\n");
+        return false;
+    }
+    DuplexPipeline * dup = ctx_omni->duplex;
+    DuplexSession * sess = ctx_omni->duplex_session;
+    if (dup->apm_replay_preparing.load() || sess->frame_id_counter.load() != 0
+        || sess->in_flight.load() != 0 || dup->in_flight_prefill.load() != 0) {
+        LOG_ERR("[apm-ab] configure must run before the first frame\n");
+        return false;
+    }
+
+    DuplexApmAbMode parsed;
+    if (mode == "baseline") {
+        parsed = DuplexApmAbMode::BASELINE;
+    } else if (mode == "replay") {
+        parsed = DuplexApmAbMode::REPLAY;
+    } else {
+        LOG_ERR("[apm-ab] unsupported mode '%s'\n", mode.c_str());
+        return false;
+    }
+    dup->apm_ab_mode = parsed;
+    dup->apm_replay_enabled.store(false);
+    dup->apm_replay_entries.clear();
+    dup->apm_prepared.store(0);
+    dup->apm_live_calls.store(0);
+    dup->apm_replay_hits.store(0);
+    dup->apm_replay_misses.store(0);
+    print_with_timestamp("[apm-ab] configured mode=%s\n", duplex_apm_ab_mode_name(parsed));
+    return true;
+}
+
+bool omni_duplex_prepare_apm_replay(
+    struct omni_context * ctx_omni,
+    const std::vector<OmniDuplexFrame> & frames) {
+    if (!ctx_omni) return false;
+    std::lock_guard<std::mutex> api_lock(ctx_omni->duplex_session_api_mtx);
+    if (!ctx_omni->duplex || !ctx_omni->duplex_session
+        || !ctx_omni->ctx_audio || !ctx_omni->ctx_llama || !ctx_omni->params) {
+        LOG_ERR("[apm-ab] replay preparation requires initialized audio/LLM contexts\n");
+        return false;
+    }
+    DuplexPipeline * dup = ctx_omni->duplex;
+    DuplexSession * sess = ctx_omni->duplex_session;
+    if (dup->apm_ab_mode != DuplexApmAbMode::REPLAY
+        || dup->apm_replay_preparing.exchange(true)) {
+        LOG_ERR("[apm-ab] replay preparation requires idle replay mode\n");
+        return false;
+    }
+    auto fail = [&]() {
+        dup->apm_replay_entries.clear();
+        dup->apm_replay_enabled.store(false);
+        dup->apm_prepared.store(0);
+        dup->apm_replay_preparing.store(false);
+        return false;
+    };
+    if (frames.empty() || sess->frame_id_counter.load() != 0
+        || sess->in_flight.load() != 0 || dup->in_flight_prefill.load() != 0) {
+        LOG_ERR("[apm-ab] replay preparation must precede all frame submissions\n");
+        return fail();
+    }
+    {
+        std::scoped_lock<std::mutex, std::mutex, std::mutex> lock(
+            sess->pending_mtx, dup->encoder_mtx, dup->llm_mtx);
+        if (!sess->pending_frames.empty() || !dup->encoder_queue.empty()
+            || !dup->prefill_queue.empty() || dup->pending_decode != nullptr) {
+            LOG_ERR("[apm-ab] replay preparation found non-empty pipeline queues\n");
+            return fail();
+        }
+    }
+
+    const int hidden_size = llama_n_embd(llama_get_model(ctx_omni->ctx_llama));
+    std::vector<DuplexApmReplayEntry> prepared;
+    prepared.reserve(frames.size());
+    for (size_t i = 0; i < frames.size(); ++i) {
+        if (frames[i].aud_fname.empty()) return fail();
+        omni_embed * audio_embeds = omni_audio_embed_make_with_filename(
+            ctx_omni->ctx_audio, ctx_omni->params->cpuparams.n_threads,
+            frames[i].aud_fname);
+        if (!audio_embeds || !audio_embeds->embed || audio_embeds->n_pos <= 0) {
+            if (audio_embeds) omni_embed_free(audio_embeds);
+            return fail();
+        }
+        DuplexApmReplayEntry entry;
+        entry.n_pos = audio_embeds->n_pos;
+        entry.embed.resize(static_cast<size_t>(entry.n_pos) * hidden_size);
+        std::memcpy(entry.embed.data(), audio_embeds->embed,
+                    entry.embed.size() * sizeof(float));
+        omni_embed_free(audio_embeds);
+        entry.hash = duplex_apm_stable_hash64(entry.embed.data(), entry.embed.size());
+        prepared.push_back(std::move(entry));
+    }
+    dup->apm_replay_entries = std::move(prepared);
+    dup->apm_prepared.store(static_cast<int>(dup->apm_replay_entries.size()));
+    dup->apm_replay_enabled.store(true);
+    dup->apm_replay_preparing.store(false);
+    return true;
+}
+
+bool omni_duplex_get_apm_ab_stats(struct omni_context * ctx_omni,
+                                 OmniDuplexApmAbStats * out) {
+    if (!ctx_omni || !out) return false;
+    std::lock_guard<std::mutex> api_lock(ctx_omni->duplex_session_api_mtx);
+    if (!ctx_omni->duplex) return false;
+    DuplexPipeline * dup = ctx_omni->duplex;
+    out->mode = duplex_apm_ab_mode_name(dup->apm_ab_mode);
+    out->prepared = dup->apm_prepared.load();
+    out->live_calls = dup->apm_live_calls.load();
+    out->replay_hits = dup->apm_replay_hits.load();
+    out->replay_misses = dup->apm_replay_misses.load();
+    return true;
+}
+
 int64_t omni_duplex_push_frame(struct omni_context * ctx_omni,
                                const OmniDuplexFrame & frame) {
     if (!ctx_omni || !ctx_omni->duplex_session) return -1;
     DuplexSession * sess = ctx_omni->duplex_session;
     if (!sess->running.load()) return -1;
+    if (ctx_omni->duplex
+        && ctx_omni->duplex->apm_ab_mode == DuplexApmAbMode::REPLAY
+        && (!ctx_omni->duplex->apm_replay_enabled.load()
+            || ctx_omni->duplex->apm_replay_preparing.load())) {
+        ctx_omni->duplex->apm_replay_misses.fetch_add(1);
+        LOG_ERR("[apm-ab] replay frame submitted before preparation completed\n");
+        return -1;
+    }
 
     OmniDuplexPendingFrame pf;
     pf.frame    = frame;

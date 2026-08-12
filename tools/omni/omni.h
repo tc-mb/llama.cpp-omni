@@ -1,6 +1,7 @@
 #include "ggml.h"
 #include "llama.h"
 #include "tts-condition-graph.h"
+#include "duplex-terminal-tracker.h"
 
 #include <thread>
 #include <memory>
@@ -39,6 +40,7 @@ struct DuplexPipeline;
 // 让外部只需要 push_frame / wait_next_frame，无需知道 stream_prefill/stream_decode
 // 的"index 语义"和并发约束。
 struct DuplexSession;
+class TtsHeadCodeExecutor;
 
 //
 // omni ctx
@@ -77,6 +79,8 @@ struct T2WOut {
     bool is_final = false;  // Whether this is the final chunk (turn end)
     bool is_chunk_end = false;  // Whether this is the end of a TTS chunk (flush buffer, but not final)
     int round_idx = -1;  // 🔧 [修复目录同步] 轮次索引，由 TTS 线程设置，T2W 线程使用此值确定输出目录
+    int turn_id = -1;  // Duplex RTF 关联键；-1 表示旧/非 duplex 数据
+    uint64_t terminal_seq = 0;  // 唯一 EOT 序号；0 表示普通数据
     std::chrono::steady_clock::time_point enqueue_time = std::chrono::steady_clock::now();
 };
 
@@ -272,7 +276,7 @@ struct omni_context {
     // 打断事件标志
     // break_event: 打断当前生成，但保持会话活跃（用于双工模式的用户打断）
     //              打断后可继续调用 prefill/decode
-    std::atomic<bool> break_event{false};
+    DuplexBreakCoordinator break_event;
     
     // session_stop_event: 终止整个会话（预留，目前未使用）
     //                     用于彻底关闭当前会话，需要重新 omni_init
@@ -302,6 +306,8 @@ struct omni_context {
     // 当 LLM 检测到 end token 时设置为 true
     // TTS 线程检查此标志来决定是否添加 text_eos_embed
     std::atomic<bool> llm_generation_done{false};
+    std::atomic<int> generated_tokens{0};
+    std::atomic<bool> generation_hit_limit{false};
     
     // ==================== 双工模式参数 ====================
     // 每个 chunk 最大生成 token 数（用于限制单次 speak 长度，便于及时响应打断）
@@ -327,6 +333,17 @@ struct omni_context {
     // simplex: 单工模式，用户说完后模型回复，回复完用户再说
     // duplex: 双工模式，模型可以在任意时刻决定听/说切换
     bool duplex_mode = false;
+
+    // Duplex RTF instrumentation uses a monotonic SPEAK-segment id rather than
+    // current_turn_id, which advances only after LISTEN and may otherwise
+    // produce several SPEAK_START events with the same correlation key.
+    DuplexSpeakSegmentTracker rtf_speak_tracker;
+    // FIFO terminal state is independent from audio_ms and turn_id.  This
+    // lets session_end wait for a normal final already being rendered, and
+    // makes cancellation/worker-stop outcomes sticky instead of polling a
+    // transient break_event.
+    DuplexTerminalTracker rtf_terminal_tracker;
+    std::mutex duplex_session_api_mtx;
     
     // 系统 prompt 是否已初始化（防止 stream_prefill index=0 被重复调用导致 prompt 重复）
     bool system_prompt_initialized = false;
@@ -422,6 +439,12 @@ struct omni_context {
     float * head_code_weight = nullptr;  // (768, 6562) - stored as (hidden_size, num_audio_tokens)
     int head_code_hidden_size = 0;  // 768
     int head_code_num_audio_tokens = 0;  // 6562
+    std::shared_ptr<TtsHeadCodeExecutor> tts_head_code_executor;
+    uint64_t tts_head_projection_calls = 0;
+    double tts_head_projection_total_ms = 0.0;
+    uint64_t tts_head_projection_steady_calls = 0;
+    double tts_head_projection_steady_ms = 0.0;
+    bool tts_generation_metrics_logged = false;
     
     // TTS condition embeddings (for first audio token re-forward)
     // Used to store the condition embeddings so we can re-forward them for the first audio token
@@ -460,6 +483,7 @@ struct omni_context {
     audio_output_cb_t audio_output_cb = nullptr; // called by T2W threads when a chunk of audio is ready
     std::string python_t2w_script_dir;  // Python Token2Wav 脚本目录
     std::string python_t2w_model_dir;   // Python Token2Wav 模型目录
+    std::string python_t2w_python = "python3"; // Python Token2Wav 解释器
     
     // Python Token2Wav 服务进程 (通过 popen 启动)
     FILE* python_t2w_stdin = nullptr;   // 写入命令
@@ -467,6 +491,9 @@ struct omni_context {
     pid_t python_t2w_pid = -1;          // 进程 ID
     bool python_t2w_initialized = false;
     std::string python_t2w_gpu_id;      // GPU ID (如 "0", "1")
+    // Last reference accepted by the Python service.  One-shot synthesis must
+    // send it explicitly because it deliberately bypasses the streaming cache.
+    std::string python_t2w_ref_audio_path;
     
     // 🔧 Python T2W 独立 GPU 配置
     // C++ LLM+TTS 占用约 22GB，Python T2W 占用约 3.3GB
@@ -492,6 +519,8 @@ struct omni_context {
     llama_token special_token_chunk_tts_eos = -1;// <|chunk_tts_eos|>: TTS chunk 结束
     llama_token special_token_turn_eos = -1;     // <|turn_eos|>: 轮次结束
     llama_token special_token_tts_eos = -1;      // <|tts_eos|>: 旧版 TTS 结束
+    llama_token special_token_im_end = -1;       // <|im_end|>: ChatML 消息结束
+    llama_token special_token_slash_s = -1;      // </s>: 兼容模型显式终止符
     llama_token special_token_eos = -1;          // </s>: 序列结束
     llama_token tts_bos_token_id = -1;           // <|tts_bos|>: TTS 开始（用于双工强制继续说话）
     llama_token special_token_unit_end = -1;     // </unit>: unit 结束标记（双工 chunk 边界）
@@ -513,8 +542,14 @@ struct omni_embed * omni_audio_embed_make_with_filename(struct audition_ctx * ct
 //
 // omni main
 //
+// Resolve the runtime Token2Wav device.  An explicit OMNI_T2W_DEVICE wins;
+// CANN builds otherwise default to the first Ascend NPU, while CUDA/CPU builds
+// retain the historical GPU default.
+std::string omni_default_token2wav_device();
+void omni_bind_device();
+
 struct omni_context * omni_init(struct common_params * params, int media_type, bool use_tts, std::string tts_bin_dir,
-                                int tts_gpu_layers = -1, const std::string & token2wav_device = "gpu:0",
+                                int tts_gpu_layers = -1, const std::string & token2wav_device = omni_default_token2wav_device(),
                                 bool duplex_mode = false,
                                 llama_model * existing_model = nullptr, llama_context * existing_ctx = nullptr,
                                 const std::string & base_output_dir = "./tools/omni/output");
@@ -524,6 +559,10 @@ void omni_free(struct omni_context * ctx_omni);
 // new session, without tearing down the loaded model (unlike omni_free).
 void omni_prepare_for_reuse(struct omni_context * ctx_omni);
 
+// Update the Python Token2Wav voice-clone cache for the current session.
+// Returns false when Python Token2Wav is disabled or the update fails.
+bool omni_set_token2wav_ref_audio(struct omni_context * ctx_omni, const std::string & ref_audio_path);
+
 // ANE/CoreML warmup — call once after omni_init to pre-load models into NPU
 void omni_warmup_ane(struct omni_context * ctx_omni);
 
@@ -532,6 +571,11 @@ bool omni_tts_queues_empty(struct omni_context * ctx_omni);
 
 // 停止所有线程（在 join 之前调用）
 void omni_stop_threads(struct omni_context * ctx_omni);
+
+// Broadcast a cancellation generation to every live duplex inference stage.
+// The signal remains active until all required stages acknowledge it.
+uint64_t omni_request_break(struct omni_context * ctx_omni);
+void omni_reset_break_state(struct omni_context * ctx_omni);
 
 bool stream_prefill(struct omni_context * ctx_omni,
                             std::string aud_fname,
@@ -588,6 +632,14 @@ struct OmniDuplexFrameResult {
     double   ms_total = 0;          // push_frame → 本帧 result 出队的端到端 wall time
 };
 
+struct OmniDuplexApmAbStats {
+    std::string mode = "disabled";
+    int prepared = 0;
+    int live_calls = 0;
+    int replay_hits = 0;
+    int replay_misses = 0;
+};
+
 // 启动一次 duplex 会话。
 //   ctx_omni      : 已经 omni_init() + ctx_omni->async = true + duplex_mode = true 的上下文
 //   voice_audio   : 用作 voice clone reference 的音频文件路径，可空
@@ -596,6 +648,14 @@ struct OmniDuplexFrameResult {
 bool omni_duplex_session_begin(struct omni_context * ctx_omni,
                                const std::string & voice_audio,
                                const std::string & debug_dir = "./");
+
+bool omni_duplex_set_apm_ab_mode(struct omni_context * ctx_omni,
+                                const std::string & mode);
+bool omni_duplex_prepare_apm_replay(
+    struct omni_context * ctx_omni,
+    const std::vector<OmniDuplexFrame> & frames);
+bool omni_duplex_get_apm_ab_stats(struct omni_context * ctx_omni,
+                                 OmniDuplexApmAbStats * out);
 
 // 提交一帧到 duplex pipeline。立即返回，不等 LLM 完成。
 // 返回值：>=1 表示分配的 frame_id；<0 表示会话未启动或队列异常。
@@ -655,7 +715,8 @@ bool tts_projector_semantic(struct omni_context* ctx_omni, const float * hidden,
 void normalize_l2_per_token(float * embeddings, int n_tokens, int n_embd, float eps = 1e-8f);
 
 // Projector 函数声明（精度验证版本）
-bool projector_init(projector_model & model, const std::string & fname, bool use_cuda);
+bool projector_init(projector_model & model, const std::string & fname, bool use_cuda,
+                    const char * device_name = nullptr);
 void projector_free(projector_model & model);
 std::vector<float> projector_forward(projector_model & model, const float * input_data, int n_tokens);
 

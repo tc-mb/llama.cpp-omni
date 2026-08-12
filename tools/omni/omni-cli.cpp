@@ -17,6 +17,7 @@
 #include <limits.h>
 #include <cinttypes>
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -61,7 +62,14 @@ static void show_usage(const char * prog_name) {
         "  --tts <path>        Override TTS model path\n"
         "  --projector <path>  Override projector model path\n"
         "  --ref-audio <path>  Reference audio for voice cloning (default: tools/omni/assets/default_ref_audio/default_ref_audio.wav)\n"
+        "  -o, --output-dir <path>  Directory for generated TTS artifacts\n"
         "  -c, --ctx-size <n>  Context size (default: 4096)\n"
+        "  -n, --predict <n>   Maximum number of generated LLM tokens (-1 = context limit)\n"
+        "  -s, --seed <n>      Sampling seed (default: random)\n"
+        "  --temp <f>          LLM sampling temperature (default: 0.7)\n"
+        "  --top-p <f>         LLM top-p sampling threshold (default: 0.8)\n"
+        "  --top-k <n>         LLM top-k sampling limit (default: 100)\n"
+        "  --repeat-penalty <f> LLM repetition penalty (default: 1.02)\n"
         "  -ngl <n>            Number of GPU layers (default: 99)\n"
         "  --no-tts            Disable TTS output\n"
         "  --omni              Enable omni mode (audio + vision, media_type=2)\n"
@@ -73,6 +81,7 @@ static void show_usage(const char * prog_name) {
         "                          (off by default; helps large / high-res / high-refresh images)\n"
         "  --test <prefix> <n> Run test case with data prefix and count\n"
         "  --bench-vision <img> Benchmark serial vs batched vision encoding\n"
+        "  -fa, --flash-attn <on|off|auto>  Flash Attention (default: auto)\n"
         "  -h, --help          Show this help message\n\n"
         "Example:\n"
         "  %s -m ./models/MiniCPM-o-4_5-gguf/MiniCPM-o-4_5-Q4_K_M.gguf\n"
@@ -168,7 +177,18 @@ void test_case(struct omni_context *ctx_omni, common_params& params, std::string
     ctx_omni->system_prompt_initialized = false;
     bool orig_async = ctx_omni->async;
     ctx_omni->async = false;  // 使用同步模式 prefill，确保所有数据被处理
-    
+
+    // index=0 initializes the system prompt and the separate voice-cloning
+    // reference audio. User audio starts at index=1; otherwise chunk 0000 is
+    // silently consumed as the reference and never reaches the user prompt.
+    {
+        auto t0 = std::chrono::high_resolution_clock::now();
+        stream_prefill(ctx_omni, std::string(), std::string(), 0);
+        auto t1 = std::chrono::high_resolution_clock::now();
+        std::cout << "prefill init (system prompt) : "
+                  << std::chrono::duration<double>(t1 - t0).count() << " s" << std::endl;
+    }
+
     for (int il = 0; il < cnt; ++il) {
         char idx_str[16];
         snprintf(idx_str, sizeof(idx_str), "%04d", il);  // 格式化为4位数字，如 0000, 0001
@@ -181,10 +201,13 @@ void test_case(struct omni_context *ctx_omni, common_params& params, std::string
             img_fname = img_candidate;
         }
 
+        if (!file_exists(aud_fname)) {
+            fprintf(stderr, "Warning: audio chunk not found, skip: %s\n", aud_fname.c_str());
+            continue;
+        }
+
         auto t0 = std::chrono::high_resolution_clock::now();
-        // index 从 0 开始，第一次 prefill (index=0) 初始化系统 prompt
-        // 后续 prefill 在同步模式下直接添加到 KV cache
-        stream_prefill(ctx_omni, aud_fname, img_fname, il);
+        stream_prefill(ctx_omni, aud_fname, img_fname, il + 1);
         auto t1 = std::chrono::high_resolution_clock::now();
         std::chrono::duration<double> elapsed_seconds = t1 - t0;
         double dt = elapsed_seconds.count();
@@ -215,13 +238,21 @@ int main(int argc, char ** argv) {
     std::string vision_coreml_model_path;  // CoreML model path (required when vision_backend=coreml)
     std::string token2wav_coreml_model_path; // CoreML model path for token2wav DiT (empty = GPU only)
     std::string ref_audio_path = "tools/omni/assets/default_ref_audio/default_ref_audio.wav";
+    std::string output_dir = "./tools/omni/output";
     std::string bench_vision_image;
     int n_ctx = 4096;
+    int n_predict = -1;
+    uint32_t sampling_seed = LLAMA_DEFAULT_SEED;
+    float sampling_temp = 0.7f;
+    float sampling_top_p = 0.8f;
+    int sampling_top_k = 100;
+    float sampling_repeat_penalty = 1.02f;
     int n_gpu_layers = 99;  // GPU 层数，默认 99
     int media_type = 1;     // 1=audio only, 2=omni (audio+vision)
     bool use_tts = true;
     bool run_test = false;
     bool vision_batch_encode = false;  // 多 slice 批量编码优化（默认关闭）
+    enum llama_flash_attn_type flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
     std::string test_audio_prefix;
     int test_count = 0;
     
@@ -235,6 +266,19 @@ int main(int argc, char ** argv) {
         }
         else if (arg == "-m" && i + 1 < argc) {
             llm_path = argv[++i];
+        }
+        else if ((arg == "-fa" || arg == "--flash-attn") && i + 1 < argc) {
+            const std::string value = argv[++i];
+            if (value == "on") {
+                flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+            } else if (value == "off") {
+                flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+            } else if (value == "auto") {
+                flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
+            } else {
+                fprintf(stderr, "Error: unknown value for --flash-attn: '%s' (use on|off|auto)\n", value.c_str());
+                return 1;
+            }
         }
         else if (arg == "--vision" && i + 1 < argc) {
             vision_path_override = argv[++i];
@@ -251,8 +295,65 @@ int main(int argc, char ** argv) {
         else if (arg == "--ref-audio" && i + 1 < argc) {
             ref_audio_path = argv[++i];
         }
+        else if ((arg == "-o" || arg == "--output-dir") && i + 1 < argc) {
+            output_dir = argv[++i];
+            if (output_dir.empty()) {
+                fprintf(stderr, "Error: --output-dir must not be empty\n");
+                return 1;
+            }
+        }
         else if ((arg == "-c" || arg == "--ctx-size") && i + 1 < argc) {
             n_ctx = std::atoi(argv[++i]);
+        }
+        else if ((arg == "-n" || arg == "--predict") && i + 1 < argc) {
+            const char * value = argv[++i];
+            char * end = nullptr;
+            long parsed = std::strtol(value, &end, 10);
+            if (end == value || *end != '\0' || parsed < -1 || parsed > INT_MAX) {
+                fprintf(stderr, "Error: --predict must be -1 or a non-negative integer, got '%s'\n", value);
+                return 1;
+            }
+            n_predict = static_cast<int>(parsed);
+        }
+        else if ((arg == "-s" || arg == "--seed") && i + 1 < argc) {
+            const char * value = argv[++i];
+            char * end = nullptr;
+            unsigned long long parsed = std::strtoull(value, &end, 10);
+            if (end == value || *end != '\0' || parsed > UINT32_MAX) {
+                fprintf(stderr, "Error: --seed must be an unsigned 32-bit integer, got '%s'\n", value);
+                return 1;
+            }
+            sampling_seed = static_cast<uint32_t>(parsed);
+        }
+        else if ((arg == "--temp" || arg == "--top-p" || arg == "--repeat-penalty") && i + 1 < argc) {
+            const char * value = argv[++i];
+            char * end = nullptr;
+            const float parsed = std::strtof(value, &end);
+            const bool valid_number = end != value && *end == '\0' && std::isfinite(parsed);
+            if (!valid_number ||
+                (arg == "--temp" && parsed < 0.0f) ||
+                (arg == "--top-p" && (parsed <= 0.0f || parsed > 1.0f)) ||
+                (arg == "--repeat-penalty" && parsed <= 0.0f)) {
+                fprintf(stderr, "Error: invalid %s value '%s'\n", arg.c_str(), value);
+                return 1;
+            }
+            if (arg == "--temp") {
+                sampling_temp = parsed;
+            } else if (arg == "--top-p") {
+                sampling_top_p = parsed;
+            } else {
+                sampling_repeat_penalty = parsed;
+            }
+        }
+        else if (arg == "--top-k" && i + 1 < argc) {
+            const char * value = argv[++i];
+            char * end = nullptr;
+            const long parsed = std::strtol(value, &end, 10);
+            if (end == value || *end != '\0' || parsed < 0 || parsed > INT_MAX) {
+                fprintf(stderr, "Error: --top-k must be a non-negative integer, got '%s'\n", value);
+                return 1;
+            }
+            sampling_top_k = static_cast<int>(parsed);
         }
         else if (arg == "-ngl" && i + 1 < argc) {
             n_gpu_layers = std::atoi(argv[++i]);
@@ -368,7 +469,16 @@ int main(int argc, char ** argv) {
     params.token2wav_coreml_model_path = token2wav_coreml_model_path;
     params.vpm_batch_encode = vision_batch_encode;
     params.n_ctx = n_ctx;
+    params.n_predict = n_predict;
+    params.sampling.seed = sampling_seed;
+    params.sampling.temp = sampling_temp;
+    params.sampling.top_p = sampling_top_p;
+    params.sampling.top_k = sampling_top_k;
+    params.sampling.min_p = 0.0f;
+    params.sampling.penalty_repeat = sampling_repeat_penalty;
+    params.sampling.penalty_last_n = 128;
     params.n_gpu_layers = n_gpu_layers;
+    params.flash_attn_type = flash_attn_type;
     
     // Projector 路径需要通过 tts_bin_dir 传递
     // omni.cpp 中 projector 路径计算: gguf_root_dir + "/projector.gguf"
@@ -385,6 +495,7 @@ int main(int argc, char ** argv) {
     printf("  TTS enabled: %s\n", use_tts ? "yes" : "no");
     printf("  Context size: %d\n", n_ctx);
     printf("  GPU layers: %d\n", n_gpu_layers);
+    printf("  Flash Attention: %s\n", llama_flash_attn_type_name(flash_attn_type));
     printf("  Vision backend: %s\n", vision_backend.c_str());
     printf("  Vision batch encode: %s\n", vision_batch_encode ? "enabled" : "disabled");
     if (vision_backend == "coreml") {
@@ -392,12 +503,15 @@ int main(int argc, char ** argv) {
     }
     printf("  TTS bin dir: %s\n", tts_bin_dir.c_str());
     printf("  Ref audio: %s\n", ref_audio_path.c_str());
+    printf("  Output dir: %s\n", output_dir.c_str());
     if (!params.token2wav_coreml_model_path.empty()) {
         printf("  T2W CoreML: %s\n", params.token2wav_coreml_model_path.c_str());
     }
     
     // 🔧 Token2Wav 使用 GPU（Metal），已用 ggml_add+ggml_repeat 替代不支持的 ggml_add1
-    auto ctx_omni = omni_init(&params, media_type, use_tts, tts_bin_dir, -1, "gpu:0");
+    auto ctx_omni = omni_init(&params, media_type, use_tts, tts_bin_dir, -1,
+                              omni_default_token2wav_device(), /*duplex_mode=*/false,
+                              /*existing_model=*/nullptr, /*existing_ctx=*/nullptr, output_dir);
     if (ctx_omni == nullptr) {
         fprintf(stderr, "Error: Failed to initialize omni context\n");
         return 1;

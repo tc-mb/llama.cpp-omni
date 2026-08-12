@@ -24,6 +24,11 @@
 
 #include "ggml-backend-impl.h"
 #include "ggml-cann/aclnn_ops.h"
+#include "ggml-cann/affine_layer_norm.h"
+#include "ggml-cann/attn_time_pack.h"
+#include "ggml-cann/im2col1d.h"
+#include "ggml-cann/kv_pair_update.h"
+#include "ggml-cann/modulate_fusion.h"
 #include "ggml-cann/common.h"
 #include "ggml-impl.h"
 #include "ggml.h"
@@ -72,6 +77,18 @@
 
 // Thread-local variable to record the current device of this thread.
 thread_local int g_current_cann_device = -1;
+
+// Serialize ACL GLOBAL graph capture against host/device copies and stream
+// synchronization on the same device. CaptureBegin(GLOBAL) forbids these APIs
+// from any thread until CaptureEnd;
+// omni runs LLM decode and TTS paths concurrently on one NPU, so without this
+// lock a sched input staging set_tensor can abort mid-capture.
+static std::mutex g_cann_device_op_mutexes[GGML_CANN_MAX_DEVICES];
+
+static std::mutex & ggml_cann_device_op_mutex(int32_t device) {
+    GGML_ASSERT(device >= 0 && device < GGML_CANN_MAX_DEVICES);
+    return g_cann_device_op_mutexes[device];
+}
 
 /**
  * @brief Set the CANN device to be used.
@@ -1281,9 +1298,11 @@ static void ggml_backend_cann_buffer_set_tensor(ggml_backend_buffer_t buffer,
     ggml_backend_cann_buffer_context * ctx = (ggml_backend_cann_buffer_context *) buffer->context;
 
     ggml_cann_set_device(ctx->device);
+    // Must not overlap CaptureBegin(GLOBAL)..CaptureEnd on this device.
+    std::lock_guard<std::mutex> device_lock(ggml_cann_device_op_mutex(ctx->device));
 
     // Only check env once.
-    static bool weight_to_nz = parse_bool(get_env_as_lowercase("GGML_CANN_WEIGHT_NZ").value_or("on"));
+    static bool weight_to_nz = parse_bool(get_env_as_lowercase("GGML_CANN_WEIGHT_NZ").value_or(""));
 
     bool is_quantized = need_transform(tensor->type);
     bool is_nz        = !is_quantized && tensor->type != GGML_TYPE_BF16 && weight_to_nz &&
@@ -1371,6 +1390,7 @@ static void ggml_backend_cann_buffer_get_tensor(ggml_backend_buffer_t buffer,
     ggml_backend_cann_buffer_context * ctx = (ggml_backend_cann_buffer_context *) buffer->context;
 
     ggml_cann_set_device(ctx->device);
+    std::lock_guard<std::mutex> device_lock(ggml_cann_device_op_mutex(ctx->device));
 
     if (!need_transform(tensor->type)) {
         ACL_CHECK(aclrtMemcpy(data, size, (char *) tensor->data + offset, size, ACL_MEMCPY_DEVICE_TO_HOST));
@@ -1405,6 +1425,7 @@ static bool ggml_backend_cann_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
         size_t memcpy_size = ggml_nbytes(src);
         // Same device.
         if (src_ctx->device == dst_ctx->device) {
+            std::lock_guard<std::mutex> device_lock(ggml_cann_device_op_mutex(src_ctx->device));
             ACL_CHECK(aclrtMemcpy((char *) dst->data, memcpy_size, (const char *) src->data, memcpy_size,
                                   ACL_MEMCPY_DEVICE_TO_DEVICE));
             return true;
@@ -1417,6 +1438,11 @@ static bool ggml_backend_cann_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
             int32_t canAccessPeer = 0;
             ACL_CHECK(aclrtDeviceCanAccessPeer(&canAccessPeer, src_ctx->device, dst_ctx->device));
             if (canAccessPeer) {
+                // Lock both devices in a stable order to avoid A-B / B-A deadlock.
+                const int32_t dev_a = src_ctx->device < dst_ctx->device ? src_ctx->device : dst_ctx->device;
+                const int32_t dev_b = src_ctx->device < dst_ctx->device ? dst_ctx->device : src_ctx->device;
+                std::lock_guard<std::mutex> lock_a(ggml_cann_device_op_mutex(dev_a));
+                std::lock_guard<std::mutex> lock_b(ggml_cann_device_op_mutex(dev_b));
                 ggml_cann_set_device(src_ctx->device);
                 ACL_CHECK(aclrtDeviceEnablePeerAccess(dst_ctx->device, 0));
                 ACL_CHECK(aclrtMemcpy((char *) dst->data, memcpy_size, (const char *) src->data, memcpy_size,
@@ -1441,6 +1467,7 @@ static void ggml_backend_cann_buffer_memset_tensor(ggml_backend_buffer_t buffer,
     ggml_backend_cann_buffer_context * ctx = (ggml_backend_cann_buffer_context *) buffer->context;
 
     ggml_cann_set_device(ctx->device);
+    std::lock_guard<std::mutex> device_lock(ggml_cann_device_op_mutex(ctx->device));
     ACL_CHECK(aclrtMemset((char *) tensor->data + offset, size, value, size));
 }
 
@@ -1551,7 +1578,7 @@ static size_t ggml_backend_cann_buffer_type_get_alloc_size(ggml_backend_buffer_t
     int64_t ne0  = tensor->ne[0];
 
     // Only check env once.
-    static bool weight_to_nz = parse_bool(get_env_as_lowercase("GGML_CANN_WEIGHT_NZ").value_or("on"));
+    static bool weight_to_nz = parse_bool(get_env_as_lowercase("GGML_CANN_WEIGHT_NZ").value_or(""));
 
     // last line must bigger than 32, because every single op deal at
     // least 32 bytes.
@@ -1967,7 +1994,9 @@ static bool ggml_cann_compute_forward(ggml_backend_cann_context & ctx, struct gg
             ggml_cann_rope(ctx, dst);
             break;
         case GGML_OP_IM2COL:
-            ggml_cann_im2col(ctx, dst);
+            if (!ggml_cann_im2col1d_try(ctx, dst)) {
+                ggml_cann_im2col(ctx, dst);
+            }
             break;
         case GGML_OP_POOL_2D:
             ggml_cann_pool2d(ctx, dst);
@@ -2065,8 +2094,16 @@ static const char * ggml_backend_cann_name(ggml_backend_t backend) {
  */
 static void ggml_backend_cann_free(ggml_backend_t backend) {
     ggml_backend_cann_context * cann_ctx = (ggml_backend_cann_context *) backend->context;
+
+    // Backend destruction may run on a WebSocket worker thread that never
+    // selected this device, or after another backend reset its thread-local
+    // ACL context. Rebind unconditionally before the final synchronize/reset.
+    g_current_cann_device = -1;
+    ggml_cann_set_device(cann_ctx->device);
+    std::lock_guard<std::mutex> device_lock(ggml_cann_device_op_mutex(cann_ctx->device));
     ACL_CHECK(aclrtSynchronizeDevice());
     ACL_CHECK(aclrtResetDevice(cann_ctx->device));
+    g_current_cann_device = -1;
 
     delete cann_ctx;
     delete backend;
@@ -2098,6 +2135,7 @@ static void ggml_backend_cann_set_tensor_async(ggml_backend_t backend,
     // token2wav thread) may reach here as their first CANN call, and
     // aclrtMemcpyAsync requires a thread-local ACL context.
     ggml_cann_set_device(cann_ctx->device);
+    std::lock_guard<std::mutex> device_lock(ggml_cann_device_op_mutex(cann_ctx->device));
     ACL_CHECK(aclrtMemcpyAsync((char *) tensor->data + offset, size, data, size, ACL_MEMCPY_HOST_TO_DEVICE,
                                cann_ctx->stream()));
 }
@@ -2126,6 +2164,7 @@ static void ggml_backend_cann_get_tensor_async(ggml_backend_t      backend,
 
     // Same as set_tensor_async: ensure this thread has an ACL context.
     ggml_cann_set_device(cann_ctx->device);
+    std::lock_guard<std::mutex> device_lock(ggml_cann_device_op_mutex(cann_ctx->device));
     ACL_CHECK(aclrtMemcpyAsync(data, size, (char *) tensor->data + offset, size, ACL_MEMCPY_DEVICE_TO_HOST,
                                cann_ctx->stream()));
 }
@@ -2221,6 +2260,7 @@ static bool ggml_backend_cann_cpy_tensor_async(ggml_backend_t      backend_src,
 static void ggml_backend_cann_synchronize(ggml_backend_t backend) {
     ggml_backend_cann_context * cann_ctx = (ggml_backend_cann_context *) backend->context;
     ggml_cann_set_device(cann_ctx->device);
+    std::lock_guard<std::mutex> device_lock(ggml_cann_device_op_mutex(cann_ctx->device));
     ACL_CHECK(aclrtSynchronizeStream(cann_ctx->stream()));
 }
 
@@ -2276,7 +2316,11 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
                                             bool                        use_cann_graph,
                                             bool                        cann_graph_capture_required) {
 #ifdef USE_ACL_GRAPH
+    // Hold the per-device op mutex across the entire GLOBAL capture window so
+    // concurrent threads cannot issue sync memcpy (set_tensor etc.) mid-capture.
+    std::unique_lock<std::mutex> capture_lock(ggml_cann_device_op_mutex(cann_ctx->device), std::defer_lock);
     if (use_cann_graph && cann_graph_capture_required) {  // Begin CANN graph capture
+        capture_lock.lock();
         ACL_CHECK(aclmdlRICaptureBegin(cann_ctx->stream(), ACL_MODEL_RI_CAPTURE_MODE_GLOBAL));
     }
 #endif  // USE_ACL_GRAPH
@@ -2284,9 +2328,100 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
     // With the use of CANN graphs, the execution will be performed by the graph launch.
     static bool opt_fusion = parse_bool(get_env_as_lowercase("GGML_CANN_OPERATOR_FUSION").value_or(""));
 
+    const auto requires_execution = [](const ggml_tensor * tensor) {
+        return !ggml_is_empty(tensor) &&
+               tensor->op != GGML_OP_RESHAPE &&
+               tensor->op != GGML_OP_TRANSPOSE &&
+               tensor->op != GGML_OP_VIEW &&
+               tensor->op != GGML_OP_PERMUTE &&
+               tensor->op != GGML_OP_NONE &&
+               (tensor->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
+    };
+
     if (!use_cann_graph || cann_graph_capture_required) {
+        std::unordered_set<int> fused_node_skips;
+        ggml_cann_unique_consumer_map unique_consumers;
+        const bool modulate_fusion_enabled =
+            ggml_cann_modulate_fusion_enabled();
+        const bool attn_time_pack_enabled =
+            ggml_cann_attn_time_pack_enabled();
+        const bool affine_layer_norm_enabled =
+            ggml_cann_affine_layer_norm_enabled();
+        const bool im2col_ctb_split_enabled =
+            ggml_cann_im2col1d_ctb_split_enabled();
+        if (modulate_fusion_enabled || attn_time_pack_enabled ||
+            affine_layer_norm_enabled || im2col_ctb_split_enabled) {
+            unique_consumers.reserve(static_cast<size_t>(cgraph->n_nodes) * 2);
+            for (int node_index = 0; node_index < cgraph->n_nodes; ++node_index) {
+                ggml_tensor * consumer = cgraph->nodes[node_index];
+                for (int src_index = 0; src_index < GGML_MAX_SRC; ++src_index) {
+                    const ggml_tensor * source = consumer->src[src_index];
+                    if (source == nullptr) {
+                        continue;
+                    }
+                    const auto inserted =
+                        unique_consumers.emplace(source, node_index);
+                    if (!inserted.second) {
+                        inserted.first->second = -1;
+                    }
+                }
+            }
+        }
         for (int i = 0; i < cgraph->n_nodes; i++) {
+            if (fused_node_skips.erase(i) != 0) {
+                continue;
+            }
             ggml_tensor * node = cgraph->nodes[i];
+            if (im2col_ctb_split_enabled && node->op == GGML_OP_CONCAT) {
+                int permute_index = -1;
+                int im2col_index = -1;
+                if (ggml_cann_im2col1d_try_ctb_split(
+                        *cann_ctx,
+                        cgraph,
+                        i,
+                        unique_consumers,
+                        &permute_index,
+                        &im2col_index)) {
+                    fused_node_skips.insert(permute_index);
+                    fused_node_skips.insert(im2col_index);
+                    continue;
+                }
+            }
+            if (attn_time_pack_enabled && node->op == GGML_OP_CONCAT) {
+                int permute_index = -1;
+                int cont_index = -1;
+                if (ggml_cann_attn_time_pack_try(
+                        *cann_ctx, cgraph, i, unique_consumers,
+                        &permute_index, &cont_index)) {
+                    fused_node_skips.insert(permute_index);
+                    fused_node_skips.insert(cont_index);
+                    continue;
+                }
+            }
+            if (modulate_fusion_enabled && node->op == GGML_OP_MUL) {
+                int add1_index = -1;
+                int add2_index = -1;
+                if (ggml_cann_modulate_fusion_try(
+                        *cann_ctx, cgraph, i, unique_consumers,
+                        &add1_index, &add2_index)) {
+                    fused_node_skips.insert(add1_index);
+                    if (add2_index >= 0) {
+                        fused_node_skips.insert(add2_index);
+                    }
+                    continue;
+                }
+            }
+            if (affine_layer_norm_enabled && node->op == GGML_OP_NORM) {
+                int mul_index = -1;
+                int add_index = -1;
+                if (ggml_cann_affine_layer_norm_try(
+                        *cann_ctx, cgraph, i, unique_consumers,
+                        &mul_index, &add_index)) {
+                    fused_node_skips.insert(mul_index);
+                    fused_node_skips.insert(add_index);
+                    continue;
+                }
+            }
             if (opt_fusion) {
                 if (ggml_cann_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_RMS_NORM })) {
                     ggml_cann_op_add_rms_norm_fused(*cann_ctx, node, cgraph->nodes[i + 1]);
@@ -2295,12 +2430,25 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
                 }
             }
 
-            if (ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE ||
-                node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE) {
+            if (!requires_execution(node)) {
                 continue;
             }
 
-            if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            int next_execution = i + 1;
+            while (next_execution < cgraph->n_nodes &&
+                   !requires_execution(cgraph->nodes[next_execution])) {
+                ++next_execution;
+            }
+            if (node->op == GGML_OP_SET_ROWS &&
+                ggml_cann_kv_pair_update_try(
+                    *cann_ctx,
+                    node,
+                    next_execution < cgraph->n_nodes
+                        ? cgraph->nodes[next_execution]
+                        : nullptr)) {
+                // Metadata-only nodes between K and V have no device work.
+                // Skip them together with the fused V root.
+                i = next_execution;
                 continue;
             }
 
@@ -2319,6 +2467,7 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
 
         if (cann_graph_capture_required) {  // End CANN graph capture
             ACL_CHECK(aclmdlRICaptureEnd(cann_ctx->stream(), &matched_graph->graph));
+            capture_lock.unlock();
         }
 
         // Execute CANN graph
@@ -2349,10 +2498,10 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, 
 
     bool graph_capture_required = false;
 #ifdef USE_ACL_GRAPH
-    bool use_cann_graph = true;
+    bool use_cann_graph = !cann_ctx->graph_bypass.disabled();
 
     static bool prefill_use_graph = parse_bool(get_env_as_lowercase("GGML_CANN_PREFILL_USE_GRAPH").value_or(""));
-    if (!prefill_use_graph) {
+    if (use_cann_graph && !prefill_use_graph) {
         // Do not use acl_graph for prefill.
         for (int i = 0; i < cgraph->n_nodes; i++) {
             ggml_tensor * node = cgraph->nodes[i];
@@ -2393,6 +2542,7 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, 
             }
         }
     }
+
 #else
     bool use_cann_graph = false;
 #endif  // USE_ACL_GRAPH
@@ -2983,10 +3133,38 @@ static ggml_backend_dev_t ggml_backend_cann_reg_get_device(ggml_backend_reg_t re
     return ctx->devices[index];
 }
 
+static void ggml_backend_cann_set_disable_graph(ggml_backend_t backend, bool disable) {
+    if (!ggml_backend_is_cann(backend)) {
+        return;
+    }
+#ifdef USE_ACL_GRAPH
+    ggml_backend_cann_context * ctx = (ggml_backend_cann_context *) backend->context;
+    ctx->graph_bypass.set_disabled(disable);
+#else
+    GGML_UNUSED(disable);
+#endif
+}
+static bool ggml_backend_cann_graph_enabled(ggml_backend_t backend) {
+    if (!ggml_backend_is_cann(backend)) {
+        return false;
+    }
+#ifdef USE_ACL_GRAPH
+    ggml_backend_cann_context * ctx = (ggml_backend_cann_context *) backend->context;
+    return ctx->acl_graph_mode;
+#else
+    return false;
+#endif
+}
+
+
 static void * ggml_backend_cann_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
-    GGML_UNUSED(name);
-    // reserved for future use
+    if (strcmp(name, "ggml_backend_cann_set_disable_graph") == 0) {
+        return (void *) ggml_backend_cann_set_disable_graph;
+    }
+    if (strcmp(name, "ggml_backend_cann_graph_enabled") == 0) {
+        return (void *) ggml_backend_cann_graph_enabled;
+    }
     return nullptr;
 }
 

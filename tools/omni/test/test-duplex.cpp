@@ -39,6 +39,22 @@
 
 static volatile bool g_is_interrupted = false;
 
+static bool parse_apm_ab_mode(const char * value, std::string & mode) {
+    mode = (value && *value) ? value : "baseline";
+    return mode == "baseline" || mode == "replay";
+}
+
+static int apm_ab_self_test() {
+    std::string mode;
+    if (!parse_apm_ab_mode(nullptr, mode) || mode != "baseline") return 1;
+    if (!parse_apm_ab_mode("", mode) || mode != "baseline") return 2;
+    if (!parse_apm_ab_mode("baseline", mode) || mode != "baseline") return 3;
+    if (!parse_apm_ab_mode("replay", mode) || mode != "replay") return 4;
+    if (parse_apm_ab_mode("invalid", mode)) return 5;
+    printf("[apm-ab] self-test passed\n");
+    return 0;
+}
+
 #if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__)) || defined(_WIN32)
 static void sigint_handler(int signo) {
     if (signo == SIGINT) {
@@ -93,10 +109,11 @@ static TestModelPaths resolve_model_paths(const std::string & llm_path) {
 
 // ==================== 双工测试核心 ====================
 
-static void duplex_test_case(struct omni_context * ctx_omni,
+static bool duplex_test_case(struct omni_context * ctx_omni,
                              const std::string & data_path_prefix,
                              int cnt,
-                             int stream_interval_ms) {
+                             int stream_interval_ms,
+                             const std::string & apm_ab_mode) {
     printf("\n=== Duplex test: %d chunks, interval=%dms ===\n", cnt, stream_interval_ms);
 
     // 准备 N 个 chunk 的 (audio, image) 文件路径
@@ -109,19 +126,38 @@ static void duplex_test_case(struct omni_context * ctx_omni,
         frames[il].user_seq = il + 1;
         if (!file_exists(frames[il].aud_fname)) {
             fprintf(stderr, "[错误] 音频不存在: %s\n", frames[il].aud_fname.c_str());
-            return;
+            return false;
         }
     }
 
     if (!omni_duplex_session_begin(ctx_omni, /*voice_audio=*/"", /*debug_dir=*/"./")) {
         fprintf(stderr, "[错误] omni_duplex_session_begin failed\n");
-        return;
+        return false;
+    }
+
+    if (!omni_duplex_set_apm_ab_mode(ctx_omni, apm_ab_mode)) {
+        fprintf(stderr, "[apm-ab] failed to configure mode=%s\n", apm_ab_mode.c_str());
+        omni_duplex_session_end(ctx_omni);
+        return false;
+    }
+    if (apm_ab_mode == "replay"
+        && !omni_duplex_prepare_apm_replay(ctx_omni, frames)) {
+        fprintf(stderr, "[apm-ab] replay preparation failed\n");
+        OmniDuplexApmAbStats stats;
+        if (omni_duplex_get_apm_ab_stats(ctx_omni, &stats)) {
+            printf("[apm-ab] summary mode=%s prepared=%d live=%d hit=%d miss=%d\n",
+                   stats.mode.c_str(), stats.prepared, stats.live_calls,
+                   stats.replay_hits, stats.replay_misses);
+        }
+        omni_duplex_session_end(ctx_omni);
+        return false;
     }
 
     auto total_t0 = std::chrono::high_resolution_clock::now();
 
     // push 节奏 = stream_interval_ms。push 本身非阻塞（除非内部队列满），
     // 因此即便 LLM 处理慢于 push 间隔，pipeline 仍能把后续帧排队等候。
+    std::atomic<bool> push_ok{true};
     std::thread producer([&]() {
         auto t_start = std::chrono::high_resolution_clock::now();
         for (int il = 0; il < cnt && !g_is_interrupted; ++il) {
@@ -131,6 +167,7 @@ static void duplex_test_case(struct omni_context * ctx_omni,
             }
             if (omni_duplex_push_frame(ctx_omni, frames[il]) < 0) {
                 fprintf(stderr, "[push] frame %d 提交失败\n", il + 1);
+                push_ok.store(false);
                 break;
             }
         }
@@ -166,6 +203,32 @@ static void duplex_test_case(struct omni_context * ctx_omni,
            completed ? sum_decode / completed : 0,
            completed ? sum_e2e    / completed : 0,
            speak, listen);
+
+    OmniDuplexApmAbStats stats;
+    if (!omni_duplex_get_apm_ab_stats(ctx_omni, &stats)) {
+        fprintf(stderr, "[apm-ab] failed to read summary counters\n");
+        return false;
+    }
+    printf("[apm-ab] summary mode=%s prepared=%d live=%d hit=%d miss=%d\n",
+           stats.mode.c_str(), stats.prepared, stats.live_calls,
+           stats.replay_hits, stats.replay_misses);
+
+    if (apm_ab_mode == "replay") {
+        const bool replay_ok = stats.mode == "replay"
+            && stats.prepared == cnt
+            && stats.live_calls == 0
+            && stats.replay_hits == cnt
+            && stats.replay_misses == 0
+            && completed == cnt
+            && push_ok.load();
+        if (!replay_ok) {
+            fprintf(stderr,
+                    "[apm-ab] replay validation failed: expected prepared=hit=%d, live=miss=0\n",
+                    cnt);
+            return false;
+        }
+    }
+    return true;
 }
 
 // ==================== 帮助信息 ====================
@@ -190,8 +253,10 @@ static void show_usage(const char * prog_name) {
         "  --vision-coreml <p>   CoreML/ANE 模型路径 (.mlmodelc)；--vision-backend=coreml 时\n"
         "                        若未指定则默认 <llm 同级目录>/vision/coreml_minicpmo45_vit_all_f16.mlmodelc\n"
         "  --test <prefix> <n> 指定测试数据前缀和 chunk 数量\n"
+        "  --force-listen-count <n>  覆盖会话开局强制 LISTEN 次数\n"
         "  --stream-interval <ms>  push frame 的最小间隔 (默认 0=背靠背压测；\n"
         "                          设为 1000 模拟真实 MiniCPM-o 流式输入)\n"
+        "  env DUPLEX_APM_AB_MODE=baseline|replay (default: baseline)\n"
         "  -o <dir>            输出目录 (默认: ./tools/omni/output)\n"
         "  -h, --help          显示帮助\n\n"
         "Example:\n"
@@ -204,7 +269,16 @@ static void show_usage(const char * prog_name) {
 // ==================== Main ====================
 
 int main(int argc, char ** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--apm-ab-self-test") {
+        return apm_ab_self_test();
+    }
     ggml_time_init();
+
+    std::string apm_ab_mode;
+    if (!parse_apm_ab_mode(std::getenv("DUPLEX_APM_AB_MODE"), apm_ab_mode)) {
+        fprintf(stderr, "Error: DUPLEX_APM_AB_MODE must be baseline or replay\n");
+        return 2;
+    }
 
     std::string llm_path;
     std::string vision_path_override;
@@ -221,12 +295,10 @@ int main(int argc, char ** argv) {
     bool use_tts = true;
     bool run_test = false;
     int  stream_interval_ms = 0;  // 0 = 背靠背（压测）；真实流式建议 1000
+    int  force_listen_count = -1; // -1 = 使用 omni 默认值
     std::string test_prefix;
     int test_count = 0;
-    std::string token2wav_device = "gpu";
-    if (const char * v = std::getenv("OMNI_T2W_DEVICE")) {
-        if (*v) token2wav_device = v;
-    }
+    std::string token2wav_device = omni_default_token2wav_device();
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -265,6 +337,9 @@ int main(int argc, char ** argv) {
         else if (arg == "--stream-interval" && i + 1 < argc) {
             stream_interval_ms = std::atoi(argv[++i]);
         }
+        else if (arg == "--force-listen-count" && i + 1 < argc) {
+            force_listen_count = std::atoi(argv[++i]);
+        }
         else {
             fprintf(stderr, "Unknown argument: %s\n", arg.c_str());
             show_usage(argv[0]);
@@ -300,6 +375,7 @@ int main(int argc, char ** argv) {
     printf("  Vision: %s (backend=%s)\n", paths.vision.c_str(), vision_backend.c_str());
     printf("  Audio:  %s\n", paths.audio.c_str());
     printf("  TTS:    %s (use_tts=%d)\n", paths.tts.c_str(), use_tts ? 1 : 0);
+    printf("  APM A/B: %s\n", apm_ab_mode.c_str());
     if (vision_backend == "coreml") {
         struct stat st;
         bool ok = (stat(paths.vision_coreml.c_str(), &st) == 0);
@@ -349,12 +425,18 @@ int main(int argc, char ** argv) {
     }
     ctx_omni->async = true;
     ctx_omni->ref_audio_path = ref_audio_path;
+    if (force_listen_count >= 0) {
+        ctx_omni->force_listen_count = force_listen_count;
+        ctx_omni->force_listen_used = 0;
+        printf("  Force LISTEN count: %d\n", force_listen_count);
+    }
 
     const std::string default_prefix = "tools/omni/assets/test_case/audio_test_case/audio_test_case_";
-    duplex_test_case(ctx_omni,
-                     run_test ? test_prefix : default_prefix,
-                     run_test ? test_count  : 2,
-                     stream_interval_ms);
+    const bool apm_ab_ok = duplex_test_case(ctx_omni,
+                                            run_test ? test_prefix : default_prefix,
+                                            run_test ? test_count  : 2,
+                                            stream_interval_ms,
+                                            apm_ab_mode);
 
     // 等所有 speak 帧的 audio 文件落盘后再销毁；omni_free 会处理后续所有线程 join。
     omni_duplex_drain_tts_audio(ctx_omni);
@@ -362,5 +444,6 @@ int main(int argc, char ** argv) {
     omni_free(ctx_omni);
 
     printf("\n=== Duplex test finished ===\n");
+    if (apm_ab_mode == "replay" && !apm_ab_ok) return 2;
     return 0;
 }

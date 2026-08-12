@@ -4455,6 +4455,50 @@ struct ggml_tensor * ggml_im2col(
     return result;
 }
 
+struct ggml_tensor * ggml_im2col_causal_1d(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        int                   s0,
+        int                   p0,
+        int                   d0,
+        enum ggml_type        dst_type) {
+    struct ggml_tensor * result = ggml_im2col(ctx, a, b, s0, 0, p0, 0, d0, 0, false, dst_type);
+    ggml_set_op_params_i32(result, 7, GGML_IM2COL_CAUSAL_1D_MARKER_V1);
+    return result;
+}
+
+struct ggml_tensor * ggml_im2col_causal_ctb_1d(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        int                   s0,
+        int                   p0,
+        int                   d0,
+        enum ggml_type        dst_type) {
+    GGML_ASSERT(b != NULL);
+    // Expose [T, C, B] logical dimensions to the standard im2col shape
+    // calculation without materializing the transpose. The CANN CTB kernel
+    // consumes the underlying contiguous [C, T, B] storage directly.
+    struct ggml_tensor * b_tcb = ggml_permute(ctx, b, 1, 0, 2, 3);
+    struct ggml_tensor * result = ggml_im2col(ctx, a, b_tcb, s0, 0, p0, 0, d0, 0, false, dst_type);
+    ggml_set_op_params_i32(result, 7, GGML_IM2COL_CAUSAL_CTB_1D_MARKER_V1);
+    return result;
+}
+struct ggml_tensor * ggml_im2col_vocoder_1d(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        int                   s0,
+        int                   p0,
+        int                   d0,
+        enum ggml_type        dst_type) {
+    struct ggml_tensor * result = ggml_im2col(ctx, a, b, s0, 0, p0, 0, d0, 0, false, dst_type);
+    ggml_set_op_params_i32(result, 7, GGML_IM2COL_VOCODER_1D_MARKER_V1);
+    return result;
+}
+
+
 struct ggml_tensor * ggml_im2col_back(
         struct ggml_context * ctx,
         struct ggml_tensor  * a,

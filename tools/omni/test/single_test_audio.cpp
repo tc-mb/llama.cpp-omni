@@ -18,6 +18,7 @@
 
 #include "omni-impl.h"
 #include "omni.h"
+#include "audition.h"
 
 #include "arg.h"
 #include "log.h"
@@ -146,6 +147,51 @@ static void run_audio_test(struct omni_context * ctx_omni,
     stream_decode(ctx_omni, "./");
 }
 
+// Isolate the Whisper/APM encoder from LLM prefill and decode. Model loading is
+// intentionally outside the measured region; every WAV produces one timing row.
+static bool run_audio_encode_only(struct audition_ctx * ctx_audio,
+                                  int n_threads,
+                                  const std::string & data_path_prefix,
+                                  int cnt) {
+    double total_ms = 0.0;
+    int completed = 0;
+
+    for (int il = 0; il < cnt; ++il) {
+        char idx_str[16];
+        snprintf(idx_str, sizeof(idx_str), "%04d", il);
+        const std::string aud_fname = data_path_prefix + idx_str + ".wav";
+
+        if (!file_exists(aud_fname)) {
+            fprintf(stderr, "Error: audio chunk not found: %s\n", aud_fname.c_str());
+            return false;
+        }
+
+        const auto t0 = std::chrono::steady_clock::now();
+        omni_embed * embeds = omni_audio_embed_make_with_filename(
+            ctx_audio, n_threads, aud_fname);
+        const auto t1 = std::chrono::steady_clock::now();
+        const double elapsed_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+        if (embeds == nullptr || embeds->n_pos <= 0) {
+            fprintf(stderr, "Error: audio encoder failed: %s\n", aud_fname.c_str());
+            if (embeds != nullptr) {
+                omni_embed_free(embeds);
+            }
+            return false;
+        }
+
+        printf("[timing] whisper_encode index=%d n_pos=%d total=%.3fms file=%s\n",
+               il, embeds->n_pos, elapsed_ms, aud_fname.c_str());
+        total_ms += elapsed_ms;
+        ++completed;
+        omni_embed_free(embeds);
+    }
+
+    printf("[timing-total] whisper_encode count=%d total=%.3fms avg=%.3fms\n",
+           completed, total_ms, completed > 0 ? total_ms / completed : 0.0);
+    return completed == cnt;
+}
+
 static void show_usage(const char * prog_name) {
     printf(
         "MiniCPM-o Singleplex Audio-only Test\n\n"
@@ -158,6 +204,7 @@ static void show_usage(const char * prog_name) {
         "  --tts <path>           覆盖 TTS 模型路径\n"
         "  --projector <path>     覆盖 projector 模型路径\n"
         "  --ref-audio <path>     参考音频路径 (voice clone)\n"
+        "  --audio-encode-only    仅执行 Whisper/APM 编码，不做 LLM prefill/decode/TTS\n"
         "  -c, --ctx-size <n>     上下文大小 (默认 4096)\n"
         "  -ngl <n>               GPU 层数 (默认 99)\n"
         "  --no-tts               禁用 TTS\n"
@@ -180,6 +227,7 @@ int main(int argc, char ** argv) {
     int n_ctx = 4096;
     int n_gpu_layers = 99;
     bool use_tts = true;
+    bool audio_encode_only = false;
     std::string test_audio_prefix;
     int test_count = 0;
 
@@ -204,6 +252,9 @@ int main(int argc, char ** argv) {
         } else if (arg == "-ngl" && i + 1 < argc) {
             n_gpu_layers = std::atoi(argv[++i]);
         } else if (arg == "--no-tts") {
+            use_tts = false;
+        } else if (arg == "--audio-encode-only") {
+            audio_encode_only = true;
             use_tts = false;
         } else if (arg == "--test" && i + 2 < argc) {
             test_audio_prefix = argv[++i];
@@ -232,7 +283,7 @@ int main(int argc, char ** argv) {
     if (!projector_path_override.empty()) paths.projector = projector_path_override;
     print_model_paths(paths);
 
-    if (!file_exists(paths.llm)) {
+    if (!audio_encode_only && !file_exists(paths.llm)) {
         fprintf(stderr, "Error: LLM model not found: %s\n", paths.llm.c_str());
         return 1;
     }
@@ -256,15 +307,33 @@ int main(int argc, char ** argv) {
 
     common_init();
 
+    if (audio_encode_only) {
+        printf("=== Initializing Whisper/APM Context ===\n");
+        printf("  Audio model:  %s\n", paths.audio.c_str());
+        printf("  CPU threads:  %d\n", params.cpuparams.n_threads);
+        audition_ctx * ctx_audio = audition_init(
+            paths.audio.c_str(), audition_context_params{true, GGML_LOG_LEVEL_INFO});
+        if (ctx_audio == nullptr) {
+            fprintf(stderr, "Error: Failed to initialize Whisper/APM context\n");
+            return 1;
+        }
+        const bool ok = run_audio_encode_only(
+            ctx_audio, params.cpuparams.n_threads, test_audio_prefix, test_count);
+        audition_free(ctx_audio);
+        return ok ? 0 : 1;
+    }
+
     printf("=== Initializing Omni Context (audio only) ===\n");
     printf("  TTS enabled:  %s\n", use_tts ? "yes" : "no");
     printf("  Context size: %d\n", n_ctx);
     printf("  GPU layers:   %d\n", n_gpu_layers);
     printf("  TTS bin dir:  %s\n", tts_bin_dir.c_str());
     printf("  Ref audio:    %s\n", ref_audio_path.c_str());
+    printf("  Encode only:  %s\n", audio_encode_only ? "yes" : "no");
 
     // media_type=1 表示纯音频输入（与双工共享的多模态通道里只开 audio）
-    auto ctx_omni = omni_init(&params, /*media_type=*/1, use_tts, tts_bin_dir, -1, "gpu:0");
+    auto ctx_omni = omni_init(&params, /*media_type=*/1, use_tts, tts_bin_dir, -1,
+                              omni_default_token2wav_device());
     if (ctx_omni == nullptr) {
         fprintf(stderr, "Error: Failed to initialize omni context\n");
         return 1;

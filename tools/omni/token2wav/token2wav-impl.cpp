@@ -1,6 +1,11 @@
 
 
 #include "token2wav-impl.h"
+#include "token2wav-adaln-cache-policy.h"
+#include "token2wav-adaln-silu-policy.h"
+#include "token2wav-conv-state-policy.h"
+#include "token2wav-est-att-writeback-policy.h"
+#include "token2wav-graph-policy.h"
 #include "token2wav-profile.h"
 
 #include <atomic>
@@ -13,6 +18,8 @@
 // These types are not exposed by the public ggml API; declare them locally
 typedef void (*ggml_backend_cuda_set_allow_batched_add_t)(ggml_backend_t backend, bool allow);
 typedef void (*ggml_backend_cuda_set_disable_graph_t)(ggml_backend_t backend, bool disable);
+typedef void (*ggml_backend_cann_set_disable_graph_t)(ggml_backend_t backend, bool disable);
+typedef bool (*ggml_backend_cann_graph_enabled_t)(ggml_backend_t backend);
 #include "ggml.h"
 #include "gguf.h"
 #include <chrono>
@@ -99,6 +106,44 @@ static void omni_set_cuda_disable_graph(ggml_backend_t backend, bool disable) {
         setter(backend, disable);
     }
 }
+
+// Temporarily bypass ACL Graph on one CANN backend instance. Other backends
+// do not expose this symbol, so the helper is a no-op for CUDA/CPU/Metal.
+static void omni_set_cann_disable_graph(ggml_backend_t backend, bool disable) {
+    if (!backend) {
+        return;
+    }
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    if (!dev) {
+        return;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (!reg) {
+        return;
+    }
+    auto setter = (ggml_backend_cann_set_disable_graph_t)
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_cann_set_disable_graph");
+    if (setter) {
+        setter(backend, disable);
+    }
+}
+static bool omni_cann_graph_enabled(ggml_backend_t backend) {
+    if (!backend) {
+        return false;
+    }
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    if (!dev) {
+        return false;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (!reg) {
+        return false;
+    }
+    auto getter = (ggml_backend_cann_graph_enabled_t)
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_cann_graph_enabled");
+    return getter && getter(backend);
+}
+
 
 #if ENABLE_STDERR_LOG
 #ifndef LOG_ERROR
@@ -278,7 +323,9 @@ flowInferenceChunkOut flowCausalMaskedDiffWithXvec::build_inference_chunk_graph(
     const flow_matching::fmCFMCache * estimator_cache_in,
     int                               n_timesteps,
     float                             temperature,
-    flow_matching::fmCFMCache *       estimator_cache_out) const {
+    flow_matching::fmCFMCache *       estimator_cache_out,
+    const flow_matching::fmAdaLNModulationCache * adaln_cache,
+    std::vector<ggml_tensor *> * adaln_timestep_inputs) const {
     flowInferenceChunkOut out{};
     if (ctx == nullptr || token_ids_tb_i32 == nullptr || spk_cb_f32 == nullptr) {
         return out;
@@ -299,7 +346,8 @@ flowInferenceChunkOut flowCausalMaskedDiffWithXvec::build_inference_chunk_graph(
         cache_out_ptr->clear();
     }
     ggml_tensor * feat_ctb = decoder_->build_forward_chunk_graph(ctx, mu_ctb, spk_proj_cb, cond_ctb, n_timesteps,
-                                                                 temperature, estimator_cache_in, cache_out_ptr);
+                                                                 temperature, estimator_cache_in, cache_out_ptr,
+                                                                 adaln_cache, adaln_timestep_inputs);
     out.feat_ctb            = ggml_cont(ctx, feat_ctb);
     out.conformer_cnn_cache = enc_out.new_cnn_cache_ctb;
     out.conformer_att_cache = enc_out.new_att_cache;
@@ -844,7 +892,9 @@ ggml_tensor * fmCausalConditionalCFM::build_forward_chunk_graph(ggml_context *  
                                                                 int                n_timesteps,
                                                                 float              temperature,
                                                                 const fmCFMCache * cache_in,
-                                                                fmCFMCache *       cache_out) const {
+                                                                fmCFMCache *       cache_out,
+                                                                const fmAdaLNModulationCache * adaln_cache,
+                                                                std::vector<ggml_tensor *> * adaln_timestep_inputs) const {
     if (ctx == nullptr || estimator_ == nullptr || mu == nullptr) {
         if (cache_out) {
             cache_out->clear();
@@ -906,6 +956,13 @@ ggml_tensor * fmCausalConditionalCFM::build_forward_chunk_graph(ggml_context *  
     std::vector<float> t_span;
     build_cosine_t_span(n_timesteps, t_span);
     const int steps = n_timesteps > 0 ? n_timesteps : 1;
+    const fmAdaLNModulationCache * active_adaln_cache =
+        omni::flow::token2wav_legacy_adaln_cache_requested(std::getenv("OMNI_T2W_LEGACY_ADALN_CACHE")) ?
+            nullptr : adaln_cache;
+    if (adaln_timestep_inputs != nullptr) {
+        adaln_timestep_inputs->clear();
+        adaln_timestep_inputs->reserve(static_cast<std::size_t>(steps));
+    }
     float t_scalar = t_span[0];
     float dt       = t_span.size() > 1 ? (t_span[1] - t_span[0]) : 1.0f;
     if (cache_out != nullptr) {
@@ -937,6 +994,9 @@ ggml_tensor * fmCausalConditionalCFM::build_forward_chunk_graph(ggml_context *  
             std::snprintf(name_buf, sizeof(name_buf), "fm_cfm_t_in_chunk%d_step%d", call_id, step);
             ggml_set_name(t_in, name_buf);
         }
+        if (adaln_timestep_inputs != nullptr) {
+            adaln_timestep_inputs->push_back(t_in);
+        }
         std::vector<ggml_tensor *> prev_cnn_cache;
         std::vector<ggml_tensor *> prev_att_cache;
         prev_cnn_cache.assign((std::size_t) depth, nullptr);
@@ -959,7 +1019,8 @@ ggml_tensor * fmCausalConditionalCFM::build_forward_chunk_graph(ggml_context *  
         std::vector<ggml_tensor *> new_cnn_vec;
         std::vector<ggml_tensor *> new_att_vec;
         ggml_tensor * dphi_all = estimator_->build_forward_chunk_graph_pre(
-            ctx, x_in, cond_cat, t_in, prev_cnn_cache, prev_att_cache, new_cnn_vec, new_att_vec);
+            ctx, x_in, cond_cat, t_in, prev_cnn_cache, prev_att_cache, new_cnn_vec, new_att_vec,
+            active_adaln_cache, step);
         ggml_tensor * dphi_main = ggml_view_3d(ctx, dphi_all, C, T, B, dphi_all->nb[1], dphi_all->nb[2], 0);
         const size_t  offset_cfg = static_cast<size_t>(B) * dphi_all->nb[2];
         ggml_tensor * dphi_cfg   = ggml_view_3d(ctx, dphi_all, C, T, B, dphi_all->nb[1], dphi_all->nb[2], offset_cfg);
@@ -1060,7 +1121,7 @@ ggml_tensor * fmCausalConv1d::build_forward_graph(ggml_context * ctx, ggml_tenso
     x_tcb               = ggml_cont(ctx, x_tcb);
     const int     pad_left = static_cast<int>(K - 1);
     ggml_tensor * x_pad    = ggml_pad_ext(ctx, x_tcb, pad_left, 0, 0, 0, 0, 0, 0, 0);
-    ggml_tensor * col = ggml_im2col(ctx, weight_, x_pad, 1, 0, 0, 0, 1, 0, false, GGML_TYPE_F32);
+    ggml_tensor * col = ggml_im2col_causal_1d(ctx, weight_, x_pad, 1, 0, 1, GGML_TYPE_F32);
     ggml_tensor * col_2d = ggml_reshape_2d(ctx, col, K * Cin_w, T * B);
     ggml_tensor * w_2d = ggml_reshape_2d(ctx, weight_, K * Cin_w, Cout);
     ggml_tensor * mm = ggml_mul_mat(ctx, w_2d, col_2d);
@@ -1098,12 +1159,26 @@ ggml_tensor * fmCausalConv1d::build_forward_chunk_graph(ggml_context * ctx,
     } else {
     }
     cache_in = ggml_cont(ctx, cache_in);
-    ggml_tensor * cache_tcb = ggml_permute(ctx, cache_in, 1, 0, 2, 3);
-    cache_tcb               = ggml_cont(ctx, cache_tcb);
-    ggml_tensor * x_tcb = ggml_permute(ctx, x, 1, 0, 2, 3);
-    x_tcb               = ggml_cont(ctx, x_tcb);
-    ggml_tensor * x_cat_tcb = ggml_concat(ctx, cache_tcb, x_tcb, 0);
-    ggml_tensor * col = ggml_im2col(ctx, weight_, x_cat_tcb, 1, 0, 0, 0, 1, 0, false, GGML_TYPE_F32);
+    const char * ctb_im2col_env = std::getenv("OMNI_T2W_CAUSAL_CTB_IM2COL");
+    const bool use_ctb_im2col = ctb_im2col_env == nullptr ||
+        std::strcmp(ctb_im2col_env, "auto") == 0;
+    ggml_tensor * col = nullptr;
+    if (use_ctb_im2col) {
+        ggml_tensor * x_cont = x;
+        if (!ggml_is_contiguous(x_cont)) {
+            x_cont = ggml_cont(ctx, x_cont);
+        }
+        ggml_tensor * x_cat_ctb = ggml_concat(ctx, cache_in, x_cont, 1);
+        col = ggml_im2col_causal_ctb_1d(
+            ctx, weight_, x_cat_ctb, 1, 0, 1, GGML_TYPE_F32);
+    } else {
+        ggml_tensor * cache_tcb = ggml_permute(ctx, cache_in, 1, 0, 2, 3);
+        cache_tcb               = ggml_cont(ctx, cache_tcb);
+        ggml_tensor * x_tcb = ggml_permute(ctx, x, 1, 0, 2, 3);
+        x_tcb               = ggml_cont(ctx, x_tcb);
+        ggml_tensor * x_cat_tcb = ggml_concat(ctx, cache_tcb, x_tcb, 0);
+        col = ggml_im2col_causal_1d(ctx, weight_, x_cat_tcb, 1, 0, 1, GGML_TYPE_F32);
+    }
     ggml_tensor * col_2d = ggml_reshape_2d(ctx, col, K * Cin_w, dt * B);
     ggml_tensor * w_2d = ggml_reshape_2d(ctx, weight_, K * Cin_w, Cout);
     ggml_tensor * mm = ggml_mul_mat(ctx, w_2d, col_2d);
@@ -1113,18 +1188,27 @@ ggml_tensor * fmCausalConv1d::build_forward_chunk_graph(ggml_context * ctx,
         y                            = ggml_add(ctx, y, bias_broadcast);
     }
     if (new_cache != nullptr) {
-        ggml_tensor * x_cont = x;
-        if (x_cont->op != GGML_OP_RESHAPE && x_cont->op != GGML_OP_NONE) {
-            x_cont = ggml_cont(ctx, x_cont);
+        const bool compatible_shape = ggml_n_dims(x) == 3 && ggml_n_dims(cache_in) == 3 &&
+                                      cache_in->ne[0] == Cin && cache_in->ne[1] == pad &&
+                                      cache_in->ne[2] == B;
+        if (omni::flow::token2wav_use_current_tail_for_conv_state(
+                dt, pad, compatible_shape, std::getenv("OMNI_T2W_LEGACY_CONV_STATE"))) {
+            const size_t offset = x->nb[1] * static_cast<size_t>(dt - pad);
+            ggml_tensor * tail_view = ggml_view_3d(ctx, x, Cin, pad, B, x->nb[1], x->nb[2], offset);
+            *new_cache = ggml_cont(ctx, tail_view);
+        } else {
+            ggml_tensor * x_cont = x;
+            if (x_cont->op != GGML_OP_RESHAPE && x_cont->op != GGML_OP_NONE) {
+                x_cont = ggml_cont(ctx, x_cont);
+            }
+            ggml_tensor * x_cat_ctb = ggml_concat(ctx, cache_in, x_cont, 1);
+            x_cat_ctb               = ggml_cont(ctx, x_cat_ctb);
+            const size_t nb1    = x_cat_ctb->nb[1];
+            const size_t nb2    = x_cat_ctb->nb[2];
+            const size_t offset = nb1 * static_cast<size_t>(dt);
+            ggml_tensor * tail_view = ggml_view_3d(ctx, x_cat_ctb, Cin, pad, B, nb1, nb2, offset);
+            *new_cache = ggml_cont(ctx, tail_view);
         }
-        ggml_tensor * x_cat_ctb = ggml_concat(ctx, cache_in, x_cont, 1);
-        x_cat_ctb               = ggml_cont(ctx, x_cat_ctb);
-        const size_t nb1    = x_cat_ctb->nb[1];
-        const size_t nb2    = x_cat_ctb->nb[2];
-        const size_t offset = nb1 * static_cast<size_t>(dt);
-        ggml_tensor * tail_view = ggml_view_3d(ctx, x_cat_ctb, Cin, pad, B, nb1, nb2, offset);
-        ggml_tensor * tail_ctb = ggml_cont(ctx, tail_view);
-        *new_cache = tail_ctb;
     }
     return y;
 }
@@ -1335,6 +1419,63 @@ ggml_tensor * fm_dit_broadcast_spks_over_time(ggml_context * ctx, ggml_tensor * 
     ggml_tensor * tmpl  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, C_spk, T, B);
     return ggml_repeat(ctx, spks_3d, tmpl);
 }
+
+ggml_tensor * fm_dit_build_shared_adaln_silu(ggml_context * ctx,
+                                             ggml_tensor *  t_embed,
+                                             int            depth,
+                                             int            hidden_size) {
+    if (ctx == nullptr || t_embed == nullptr) {
+        return nullptr;
+    }
+    const bool share = omni::flow::token2wav_should_share_adaln_silu(
+        std::getenv("OMNI_T2W_LEGACY_ADALN_SILU"), depth, hidden_size, ggml_n_dims(t_embed),
+        t_embed->ne[0], t_embed->ne[1], t_embed->ne[2], t_embed->type == GGML_TYPE_F32);
+    if (!share) {
+        return nullptr;
+    }
+    ggml_tensor * shared = build_silu(ctx, t_embed);
+    ggml_set_name(shared, "fm_dit_adaln_silu_shared");
+    return shared;
+}
+
+bool fm_dit_adaln_cache_matches(const fmAdaLNModulationCache * cache,
+                                 int                            depth,
+                                 int                            hidden_size,
+                                 int64_t                        cfg_batch,
+                                 int                            step) {
+    if (cache == nullptr || cache->block_packed == nullptr || cache->final_packed == nullptr || step < 0 ||
+        step >= cache->n_timesteps || cache->depth != depth || cache->hidden_size != hidden_size ||
+        cache->cfg_batch != cfg_batch) {
+        return false;
+    }
+    const ggml_tensor * block = cache->block_packed;
+    const ggml_tensor * final = cache->final_packed;
+    return omni::flow::token2wav_adaln_cache_is_canonical(
+               depth, hidden_size, cache->n_timesteps, cfg_batch,
+               block->type == GGML_TYPE_F32 && final->type == GGML_TYPE_F32) &&
+           block->ne[0] == 9 * hidden_size && block->ne[1] == 1 && block->ne[2] == cfg_batch &&
+           block->ne[3] == static_cast<int64_t>(depth) * cache->n_timesteps &&
+           final->ne[0] == 2 * hidden_size && final->ne[1] == 1 && final->ne[2] == cfg_batch &&
+           final->ne[3] == cache->n_timesteps;
+}
+
+ggml_tensor * fm_dit_view_cached_block_adaln(ggml_context *                      ctx,
+                                              const fmAdaLNModulationCache & cache,
+                                              int                                 step,
+                                              int                                 block) {
+    const int64_t slot = static_cast<int64_t>(step) * cache.depth + block;
+    return ggml_view_3d(ctx, cache.block_packed, 9 * cache.hidden_size, 1, cache.cfg_batch,
+                        cache.block_packed->nb[1], cache.block_packed->nb[2],
+                        static_cast<size_t>(slot) * cache.block_packed->nb[3]);
+}
+
+ggml_tensor * fm_dit_view_cached_final_adaln(ggml_context *                      ctx,
+                                              const fmAdaLNModulationCache & cache,
+                                              int                                 step) {
+    return ggml_view_3d(ctx, cache.final_packed, 2 * cache.hidden_size, 1, cache.cfg_batch,
+                        cache.final_packed->nb[1], cache.final_packed->nb[2],
+                        static_cast<size_t>(step) * cache.final_packed->nb[3]);
+}
 }  // namespace
 fmDiT::fmDiT(int   in_channels,
              int   out_channels,
@@ -1372,6 +1513,74 @@ void fmDiT::set_parameters(ggml_tensor * in_proj_weight, ggml_tensor * in_proj_b
     in_proj_weight_ = in_proj_weight;
     in_proj_bias_   = in_proj_bias;
 }
+
+bool fmDiT::create_adaln_modulation_cache(ggml_context *              ctx,
+                                          int                         n_timesteps,
+                                          int64_t                     cfg_batch,
+                                          fmAdaLNModulationCache &    cache) const {
+    cache.clear();
+    if (ctx == nullptr || !omni::flow::token2wav_adaln_cache_is_canonical(
+                              depth_, hidden_size_, n_timesteps, cfg_batch, true)) {
+        return false;
+    }
+    cache.depth        = depth_;
+    cache.hidden_size  = hidden_size_;
+    cache.n_timesteps  = n_timesteps;
+    cache.cfg_batch    = cfg_batch;
+    cache.block_packed = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 9 * hidden_size_, 1, cfg_batch,
+                                             static_cast<int64_t>(depth_) * n_timesteps);
+    cache.final_packed = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 2 * hidden_size_, 1, cfg_batch, n_timesteps);
+    if (cache.block_packed == nullptr || cache.final_packed == nullptr) {
+        cache.clear();
+        return false;
+    }
+    // These buffers survive graph executions and are populated only by the
+    // corresponding call-id's one-off init graph.
+    ggml_set_output(cache.block_packed);
+    ggml_set_output(cache.final_packed);
+    return true;
+}
+
+ggml_cgraph * fmDiT::build_adaln_modulation_cache_init_graph(
+    ggml_context *                      ctx,
+    const std::vector<ggml_tensor *> & timestep_inputs,
+    fmAdaLNModulationCache &            cache) const {
+    if (ctx == nullptr || static_cast<int>(timestep_inputs.size()) != cache.n_timesteps ||
+        !fm_dit_adaln_cache_matches(&cache, depth_, hidden_size_, cache.cfg_batch, 0)) {
+        return nullptr;
+    }
+    for (ggml_tensor * t : timestep_inputs) {
+        if (t == nullptr || t->type != GGML_TYPE_F32 || ggml_n_dims(t) != 1 || t->ne[0] != cache.cfg_batch) {
+            return nullptr;
+        }
+    }
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, GGML_DEFAULT_GRAPH_SIZE * 8, false);
+    if (gf == nullptr) {
+        return nullptr;
+    }
+    for (int step = 0; step < cache.n_timesteps; ++step) {
+        ggml_tensor * t_embed = t_embedder_->build_forward_graph(ctx, timestep_inputs[static_cast<std::size_t>(step)]);
+        ggml_tensor * t_embed_3d = ggml_reshape_3d(ctx, t_embed, hidden_size_, 1, cache.cfg_batch);
+        ggml_tensor * shared_c_silu = fm_dit_build_shared_adaln_silu(ctx, t_embed_3d, depth_, hidden_size_);
+        for (int bi = 0; bi < depth_; ++bi) {
+            ggml_tensor * modulation = blocks_[static_cast<std::size_t>(bi)]->build_adaln_modulation_graph(
+                ctx, t_embed_3d, shared_c_silu);
+            if (modulation == nullptr || modulation->type != GGML_TYPE_F32) {
+                return nullptr;
+            }
+            ggml_tensor * dst = fm_dit_view_cached_block_adaln(ctx, cache, step, bi);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, modulation, dst));
+        }
+        ggml_tensor * final_modulation = final_layer_->build_adaln_modulation_graph(
+            ctx, t_embed_3d, shared_c_silu);
+        if (final_modulation == nullptr || final_modulation->type != GGML_TYPE_F32) {
+            return nullptr;
+        }
+        ggml_tensor * final_dst = fm_dit_view_cached_final_adaln(ctx, cache, step);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, final_modulation, final_dst));
+    }
+    return gf;
+}
 // 构建 DiT blocks 的计算图
 ggml_tensor * fmDiT::build_blocks_forward_graph(ggml_context * ctx,
                                                 ggml_tensor *  x,
@@ -1382,11 +1591,13 @@ ggml_tensor * fmDiT::build_blocks_forward_graph(ggml_context * ctx,
     (void) B;
     ggml_tensor * x_hidden = build_linear(ctx, x, in_proj_weight_, in_proj_bias_);
     ggml_set_name(x_hidden, "fm_dit_x_after_in_proj");
+    ggml_tensor * shared_c_silu = fm_dit_build_shared_adaln_silu(
+        ctx, t_embed, static_cast<int>(blocks_.size()), hidden_size_);
     for (fmDiTBlock * blk : blocks_) {
-        x_hidden = blk->build_forward_graph(ctx, x_hidden, t_embed, attn_mask);
+        x_hidden = blk->build_forward_graph(ctx, x_hidden, t_embed, attn_mask, shared_c_silu);
     }
     ggml_set_name(x_hidden, "fm_dit_x_after_blocks");
-    ggml_tensor * y = final_layer_->build_forward_graph(ctx, x_hidden, t_embed);
+    ggml_tensor * y = final_layer_->build_forward_graph(ctx, x_hidden, t_embed, shared_c_silu);
     ggml_set_name(y, "fm_dit_y");
     return y;
 }
@@ -1425,15 +1636,20 @@ ggml_tensor * fmDiT::build_blocks_forward_chunk_graph(ggml_context *            
                                                       const std::vector<ggml_tensor *> & prev_cnn_cache,
                                                       const std::vector<ggml_tensor *> & prev_att_cache,
                                                       std::vector<ggml_tensor *> &       new_cnn_cache,
-                                                      std::vector<ggml_tensor *> &       new_att_cache) const {
+                                                      std::vector<ggml_tensor *> &       new_att_cache,
+                                                      const fmAdaLNModulationCache *     adaln_cache,
+                                                      int                               adaln_step) const {
     const int64_t T = x->ne[1];
     const int64_t B = x->ne[2];
-    (void) B;
     new_cnn_cache.clear();
     new_att_cache.clear();
     new_cnn_cache.reserve(blocks_.size());
     new_att_cache.reserve(blocks_.size());
     ggml_tensor * x_hidden = build_linear(ctx, x, in_proj_weight_, in_proj_bias_);
+    const bool use_adaln_cache = fm_dit_adaln_cache_matches(
+        adaln_cache, static_cast<int>(blocks_.size()), hidden_size_, B, adaln_step);
+    ggml_tensor * shared_c_silu = use_adaln_cache ? nullptr : fm_dit_build_shared_adaln_silu(
+        ctx, t_embed, static_cast<int>(blocks_.size()), hidden_size_);
     for (std::size_t i = 0; i < blocks_.size(); ++i) {
         fmDiTBlock *  blk      = blocks_[i];
         ggml_tensor * prev_cnn = nullptr;
@@ -1446,12 +1662,16 @@ ggml_tensor * fmDiT::build_blocks_forward_chunk_graph(ggml_context *            
         }
         ggml_tensor * this_new_cnn = nullptr;
         ggml_tensor * this_new_att = nullptr;
+        ggml_tensor * cached_ada_out = use_adaln_cache ? fm_dit_view_cached_block_adaln(
+            ctx, *adaln_cache, adaln_step, static_cast<int>(i)) : nullptr;
         x_hidden = blk->build_forward_chunk_graph(ctx, x_hidden, t_embed, prev_cnn, prev_att, mask, &this_new_cnn,
-                                                  &this_new_att);
+                                                  &this_new_att, shared_c_silu, cached_ada_out);
         new_cnn_cache.push_back(this_new_cnn);
         new_att_cache.push_back(this_new_att);
     }
-    ggml_tensor * y = final_layer_->build_forward_graph(ctx, x_hidden, t_embed);
+    ggml_tensor * cached_final = use_adaln_cache ? fm_dit_view_cached_final_adaln(
+        ctx, *adaln_cache, adaln_step) : nullptr;
+    ggml_tensor * y = final_layer_->build_forward_graph(ctx, x_hidden, t_embed, shared_c_silu, cached_final);
     return y;
 }
 // 构建 DiT 分块前向并更新缓存
@@ -1521,18 +1741,25 @@ ggml_tensor * fmDiT::build_forward_chunk_graph_pre(ggml_context *               
                                                    const std::vector<ggml_tensor *> & prev_cnn_cache,
                                                    const std::vector<ggml_tensor *> & prev_att_cache,
                                                    std::vector<ggml_tensor *> &       new_cnn_cache,
-                                                   std::vector<ggml_tensor *> &       new_att_cache) const {
+                                                   std::vector<ggml_tensor *> &       new_att_cache,
+                                                   const fmAdaLNModulationCache *     adaln_cache,
+                                                   int                               adaln_step) const {
     if (ctx == nullptr || x == nullptr || cond_cat == nullptr || t == nullptr) {
         new_cnn_cache.clear();
         new_att_cache.clear();
         return nullptr;
     }
-    ggml_tensor * t_embed    = t_embedder_->build_forward_graph(ctx, t);
-    ggml_tensor * t_embed_3d = ggml_reshape_3d(ctx, t_embed, hidden_size_, 1, t_embed->ne[1]);
+    const bool use_adaln_cache = fm_dit_adaln_cache_matches(
+        adaln_cache, depth_, hidden_size_, cond_cat->ne[2], adaln_step);
+    ggml_tensor * t_embed_3d = nullptr;
+    if (!use_adaln_cache) {
+        ggml_tensor * t_embed = t_embedder_->build_forward_graph(ctx, t);
+        t_embed_3d = ggml_reshape_3d(ctx, t_embed, hidden_size_, 1, t_embed->ne[1]);
+    }
     ggml_tensor * x_cat      = ggml_concat(ctx, x, cond_cat, 0);
     ggml_tensor * mask       = nullptr;
     return build_blocks_forward_chunk_graph(ctx, x_cat, t_embed_3d, mask, prev_cnn_cache, prev_att_cache, new_cnn_cache,
-                                            new_att_cache);
+                                            new_att_cache, use_adaln_cache ? adaln_cache : nullptr, adaln_step);
 }
 }  // namespace flow_matching
 }  // namespace omni
@@ -1630,16 +1857,27 @@ void fmDiTBlock::set_mlp_parameters(ggml_tensor * fc1_weight,
         mlp_->set_parameters(fc1_weight, fc1_bias, fc2_weight, fc2_bias);
     }
 }
+ggml_tensor * fmDiTBlock::build_adaln_modulation_graph(ggml_context * ctx,
+                                                        ggml_tensor *  c,
+                                                        ggml_tensor *  shared_c_silu) const {
+    if (ctx == nullptr || c == nullptr) {
+        return nullptr;
+    }
+    ggml_tensor * c_silu = shared_c_silu != nullptr ? shared_c_silu : build_silu(ctx, c);
+    return build_linear(ctx, c_silu, ada_weight_, ada_bias_);
+}
 // 构建 DiT block 的前向计算图
 ggml_tensor * fmDiTBlock::build_forward_graph(ggml_context * ctx,
                                               ggml_tensor *  x,
                                               ggml_tensor *  c,
-                                              ggml_tensor *  attn_mask) const {
-    if (x == nullptr || c == nullptr) {
+                                              ggml_tensor *  attn_mask,
+                                              ggml_tensor *  shared_c_silu,
+                                              ggml_tensor *  cached_ada_out) const {
+    if (x == nullptr || (c == nullptr && cached_ada_out == nullptr)) {
         return nullptr;
     }
-    ggml_tensor * c_silu  = build_silu(ctx, c);
-    ggml_tensor * ada_out = build_linear(ctx, c_silu, ada_weight_, ada_bias_);
+    ggml_tensor * ada_out = cached_ada_out != nullptr ? cached_ada_out :
+        build_adaln_modulation_graph(ctx, c, shared_c_silu);
     ggml_tensor * chunks[9];
     fm_dit_blk_split_into_9_chunks(ctx, ada_out, hidden_size_, chunks);
     ggml_tensor * shift_msa  = chunks[0];
@@ -1676,12 +1914,14 @@ ggml_tensor * fmDiTBlock::build_forward_chunk_graph(ggml_context * ctx,
                                                     ggml_tensor *  att_cache,
                                                     ggml_tensor *  mask,
                                                     ggml_tensor ** new_cnn_cache,
-                                                    ggml_tensor ** new_att_cache) const {
-    if (x == nullptr || c == nullptr) {
+                                                    ggml_tensor ** new_att_cache,
+                                                    ggml_tensor *  shared_c_silu,
+                                                    ggml_tensor *  cached_ada_out) const {
+    if (x == nullptr || (c == nullptr && cached_ada_out == nullptr)) {
         return nullptr;
     }
-    ggml_tensor * c_silu  = build_silu(ctx, c);
-    ggml_tensor * ada_out = build_linear(ctx, c_silu, ada_weight_, ada_bias_);
+    ggml_tensor * ada_out = cached_ada_out != nullptr ? cached_ada_out :
+        build_adaln_modulation_graph(ctx, c, shared_c_silu);
     ggml_tensor * chunks[9];
     fm_dit_blk_split_into_9_chunks(ctx, ada_out, hidden_size_, chunks);
     ggml_tensor * shift_msa  = chunks[0];
@@ -1740,15 +1980,31 @@ void fmFinalLayer::set_parameters(ggml_tensor * ada_weight,
     linear_weight_ = linear_weight;
     linear_bias_   = linear_bias;
 }
+ggml_tensor * fmFinalLayer::build_adaln_modulation_graph(ggml_context * ctx,
+                                                          ggml_tensor *  c,
+                                                          ggml_tensor *  shared_c_silu) const {
+    if (ctx == nullptr || c == nullptr) {
+        return nullptr;
+    }
+    ggml_tensor * c_silu = shared_c_silu != nullptr ? shared_c_silu : build_silu(ctx, c);
+    return build_linear(ctx, c_silu, ada_weight_, ada_bias_);
+}
 // 构建 final layer 的计算图
-ggml_tensor * fmFinalLayer::build_forward_graph(ggml_context * ctx, ggml_tensor * x, ggml_tensor * c) const {
+ggml_tensor * fmFinalLayer::build_forward_graph(ggml_context * ctx,
+                                                ggml_tensor *  x,
+                                                ggml_tensor *  c,
+                                                ggml_tensor *  shared_c_silu,
+                                                ggml_tensor *  cached_ada_out) const {
+    if (x == nullptr || (c == nullptr && cached_ada_out == nullptr)) {
+        return nullptr;
+    }
     const int64_t C = x->ne[0];
     const int64_t T = x->ne[1];
     const int64_t B = x->ne[2];
     (void) T;
     (void) B;
-    ggml_tensor * c_silu = build_silu(ctx, c);
-    ggml_tensor * ada_out = build_linear(ctx, c_silu, ada_weight_, ada_bias_);
+    ggml_tensor * ada_out = cached_ada_out != nullptr ? cached_ada_out :
+        build_adaln_modulation_graph(ctx, c, shared_c_silu);
     const int64_t half = C;
     const size_t  nb0  = ada_out->nb[0];
     const size_t  nb1  = ada_out->nb[1];
@@ -2120,12 +2376,12 @@ void backend_tensor_set(ggml_backend_t backend,
         ggml_backend_tensor_set(tensor, data, 0, size_bytes);
     }
 }
-// Phase 2.3: env gate for fused QKV. Default ON (returns true when unset or
-// non-"0"), opt-out with OMNI_T2W_FUSED_QKV=0.  Evaluated once per process.
+// Experimental fused QKV is opt-in until tensor and WAV equivalence are
+// established on the evaluation model.
 bool fm_fused_qkv_enabled() {
     static const bool enabled = [] {
         const char * s = std::getenv("OMNI_T2W_FUSED_QKV");
-        return (s == nullptr) || (s[0] != '0');
+        return s != nullptr && s[0] == '1' && s[1] == '\0';
     }();
     return enabled;
 }
@@ -2731,7 +2987,7 @@ ggml_tensor * fmModulateUtils::build_modulate(ggml_context * ctx,
                                               ggml_tensor *  x,
                                               ggml_tensor *  shift,
                                               ggml_tensor *  scale) {
-    return build_modulate(ctx, x, shift, scale);
+    return omni::flow_matching::build_modulate(ctx, x, shift, scale);
 }
 }  // namespace flow_matching
 }  // namespace omni
@@ -4923,6 +5179,51 @@ ggml_tensor * ueUpsampleEncoderModelLoaderGGUF::get_tensor(const std::string & n
 namespace omni {
 namespace vocoder {
 namespace hifigan2 {
+static bool hg2_native_im2col_enabled() {
+    const char * value = std::getenv("OMNI_T2W_HIFT_NATIVE_IM2COL");
+    return value == nullptr || std::strcmp(value, "off") != 0;
+}
+
+static bool hg2_legacy_redundant_cont_enabled() {
+    const char * value = std::getenv("OMNI_T2W_LEGACY_HIFT_CONT");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
+static ggml_tensor * hg2_cont_if_required(
+        ggml_context * ctx,
+        ggml_tensor * tensor) {
+    if (tensor == nullptr || hg2_legacy_redundant_cont_enabled() ||
+        !ggml_is_contiguous(tensor)) {
+        return tensor == nullptr ? nullptr : ggml_cont(ctx, tensor);
+    }
+    return tensor;
+}
+
+static ggml_tensor * hg2_im2col_1d_f32(ggml_context * ctx,
+                                        ggml_tensor *  weight_kic_oc,
+                                        ggml_tensor *  input_tcb,
+                                        int            stride,
+                                        int            padding,
+                                        int            dilation) {
+    const int64_t kernel = weight_kic_oc->ne[0];
+    const bool native_shape =
+        input_tcb->ne[2] == 1 && stride == 1 &&
+        (kernel == 3 || kernel == 7 || kernel == 11) &&
+        (dilation == 1 || dilation == 3 || dilation == 5) &&
+        padding == dilation * (kernel - 1) / 2;
+    const bool hift_strided_shape =
+        input_tcb->ne[2] == 1 && kernel == 30 && stride == 15 &&
+        padding == 7 && dilation == 1;
+    if ((native_shape || hift_strided_shape) &&
+        hg2_native_im2col_enabled()) {
+        return ggml_im2col_vocoder_1d(
+            ctx, weight_kic_oc, input_tcb, stride, padding, dilation,
+            GGML_TYPE_F32);
+    }
+    return ggml_im2col(ctx, weight_kic_oc, input_tcb, stride, 0, padding, 0,
+                       dilation, 0, false, GGML_TYPE_F32);
+}
+
 static ggml_tensor * hg_f0_predictor_conv1d_k3_p1_f32(ggml_context * ctx,
                                                        ggml_tensor *  x_tcb,
                                                        ggml_tensor *  w_kic_oc,
@@ -4954,16 +5255,16 @@ static ggml_tensor * hg_f0_predictor_conv1d_k3_p1_f32(ggml_context * ctx,
                      (long long) Cout, (long long) b_oc->ne[0]);
         return nullptr;
     }
-    ggml_tensor * im2col = ggml_im2col(ctx, w_kic_oc, x_tcb, 1, 0, 1, 0, 1, 0, false, GGML_TYPE_F32);
+    ggml_tensor * im2col = hg2_im2col_1d_f32(ctx, w_kic_oc, x_tcb, 1, 1, 1);
     ggml_tensor * im2col_2d = ggml_reshape_2d(ctx, im2col, im2col->ne[0], im2col->ne[2] * im2col->ne[1]);
-    im2col_2d               = ggml_cont(ctx, im2col_2d);
+    im2col_2d               = hg2_cont_if_required(ctx, im2col_2d);
     ggml_tensor * w_2d = ggml_reshape_2d(ctx, w_kic_oc, K * Cin, Cout);
-    w_2d               = ggml_cont(ctx, w_2d);
+    w_2d               = hg2_cont_if_required(ctx, w_2d);
     ggml_tensor * mm = ggml_mul_mat(ctx, im2col_2d, w_2d);
     ggml_tensor * y_tcb = ggml_reshape_3d(ctx, mm, T, Cout, B);
-    y_tcb               = ggml_cont(ctx, y_tcb);
+    y_tcb               = hg2_cont_if_required(ctx, y_tcb);
     ggml_tensor * b_1c1  = ggml_reshape_3d(ctx, b_oc, 1, Cout, 1);
-    b_1c1                = ggml_cont(ctx, b_1c1);
+    b_1c1                = hg2_cont_if_required(ctx, b_1c1);
     ggml_tensor * b_tcb  = ggml_repeat(ctx, b_1c1, y_tcb);
     ggml_tensor * y_bias = ggml_add(ctx, y_tcb, b_tcb);
     return y_bias;
@@ -5236,16 +5537,17 @@ static ggml_tensor * hg_hift_conv1d_f32(ggml_context * ctx,
                      (long long) b_oc->ne[0]);
         return nullptr;
     }
-    ggml_tensor * im2col = ggml_im2col(ctx, w_kic_oc, x_tcb, stride, 0, padding, 0, dilation, 0, false, GGML_TYPE_F32);
+    ggml_tensor * im2col =
+        hg2_im2col_1d_f32(ctx, w_kic_oc, x_tcb, stride, padding, dilation);
     ggml_tensor * im2col_2d = ggml_reshape_2d(ctx, im2col, im2col->ne[0], im2col->ne[2] * im2col->ne[1]);
-    im2col_2d               = ggml_cont(ctx, im2col_2d);
+    im2col_2d               = hg2_cont_if_required(ctx, im2col_2d);
     ggml_tensor * w_2d = ggml_reshape_2d(ctx, w_kic_oc, K * Cin, Cout);
-    w_2d               = ggml_cont(ctx, w_2d);
+    w_2d               = hg2_cont_if_required(ctx, w_2d);
     ggml_tensor * mm    = ggml_mul_mat(ctx, im2col_2d, w_2d);
     ggml_tensor * y_tcb = ggml_reshape_3d(ctx, mm, im2col->ne[1], Cout, B);
-    y_tcb               = ggml_cont(ctx, y_tcb);
+    y_tcb               = hg2_cont_if_required(ctx, y_tcb);
     ggml_tensor * b_1c1 = ggml_reshape_3d(ctx, b_oc, 1, Cout, 1);
-    b_1c1               = ggml_cont(ctx, b_1c1);
+    b_1c1               = hg2_cont_if_required(ctx, b_1c1);
     ggml_tensor * b_tcb = ggml_repeat(ctx, b_1c1, y_tcb);
     ggml_tensor * y     = ggml_add(ctx, y_tcb, b_tcb);
     return y;
@@ -5973,16 +6275,16 @@ static ggml_tensor * hg_resblock_conv1d_f32(ggml_context *                      
         return nullptr;
     }
     ggml_tensor * im2col =
-        ggml_im2col(ctx, c.weight_kic_oc, x_tcb, 1, 0, c.padding, 0, c.dilation, 0, false, GGML_TYPE_F32);
+        ggml_im2col_vocoder_1d(ctx, c.weight_kic_oc, x_tcb, 1, c.padding, c.dilation, GGML_TYPE_F32);
     ggml_tensor * im2col_2d = ggml_reshape_2d(ctx, im2col, im2col->ne[0], im2col->ne[2] * im2col->ne[1]);
-    im2col_2d               = ggml_cont(ctx, im2col_2d);
+    im2col_2d               = hg2_cont_if_required(ctx, im2col_2d);
     ggml_tensor * w_2d = ggml_reshape_2d(ctx, c.weight_kic_oc, K * Cin, Cout);
-    w_2d               = ggml_cont(ctx, w_2d);
+    w_2d               = hg2_cont_if_required(ctx, w_2d);
     ggml_tensor * mm    = ggml_mul_mat(ctx, im2col_2d, w_2d);
     ggml_tensor * y_tcb = ggml_reshape_3d(ctx, mm, T, Cout, B);
-    y_tcb               = ggml_cont(ctx, y_tcb);
+    y_tcb               = hg2_cont_if_required(ctx, y_tcb);
     ggml_tensor * b_1c1 = ggml_reshape_3d(ctx, c.bias_oc, 1, Cout, 1);
-    b_1c1               = ggml_cont(ctx, b_1c1);
+    b_1c1               = hg2_cont_if_required(ctx, b_1c1);
     ggml_tensor * b_tcb = ggml_repeat(ctx, b_1c1, y_tcb);
     ggml_tensor * y     = ggml_add(ctx, y_tcb, b_tcb);
     return y;
@@ -6596,18 +6898,22 @@ bool voc_hg2_model::voc_hg2_model_init_from_gguf(const std::string & gguf_path_i
     gguf_path   = gguf_path_in;
     num_threads = num_threads_in > 0 ? num_threads_in : 1;
     ggml_backend_load_all();
-    // Support "gpu", "gpu:0", "gpu:1" etc.
-    if (device.find("gpu") == 0) {
+    // Support generic accelerator aliases and explicit Ascend NPU aliases.
+    const bool npu_requested = device.find("npu") == 0;
+    if (device.find("gpu") == 0 || device.find("cuda") == 0 || npu_requested || device == "auto") {
         int gpu_idx = 0;
-        if (device.find("gpu:") == 0 && device.size() > 4) {
+        const auto colon_pos = device.find(':');
+        if (colon_pos != std::string::npos && colon_pos + 1 < device.size()) {
             try {
-                gpu_idx = std::stoi(device.substr(4));
+                gpu_idx = std::stoi(device.substr(colon_pos + 1));
             } catch (...) {
                 gpu_idx = 0;
             }
         }
 #ifdef GGML_USE_CUDA
-        backend = ggml_backend_cuda_init(gpu_idx);
+        if (!npu_requested) {
+            backend = ggml_backend_cuda_init(gpu_idx);
+        }
 #endif
 #ifdef GGML_USE_CANN
         if (!backend) {
@@ -6622,6 +6928,13 @@ bool voc_hg2_model::voc_hg2_model_init_from_gguf(const std::string & gguf_path_i
         }
         if (!backend) {
             backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+        }
+        if (npu_requested && backend
+            && std::string(ggml_backend_name(backend)).find("CANN") == std::string::npos) {
+            LOG_ERROR("voc_hg2_model: requested %s but resolved backend=%s\n",
+                      device.c_str(), ggml_backend_name(backend));
+            ggml_backend_free(backend);
+            backend = nullptr;
         }
         std::fprintf(stderr, "voc_hg2_model: init_backend device=%s, gpu_idx=%d, backend=%s\n",
                 device.c_str(), gpu_idx, backend ? ggml_backend_name(backend) : "null");
@@ -6862,11 +7175,8 @@ bool bind_flow_matching_weights(flow_matching::fmFlowMatchingModelLoaderGGUF & l
     dit.set_parameters(loader.get_tensor("estimator.in_proj.weight"), loader.get_tensor("estimator.in_proj.bias"));
     auto & blocks = dit.blocks();
     const int depth = (int) blocks.size();
-    // Phase 2.3: env gate for fused QKV (same policy as fm_loader_bind_all_weights).
-    static const bool fused_env_on = [] {
-        const char * s = std::getenv("OMNI_T2W_FUSED_QKV");
-        return (s == nullptr) || (s[0] != '0');
-    }();
+    // Same opt-in policy as fm_loader_bind_all_weights().
+    const bool fused_env_on = flow_matching::fm_fused_qkv_enabled();
     const bool fused_enabled = fused_env_on && depth > 0 && dit.hidden_size() > 0 &&
                                loader.build_fused_qkv(depth, dit.hidden_size());
     const auto & fused_qkv = loader.fused_qkv();
@@ -7239,10 +7549,11 @@ bool flowGGUFModelLoader::init_backend(const std::string & device) {
     if (backend_) {
         return true;
     }
-    // Support "gpu", "gpu:0", "gpu:1", "cuda", "cuda:0", etc.
-    if (device.find("gpu") == 0 || device.find("cuda") == 0 || device == "auto") {
+    // Support "gpu", "cuda", and explicit Ascend "npu" aliases.
+    const bool npu_requested = device.find("npu") == 0;
+    if (device.find("gpu") == 0 || device.find("cuda") == 0 || npu_requested || device == "auto") {
         int gpu_idx = 0;
-        // Parse "gpu:N" or "cuda:N" format
+        // Parse "gpu:N", "cuda:N", or "npu:N" format.
         auto colon_pos = device.find(':');
         if (colon_pos != std::string::npos && colon_pos + 1 < device.size()) {
             try {
@@ -7252,7 +7563,9 @@ bool flowGGUFModelLoader::init_backend(const std::string & device) {
             }
         }
 #ifdef GGML_USE_CUDA
-        backend_ = ggml_backend_cuda_init(gpu_idx);
+        if (!npu_requested) {
+            backend_ = ggml_backend_cuda_init(gpu_idx);
+        }
 #endif
 #ifdef GGML_USE_CANN
         if (!backend_) {
@@ -7265,6 +7578,15 @@ bool flowGGUFModelLoader::init_backend(const std::string & device) {
         if (backend_) {
             backend_name_ = ggml_backend_name(backend_);
             omni_try_enable_cuda_batched_add(backend_);
+        }
+        if (npu_requested && backend_name_.find("CANN") == std::string::npos) {
+            LOG_ERROR("flowGGUFModelLoader: requested %s but resolved backend=%s\n",
+                      device.c_str(), backend_name_.c_str());
+            if (backend_) {
+                ggml_backend_free(backend_);
+                backend_ = nullptr;
+            }
+            backend_name_.clear();
         }
         std::fprintf(stderr, "flowGGUFModelLoader: init_backend device=%s, gpu_idx=%d, backend=%s\n",
                 device.c_str(), gpu_idx, backend_name_.c_str());
@@ -7481,14 +7803,14 @@ void runner_feed_enc_stream_pos(ggml_backend_t                                  
 }
 // 用于填充CFM噪声与时间步输入
 void runner_feed_cfm_noise_ts(ggml_backend_t backend,
-                                  ggml_context * ctx,
-                                  int            call_id,
-                                  int            n_timesteps,
-                                  float          temperature,
-                                  int64_t        last_att_len,
-                                  int64_t        C,
-                                  int64_t        T,
-                                  int64_t        B) {
+                              ggml_context * ctx,
+                              int            call_id,
+                              int            n_timesteps,
+                              float          temperature,
+                              int64_t        last_att_len,
+                              int64_t        C,
+                              int64_t        T,
+                              int64_t        B) {
     if (!backend || !ctx) {
         return;
     }
@@ -7540,6 +7862,45 @@ ggml_tensor * runner_slice_time_dim1_4d(ggml_context * ctx, ggml_tensor * x, int
     ggml_tensor * v   = ggml_view_4d(ctx, x, x->ne[0], tlen, x->ne[2], x->ne[3], x->nb[1], x->nb[2], x->nb[3], off);
     return ggml_cont(ctx, v);
 }
+bool runner_should_elide_est_att_writeback(const ggml_tensor * produced,
+                                           const ggml_tensor * persistent,
+                                           int64_t             delta) {
+    if (produced == nullptr || persistent == nullptr) {
+        return false;
+    }
+    const token2wav_est_att_shape produced_shape{
+        ggml_n_dims(produced), produced->ne[0], produced->ne[1], produced->ne[2], produced->ne[3],
+        produced->type == GGML_TYPE_F32,
+    };
+    const token2wav_est_att_shape persistent_shape{
+        ggml_n_dims(persistent), persistent->ne[0], persistent->ne[1], persistent->ne[2], persistent->ne[3],
+        persistent->type == GGML_TYPE_F32,
+    };
+    return token2wav_should_elide_est_att_writeback(
+        std::getenv("OMNI_T2W_LEGACY_EST_ATTN_CPY"), produced_shape, persistent_shape, delta);
+}
+void runner_merge_graph_for_allocation(ggml_cgraph * dst, ggml_cgraph * src) {
+    if (dst == nullptr || src == nullptr) {
+        return;
+    }
+    const int n_nodes = ggml_graph_n_nodes(src);
+    for (int i = 0; i < n_nodes; ++i) {
+        ggml_build_forward_expand(dst, ggml_graph_node(src, i));
+    }
+}
+ggml_status runner_compute_oneoff_graph(ggml_backend_t backend, ggml_cgraph * gf) {
+    if (backend == nullptr || gf == nullptr) {
+        return GGML_STATUS_FAILED;
+    }
+    // Cache-fill graphs execute once per call-id. Keep them out of the backend's
+    // single hot graph slot so the steady non-last graph is not evicted.
+    omni_set_cuda_disable_graph(backend, true);
+    omni_set_cann_disable_graph(backend, true);
+    const ggml_status st = ggml_backend_graph_compute(backend, gf);
+    omni_set_cuda_disable_graph(backend, false);
+    omni_set_cann_disable_graph(backend, false);
+    return st;
+}
 }  // namespace
 // 用于上下文/计算图与流式缓存张量
 // 提前定义 streamSessionEncOnly，让 reset()/reset_stream() 能引用其 clear()。
@@ -7586,6 +7947,13 @@ struct flowGGUFModelRunner::streamSession {
     ggml_cgraph * gf_setup   = nullptr;
     ggml_cgraph * gf_nonlast = nullptr;
     ggml_cgraph * gf_last    = nullptr;
+    flow_matching::fmAdaLNModulationCache adaln_cache_nonlast;
+    flow_matching::fmAdaLNModulationCache adaln_cache_last;
+    ggml_cgraph * gf_adaln_init_nonlast = nullptr;
+    ggml_cgraph * gf_adaln_init_last    = nullptr;
+    bool adaln_cache_enabled        = false;
+    bool adaln_cache_nonlast_ready  = false;
+    bool adaln_cache_last_ready     = false;
     int call_id_setup   = -1;
     int call_id_nonlast = -1;
     int call_id_last    = -1;
@@ -7677,12 +8045,16 @@ bool flowGGUFModelRunner::setup_cache(const int32_t *       token_bt,
         return false;
     }
     const int64_t T_chunk_token = 28;
+    const std::shared_ptr<flow_matching::fmDiT> estimator = loader_.estimator();
+    const bool use_adaln_cache = estimator && omni::flow::token2wav_should_cache_adaln(
+        std::getenv("OMNI_T2W_LEGACY_ADALN_CACHE"), estimator->depth(), estimator->hidden_size(),
+        n_timesteps, 2 * B, true);
     if (!sess_) {
         sess_ = std::make_unique<streamSession>();
     }
     const bool need_rebuild = sess_->ctx == nullptr || sess_->B != B || sess_->T_prompt_token != T_token ||
                               sess_->T_prompt_mel != T_mel || sess_->T_chunk_token != T_chunk_token ||
-                              sess_->n_timesteps != n_timesteps;
+                              sess_->n_timesteps != n_timesteps || sess_->adaln_cache_enabled != use_adaln_cache;
     // 需要时重建图与持久化cache张量
     if (need_rebuild) {
         sess_->clear();
@@ -7758,11 +8130,32 @@ bool flowGGUFModelRunner::setup_cache(const int32_t *       token_bt,
         est_in.clear();
         est_in.cnn_cache = sess_->est_cnn_cache;
         est_in.att_cache = sess_->est_att_cache;
+        std::vector<ggml_tensor *> adaln_timestep_inputs_nonlast;
+        std::vector<ggml_tensor *> adaln_timestep_inputs_last;
+        sess_->adaln_cache_enabled = use_adaln_cache;
+        if (estimator) {
+            if (sess_->adaln_cache_enabled &&
+                (!estimator->create_adaln_modulation_cache(sess_->ctx, n_timesteps, 2 * B,
+                                                           sess_->adaln_cache_nonlast) ||
+                 !estimator->create_adaln_modulation_cache(sess_->ctx, n_timesteps, 2 * B,
+                                                           sess_->adaln_cache_last))) {
+                sess_->clear();
+                return false;
+            }
+            if (sess_->adaln_cache_enabled) {
+                ggml_set_name(sess_->adaln_cache_nonlast.block_packed, "fm_adaln_cache_nonlast_blocks");
+                ggml_set_name(sess_->adaln_cache_nonlast.final_packed, "fm_adaln_cache_nonlast_final");
+                ggml_set_name(sess_->adaln_cache_last.block_packed, "fm_adaln_cache_last_blocks");
+                ggml_set_name(sess_->adaln_cache_last.final_packed, "fm_adaln_cache_last_final");
+            }
+        }
         flow_matching::fmCFMCache est_out_nonlast;
         est_out_nonlast.clear();
         auto out1 = loader_.model()->build_inference_chunk_graph(sess_->ctx, sess_->chunk_token_ids_tb, sess_->spk_cb,
                                                                  false, sess_->conf_cnn_cache, sess_->conf_att_cache,
-                                                                 &est_in, n_timesteps, temperature, &est_out_nonlast);
+                                                                 &est_in, n_timesteps, temperature, &est_out_nonlast,
+                                                                 sess_->adaln_cache_enabled ? &sess_->adaln_cache_nonlast : nullptr,
+                                                                 sess_->adaln_cache_enabled ? &adaln_timestep_inputs_nonlast : nullptr);
         if (!out1.feat_ctb || !out1.conformer_cnn_cache || !out1.conformer_att_cache || !est_out_nonlast.cnn_cache ||
             !est_out_nonlast.att_cache) {
             sess_->clear();
@@ -7785,17 +8178,31 @@ bool flowGGUFModelRunner::setup_cache(const int32_t *       token_bt,
         ggml_tensor * cpy_conf_att_1 = ggml_cpy(sess_->ctx, out1_conf_att_trim, sess_->conf_att_cache);
         ggml_tensor * cpy_est_cnn_1  = ggml_cpy(sess_->ctx, est_out_nonlast.cnn_cache, sess_->est_cnn_cache);
         ggml_tensor * cpy_est_att_1  = ggml_cpy(sess_->ctx, out1_est_att_trim, sess_->est_att_cache);
+        const bool elide_est_att_1 =
+            runner_should_elide_est_att_writeback(est_out_nonlast.att_cache, sess_->est_att_cache, delta);
         sess_->gf_nonlast = ggml_new_graph_custom(sess_->ctx, GGML_DEFAULT_GRAPH_SIZE * 1024, false);
         ggml_build_forward_expand(sess_->gf_nonlast, sess_->out_feat_nonlast_ctb);
         ggml_build_forward_expand(sess_->gf_nonlast, cpy_conf_cnn_1);
         ggml_build_forward_expand(sess_->gf_nonlast, cpy_conf_att_1);
         ggml_build_forward_expand(sess_->gf_nonlast, cpy_est_cnn_1);
-        ggml_build_forward_expand(sess_->gf_nonlast, cpy_est_att_1);
+        if (!elide_est_att_1) {
+            ggml_build_forward_expand(sess_->gf_nonlast, cpy_est_att_1);
+        }
+        if (sess_->adaln_cache_enabled) {
+            sess_->gf_adaln_init_nonlast = loader_.estimator()->build_adaln_modulation_cache_init_graph(
+                sess_->ctx, adaln_timestep_inputs_nonlast, sess_->adaln_cache_nonlast);
+            if (sess_->gf_adaln_init_nonlast == nullptr) {
+                sess_->clear();
+                return false;
+            }
+        }
         flow_matching::fmCFMCache est_out_last;
         est_out_last.clear();
         auto out2 = loader_.model()->build_inference_chunk_graph(sess_->ctx, sess_->chunk_token_ids_tb, sess_->spk_cb,
                                                                  true, sess_->conf_cnn_cache, sess_->conf_att_cache,
-                                                                 &est_in, n_timesteps, temperature, &est_out_last);
+                                                                 &est_in, n_timesteps, temperature, &est_out_last,
+                                                                 sess_->adaln_cache_enabled ? &sess_->adaln_cache_last : nullptr,
+                                                                 sess_->adaln_cache_enabled ? &adaln_timestep_inputs_last : nullptr);
         if (!out2.feat_ctb || !out2.conformer_cnn_cache || !out2.conformer_att_cache || !est_out_last.cnn_cache ||
             !est_out_last.att_cache) {
             sess_->clear();
@@ -7816,12 +8223,24 @@ bool flowGGUFModelRunner::setup_cache(const int32_t *       token_bt,
         ggml_tensor * cpy_conf_att_2 = ggml_cpy(sess_->ctx, out2_conf_att_trim, sess_->conf_att_cache);
         ggml_tensor * cpy_est_cnn_2  = ggml_cpy(sess_->ctx, est_out_last.cnn_cache, sess_->est_cnn_cache);
         ggml_tensor * cpy_est_att_2  = ggml_cpy(sess_->ctx, out2_est_att_trim, sess_->est_att_cache);
+        const bool elide_est_att_2 =
+            runner_should_elide_est_att_writeback(est_out_last.att_cache, sess_->est_att_cache, delta2);
         sess_->gf_last = ggml_new_graph_custom(sess_->ctx, GGML_DEFAULT_GRAPH_SIZE * 1024, false);
         ggml_build_forward_expand(sess_->gf_last, sess_->out_feat_last_ctb);
         ggml_build_forward_expand(sess_->gf_last, cpy_conf_cnn_2);
         ggml_build_forward_expand(sess_->gf_last, cpy_conf_att_2);
         ggml_build_forward_expand(sess_->gf_last, cpy_est_cnn_2);
-        ggml_build_forward_expand(sess_->gf_last, cpy_est_att_2);
+        if (!elide_est_att_2) {
+            ggml_build_forward_expand(sess_->gf_last, cpy_est_att_2);
+        }
+        if (sess_->adaln_cache_enabled) {
+            sess_->gf_adaln_init_last = loader_.estimator()->build_adaln_modulation_cache_init_graph(
+                sess_->ctx, adaln_timestep_inputs_last, sess_->adaln_cache_last);
+            if (sess_->gf_adaln_init_last == nullptr) {
+                sess_->clear();
+                return false;
+            }
+        }
 
         
         ggml_cgraph * gf_alloc = ggml_new_graph_custom(sess_->ctx, GGML_DEFAULT_GRAPH_SIZE * 1024, false);
@@ -7833,12 +8252,18 @@ bool flowGGUFModelRunner::setup_cache(const int32_t *       token_bt,
         ggml_build_forward_expand(gf_alloc, cpy_conf_cnn_1);
         ggml_build_forward_expand(gf_alloc, cpy_conf_att_1);
         ggml_build_forward_expand(gf_alloc, cpy_est_cnn_1);
-        ggml_build_forward_expand(gf_alloc, cpy_est_att_1);
+        if (!elide_est_att_1) {
+            ggml_build_forward_expand(gf_alloc, cpy_est_att_1);
+        }
         ggml_build_forward_expand(gf_alloc, sess_->out_feat_last_ctb);
         ggml_build_forward_expand(gf_alloc, cpy_conf_cnn_2);
         ggml_build_forward_expand(gf_alloc, cpy_conf_att_2);
         ggml_build_forward_expand(gf_alloc, cpy_est_cnn_2);
-        ggml_build_forward_expand(gf_alloc, cpy_est_att_2);
+        if (!elide_est_att_2) {
+            ggml_build_forward_expand(gf_alloc, cpy_est_att_2);
+        }
+        runner_merge_graph_for_allocation(gf_alloc, sess_->gf_adaln_init_nonlast);
+        runner_merge_graph_for_allocation(gf_alloc, sess_->gf_adaln_init_last);
 
         ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(loader_.backend());
         sess_->galloc = ggml_gallocr_new(buft);
@@ -7864,7 +8289,7 @@ bool flowGGUFModelRunner::setup_cache(const int32_t *       token_bt,
                                      mel_ctb.size() * sizeof(float));
     runner_feed_enc_stream_pos(loader_.backend(), sess_->ctx, loader_.encoder());
     runner_feed_cfm_noise_ts(loader_.backend(), sess_->ctx, sess_->call_id_setup, n_timesteps, temperature, 0,
-                                 C_mel, T_mel, B);
+                             C_mel, T_mel, B);
     const ggml_status st = ggml_backend_graph_compute(loader_.backend(), sess_->gf_setup);
     if (st != GGML_STATUS_SUCCESS) {
         return false;
@@ -7952,7 +8377,18 @@ bool flowGGUFModelRunner::inference_chunk(const int32_t *             token_bt,
     {
         omni::flow::profile::ScopeTimer _t("t2m.feed_noise");
         runner_feed_cfm_noise_ts(loader_.backend(), sess_->ctx, call_id, n_timesteps, temperature, last_att_len, C, T,
-                                     B);
+                                 B);
+    }
+    if (sess_->adaln_cache_enabled) {
+        bool & cache_ready = last_chunk ? sess_->adaln_cache_last_ready : sess_->adaln_cache_nonlast_ready;
+        ggml_cgraph * cache_init = last_chunk ? sess_->gf_adaln_init_last : sess_->gf_adaln_init_nonlast;
+        if (!cache_ready) {
+            omni::flow::profile::ScopeTimer _t("t2m.adaln_cache_init");
+            if (runner_compute_oneoff_graph(loader_.backend(), cache_init) != GGML_STATUS_SUCCESS) {
+                return false;
+            }
+            cache_ready = true;
+        }
     }
     // 根据last_chunk选择图并执行推理
     ggml_cgraph *     gf = last_chunk ? sess_->gf_last : sess_->gf_nonlast;
@@ -7984,17 +8420,26 @@ bool flowGGUFModelRunner::inference_chunk(const int32_t *             token_bt,
         // is_cuda_graph_update_required 根本不会被调用，properties / instance 都不碰 → gf_nonlast
         // 的 cache 保持热。跑完立刻恢复 false。
         //
-        // 可通过 OMNI_T2W_DISABLE_LAST_GRAPH=0 强制关闭此行为（所有 chunk 一视同仁，仅用于对照实验）。
-        const bool disable_last_graph = last_chunk && [] {
+        // OMNI_T2W_DISABLE_LAST_GRAPH=0 仅关闭 CUDA 对照策略。CANN 的 final shape
+        // 始终 bypass ACL Graph，避免一次性 shape 污染 Graph cache。
+        const bool disable_cuda_last_graph = last_chunk && [] {
             const char * e = std::getenv("OMNI_T2W_DISABLE_LAST_GRAPH");
             return !e || std::string(e) != "0"; // default on; "0" to opt out
         }();
-        if (disable_last_graph) {
+        const auto final_graph_bypass = token2wav_final_graph_bypass_for(
+            last_chunk, disable_cuda_last_graph);
+        if (final_graph_bypass.cuda) {
             omni_set_cuda_disable_graph(loader_.backend(), /*disable=*/true);
         }
+        if (final_graph_bypass.cann) {
+            omni_set_cann_disable_graph(loader_.backend(), /*disable=*/true);
+        }
         const ggml_status st = ggml_backend_graph_compute(loader_.backend(), gf);
-        if (disable_last_graph) {
+        if (final_graph_bypass.cuda) {
             omni_set_cuda_disable_graph(loader_.backend(), /*disable=*/false);
+        }
+        if (final_graph_bypass.cann) {
+            omni_set_cann_disable_graph(loader_.backend(), /*disable=*/false);
         }
         if (st != GGML_STATUS_SUCCESS) {
             return false;
@@ -8347,11 +8792,15 @@ bool flowGGUFModelRunner::init_from_host_caches(const flowStreamCacheHost & cach
         return false;
     }
     const int64_t T_chunk_token = 28;
+    const std::shared_ptr<flow_matching::fmDiT> estimator = loader_.estimator();
+    const bool use_adaln_cache = estimator && omni::flow::token2wav_should_cache_adaln(
+        std::getenv("OMNI_T2W_LEGACY_ADALN_CACHE"), estimator->depth(), estimator->hidden_size(),
+        n_timesteps, 2 * B, true);
     if (!sess_) {
         sess_ = std::make_unique<streamSession>();
     }
     const bool need_rebuild = sess_->ctx == nullptr || sess_->B != B || sess_->T_chunk_token != T_chunk_token ||
-                              sess_->n_timesteps != n_timesteps;
+                              sess_->n_timesteps != n_timesteps || sess_->adaln_cache_enabled != use_adaln_cache;
     if (need_rebuild) {
         sess_->clear();
         sess_->B              = B;
@@ -8400,11 +8849,32 @@ bool flowGGUFModelRunner::init_from_host_caches(const flowStreamCacheHost & cach
         est_in.clear();
         est_in.cnn_cache = sess_->est_cnn_cache;
         est_in.att_cache = sess_->est_att_cache;
+        std::vector<ggml_tensor *> adaln_timestep_inputs_nonlast;
+        std::vector<ggml_tensor *> adaln_timestep_inputs_last;
+        sess_->adaln_cache_enabled = use_adaln_cache;
+        if (estimator) {
+            if (sess_->adaln_cache_enabled &&
+                (!estimator->create_adaln_modulation_cache(sess_->ctx, n_timesteps, 2 * B,
+                                                           sess_->adaln_cache_nonlast) ||
+                 !estimator->create_adaln_modulation_cache(sess_->ctx, n_timesteps, 2 * B,
+                                                           sess_->adaln_cache_last))) {
+                sess_->clear();
+                return false;
+            }
+            if (sess_->adaln_cache_enabled) {
+                ggml_set_name(sess_->adaln_cache_nonlast.block_packed, "fm_adaln_cache_nonlast_blocks");
+                ggml_set_name(sess_->adaln_cache_nonlast.final_packed, "fm_adaln_cache_nonlast_final");
+                ggml_set_name(sess_->adaln_cache_last.block_packed, "fm_adaln_cache_last_blocks");
+                ggml_set_name(sess_->adaln_cache_last.final_packed, "fm_adaln_cache_last_final");
+            }
+        }
         flow_matching::fmCFMCache est_out_nonlast;
         est_out_nonlast.clear();
         auto out1 = loader_.model()->build_inference_chunk_graph(sess_->ctx, sess_->chunk_token_ids_tb, sess_->spk_cb,
                                                                  false, sess_->conf_cnn_cache, sess_->conf_att_cache,
-                                                                 &est_in, n_timesteps, temperature, &est_out_nonlast);
+                                                                 &est_in, n_timesteps, temperature, &est_out_nonlast,
+                                                                 sess_->adaln_cache_enabled ? &sess_->adaln_cache_nonlast : nullptr,
+                                                                 sess_->adaln_cache_enabled ? &adaln_timestep_inputs_nonlast : nullptr);
         if (!out1.feat_ctb || !out1.conformer_cnn_cache || !out1.conformer_att_cache || !est_out_nonlast.cnn_cache ||
             !est_out_nonlast.att_cache) {
             sess_->clear();
@@ -8427,17 +8897,31 @@ bool flowGGUFModelRunner::init_from_host_caches(const flowStreamCacheHost & cach
         ggml_tensor * cpy_conf_att_1 = ggml_cpy(sess_->ctx, out1_conf_att_trim, sess_->conf_att_cache);
         ggml_tensor * cpy_est_cnn_1  = ggml_cpy(sess_->ctx, est_out_nonlast.cnn_cache, sess_->est_cnn_cache);
         ggml_tensor * cpy_est_att_1  = ggml_cpy(sess_->ctx, out1_est_att_trim, sess_->est_att_cache);
+        const bool elide_est_att_1 =
+            runner_should_elide_est_att_writeback(est_out_nonlast.att_cache, sess_->est_att_cache, delta);
         sess_->gf_nonlast = ggml_new_graph_custom(sess_->ctx, GGML_DEFAULT_GRAPH_SIZE * 1024, false);
         ggml_build_forward_expand(sess_->gf_nonlast, sess_->out_feat_nonlast_ctb);
         ggml_build_forward_expand(sess_->gf_nonlast, cpy_conf_cnn_1);
         ggml_build_forward_expand(sess_->gf_nonlast, cpy_conf_att_1);
         ggml_build_forward_expand(sess_->gf_nonlast, cpy_est_cnn_1);
-        ggml_build_forward_expand(sess_->gf_nonlast, cpy_est_att_1);
+        if (!elide_est_att_1) {
+            ggml_build_forward_expand(sess_->gf_nonlast, cpy_est_att_1);
+        }
+        if (sess_->adaln_cache_enabled) {
+            sess_->gf_adaln_init_nonlast = loader_.estimator()->build_adaln_modulation_cache_init_graph(
+                sess_->ctx, adaln_timestep_inputs_nonlast, sess_->adaln_cache_nonlast);
+            if (sess_->gf_adaln_init_nonlast == nullptr) {
+                sess_->clear();
+                return false;
+            }
+        }
         flow_matching::fmCFMCache est_out_last;
         est_out_last.clear();
         auto out2 = loader_.model()->build_inference_chunk_graph(sess_->ctx, sess_->chunk_token_ids_tb, sess_->spk_cb,
                                                                  true, sess_->conf_cnn_cache, sess_->conf_att_cache,
-                                                                 &est_in, n_timesteps, temperature, &est_out_last);
+                                                                 &est_in, n_timesteps, temperature, &est_out_last,
+                                                                 sess_->adaln_cache_enabled ? &sess_->adaln_cache_last : nullptr,
+                                                                 sess_->adaln_cache_enabled ? &adaln_timestep_inputs_last : nullptr);
         if (!out2.feat_ctb || !out2.conformer_cnn_cache || !out2.conformer_att_cache || !est_out_last.cnn_cache ||
             !est_out_last.att_cache) {
             sess_->clear();
@@ -8458,24 +8942,42 @@ bool flowGGUFModelRunner::init_from_host_caches(const flowStreamCacheHost & cach
         ggml_tensor * cpy_conf_att_2 = ggml_cpy(sess_->ctx, out2_conf_att_trim, sess_->conf_att_cache);
         ggml_tensor * cpy_est_cnn_2  = ggml_cpy(sess_->ctx, est_out_last.cnn_cache, sess_->est_cnn_cache);
         ggml_tensor * cpy_est_att_2  = ggml_cpy(sess_->ctx, out2_est_att_trim, sess_->est_att_cache);
+        const bool elide_est_att_2 =
+            runner_should_elide_est_att_writeback(est_out_last.att_cache, sess_->est_att_cache, delta2);
         sess_->gf_last = ggml_new_graph_custom(sess_->ctx, GGML_DEFAULT_GRAPH_SIZE * 1024, false);
         ggml_build_forward_expand(sess_->gf_last, sess_->out_feat_last_ctb);
         ggml_build_forward_expand(sess_->gf_last, cpy_conf_cnn_2);
         ggml_build_forward_expand(sess_->gf_last, cpy_conf_att_2);
         ggml_build_forward_expand(sess_->gf_last, cpy_est_cnn_2);
-        ggml_build_forward_expand(sess_->gf_last, cpy_est_att_2);
+        if (!elide_est_att_2) {
+            ggml_build_forward_expand(sess_->gf_last, cpy_est_att_2);
+        }
+        if (sess_->adaln_cache_enabled) {
+            sess_->gf_adaln_init_last = loader_.estimator()->build_adaln_modulation_cache_init_graph(
+                sess_->ctx, adaln_timestep_inputs_last, sess_->adaln_cache_last);
+            if (sess_->gf_adaln_init_last == nullptr) {
+                sess_->clear();
+                return false;
+            }
+        }
 
         ggml_cgraph * gf_alloc = ggml_new_graph_custom(sess_->ctx, GGML_DEFAULT_GRAPH_SIZE * 1024, false);
         ggml_build_forward_expand(gf_alloc, sess_->out_feat_nonlast_ctb);
         ggml_build_forward_expand(gf_alloc, cpy_conf_cnn_1);
         ggml_build_forward_expand(gf_alloc, cpy_conf_att_1);
         ggml_build_forward_expand(gf_alloc, cpy_est_cnn_1);
-        ggml_build_forward_expand(gf_alloc, cpy_est_att_1);
+        if (!elide_est_att_1) {
+            ggml_build_forward_expand(gf_alloc, cpy_est_att_1);
+        }
         ggml_build_forward_expand(gf_alloc, sess_->out_feat_last_ctb);
         ggml_build_forward_expand(gf_alloc, cpy_conf_cnn_2);
         ggml_build_forward_expand(gf_alloc, cpy_conf_att_2);
         ggml_build_forward_expand(gf_alloc, cpy_est_cnn_2);
-        ggml_build_forward_expand(gf_alloc, cpy_est_att_2);
+        if (!elide_est_att_2) {
+            ggml_build_forward_expand(gf_alloc, cpy_est_att_2);
+        }
+        runner_merge_graph_for_allocation(gf_alloc, sess_->gf_adaln_init_nonlast);
+        runner_merge_graph_for_allocation(gf_alloc, sess_->gf_adaln_init_last);
 
         ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(loader_.backend());
         sess_->galloc = ggml_gallocr_new(buft);
@@ -8515,7 +9017,13 @@ bool flowGGUFModelRunner::init_from_host_caches(const flowStreamCacheHost & cach
             const int64_t C            = feat ? feat->ne[0] : 80;
             const int64_t T            = feat ? feat->ne[1] : 1;
             runner_feed_cfm_noise_ts(loader_.backend(), sess_->ctx, call_id, n_timesteps, temperature, last_att_len,
-                                         C, T, B);
+                                     C, T, B);
+        }
+        if (sess_->adaln_cache_enabled && !sess_->adaln_cache_nonlast_ready) {
+            if (runner_compute_oneoff_graph(loader_.backend(), sess_->gf_adaln_init_nonlast) != GGML_STATUS_SUCCESS) {
+                return false;
+            }
+            sess_->adaln_cache_nonlast_ready = true;
         }
         (void) ggml_backend_graph_compute(loader_.backend(), sess_->gf_nonlast);
         ggml_backend_synchronize(loader_.backend());
@@ -9482,6 +9990,39 @@ bool Token2Mel::push_tokens(const int32_t * tokens, int64_t n_tokens, bool is_fi
     return true;
 }
 
+static uint64_t fnv1a64_append(uint64_t h, const void * data, size_t size) {
+    const auto * p = static_cast<const uint8_t *>(data);
+    for (size_t i = 0; i < size; ++i) {
+        h ^= p[i];
+        h *= UINT64_C(1099511628211);
+    }
+    return h;
+}
+
+template <typename T>
+static uint64_t fnv1a64_append_vector(uint64_t h, const std::vector<T> & values) {
+    const uint64_t n = static_cast<uint64_t>(values.size());
+    h = fnv1a64_append(h, &n, sizeof(n));
+    if (!values.empty()) {
+        h = fnv1a64_append(h, values.data(), values.size() * sizeof(T));
+    }
+    return h;
+}
+
+uint64_t Token2Mel::debug_stream_cache_checksum() const {
+    uint64_t h = UINT64_C(1469598103934665603);
+    h = fnv1a64_append_vector(h, cache_in_.conformer_cnn_cache);
+    h = fnv1a64_append_vector(h, cache_in_.conformer_cnn_ne);
+    h = fnv1a64_append_vector(h, cache_in_.conformer_att_cache);
+    h = fnv1a64_append_vector(h, cache_in_.conformer_att_ne);
+    h = fnv1a64_append_vector(h, cache_in_.estimator_cnn_cache);
+    h = fnv1a64_append_vector(h, cache_in_.estimator_cnn_ne);
+    h = fnv1a64_append_vector(h, cache_in_.estimator_att_cache);
+    h = fnv1a64_append_vector(h, cache_in_.estimator_att_ne);
+    h = fnv1a64_append(h, &cache_in_.n_timesteps, sizeof(cache_in_.n_timesteps));
+    return h;
+}
+
 void Token2Mel::reset_stream() {
     runner_.reset_stream();
     stream_started_ = false;
@@ -9705,6 +10246,26 @@ bool Token2Wav::load_models(const std::string & encoder_gguf,
     }
 
     voc_runner_.model = &voc_model_;
+    if (omni_cann_graph_enabled(voc_model_.backend)) {
+        constexpr auto bucket = token2wav_vocoder_cann_graph_bucket(
+            (int64_t) kMelCacheLen,
+            (int64_t) Token2Mel::kChunkMain * 2,
+            (int64_t) kSourceCacheLen);
+        std::vector<float> dummy_mel((size_t) Token2Mel::kMelChannels * (size_t) bucket.t_mel, 0.0f);
+        std::vector<float> dummy_cache((size_t) bucket.tc, 0.0f);
+        std::vector<float> dummy_wave;
+        std::vector<float> dummy_source;
+        int64_t dummy_audio_len  = 0;
+        int64_t dummy_source_len = 0;
+        if (!voc_runner_.voc_hg2_runner_eval_stream(
+                dummy_mel, bucket.t_mel, dummy_cache, bucket.tc,
+                dummy_wave, dummy_audio_len, dummy_source, dummy_source_len)) {
+            LOG_ERROR("Token2Wav.load_models: vocoder CANN Graph bucket prewarm failed\n");
+            models_loaded_ = false;
+            return false;
+        }
+    }
+
     models_loaded_    = true;
     return true;
 }
@@ -9809,9 +10370,25 @@ bool Token2Wav::push_tokens_window(const int32_t *      tokens,
 
     std::vector<float> out_source_bt1;
     int64_t            out_T_source = 0;
-    const auto t_voc0 = clock::now();
-    if (!voc_runner_.voc_hg2_runner_eval_stream(mel_in_bct, T_mel, voc_cache_source_bt1_, voc_Tc_, wave_bt_out,
-                                                out_T_audio, out_source_bt1, out_T_source)) {
+    const auto          t_voc0       = clock::now();
+
+    const bool use_cann_graph = token2wav_vocoder_uses_cann_graph(
+        is_final,
+        T_mel,
+        voc_Tc_,
+        (int64_t) kMelCacheLen,
+        (int64_t) Token2Mel::kChunkMain * 2,
+        (int64_t) kSourceCacheLen);
+    if (!use_cann_graph) {
+        omni_set_cann_disable_graph(voc_model_.backend, /*disable=*/true);
+    }
+    const bool voc_ok = voc_runner_.voc_hg2_runner_eval_stream(
+        mel_in_bct, T_mel, voc_cache_source_bt1_, voc_Tc_, wave_bt_out,
+        out_T_audio, out_source_bt1, out_T_source);
+    if (!use_cann_graph) {
+        omni_set_cann_disable_graph(voc_model_.backend, /*disable=*/false);
+    }
+    if (!voc_ok) {
         LOG_ERROR( "Token2Wav.push_tokens_window: voc_hg2_runner_eval_stream failed\n");
         return false;
     }
@@ -9864,6 +10441,17 @@ bool Token2Wav::push_tokens_window(const int32_t *      tokens,
     }
 
     return true;
+}
+
+uint64_t Token2Wav::debug_stream_cache_checksum() const {
+    uint64_t h = UINT64_C(1469598103934665603);
+    const uint64_t token2mel = t2m_.debug_stream_cache_checksum();
+    h = fnv1a64_append(h, &token2mel, sizeof(token2mel));
+    h = fnv1a64_append_vector(h, voc_mel_cache_bct_);
+    h = fnv1a64_append_vector(h, voc_cache_source_bt1_);
+    h = fnv1a64_append(h, &voc_Tc_, sizeof(voc_Tc_));
+    h = fnv1a64_append_vector(h, voc_speech_cache_bt_);
+    return h;
 }
 
 void Token2Wav::reset_stream() {

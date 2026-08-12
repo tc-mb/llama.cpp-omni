@@ -4421,6 +4421,7 @@ inline void signal_handler(int signal) {
 }
 
 int main(int argc, char ** argv) {
+    omni_bind_device();
     // own arguments required by this example
     common_params params;
 
@@ -5798,7 +5799,7 @@ int main(int argc, char ** argv) {
         
         // GPU 配置
         int tts_gpu_layers = json_value(data, "tts_gpu_layers", 99);
-        std::string token2wav_device = json_value(data, "token2wav_device", std::string("gpu:1"));
+        std::string token2wav_device = json_value(data, "token2wav_device", omni_default_token2wav_device());
         
         // 🔧 [多实例支持] 可配置的输出目录
         std::string output_dir = json_value(data, "output_dir", std::string("./tools/omni/output"));
@@ -5949,7 +5950,7 @@ int main(int argc, char ** argv) {
             SRV_INF("%s: break requested, reason=%s\n", __func__, reason.c_str());
             
             // 1. 设置打断标志 - 原子操作，线程安全
-            ctx_server.octx->break_event = true;
+            omni_request_break(ctx_server.octx);
             ctx_server.octx->current_turn_ended = true;
             
             // 2. 清空 text_queue 并通知等待的消费者
@@ -6002,6 +6003,12 @@ int main(int argc, char ** argv) {
             }
             
             SRV_INF("%s: reset requested, clearing KV caches\n", __func__);
+
+            // Reset is a destructive state transition for all model caches.
+            // First broadcast cancellation, then join every inference worker;
+            // otherwise active decode/TTS can race the KV removals below.
+            omni_request_break(ctx_server.octx);
+            omni_prepare_for_reuse(ctx_server.octx);
             
             // 1. 清空 LLM KV cache
             if (ctx_server.octx->ctx_llama) {
@@ -6024,7 +6031,7 @@ int main(int argc, char ** argv) {
             // 3. 重置状态变量
             ctx_server.octx->n_past = 0;
             ctx_server.octx->tts_all_generated_tokens.clear();
-            ctx_server.octx->break_event = false;
+            omni_reset_break_state(ctx_server.octx);
             ctx_server.octx->current_turn_ended = false;
             ctx_server.octx->llm_generation_done = false;
             
@@ -6085,6 +6092,11 @@ int main(int argc, char ** argv) {
             }
             
             SRV_INF("%s: update_session_config requested\n", __func__);
+
+            // Configuration may change cache/layout semantics. Stop and join
+            // the old session before mutating any shared model state.
+            omni_request_break(ctx_server.octx);
+            omni_prepare_for_reuse(ctx_server.octx);
             
             // 1. 更新 media_type（如果提供）
             bool media_type_changed = false;
@@ -6179,7 +6191,7 @@ int main(int argc, char ** argv) {
             ctx_server.octx->n_past = 0;
             ctx_server.octx->n_keep = 0;
             ctx_server.octx->tts_all_generated_tokens.clear();
-            ctx_server.octx->break_event = false;
+            omni_reset_break_state(ctx_server.octx);
             ctx_server.octx->current_turn_ended = false;
             ctx_server.octx->llm_generation_done = false;
             

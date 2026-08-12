@@ -1994,6 +1994,35 @@ extern "C" {
             bool                  is_2D,
             enum ggml_type        dst_type);
 
+    GGML_API struct ggml_tensor * ggml_im2col_causal_1d(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            int                   s0,
+            int                   p0,
+            int                   d0,
+            enum ggml_type        dst_type);
+
+    // Causal 1-D im2col whose input is contiguous [C, T, B]. The returned
+    // tensor has the same [K*C, OW, B] layout as ggml_im2col_causal_1d.
+    GGML_API struct ggml_tensor * ggml_im2col_causal_ctb_1d(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            int                   s0,
+            int                   p0,
+            int                   d0,
+            enum ggml_type        dst_type);
+
+    GGML_API struct ggml_tensor * ggml_im2col_vocoder_1d(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            int                   s0,
+            int                   p0,
+            int                   d0,
+            enum ggml_type        dst_type);
+
     GGML_API struct ggml_tensor * ggml_im2col_back(
         struct ggml_context * ctx,
         struct ggml_tensor  * a,  // convolution kernel

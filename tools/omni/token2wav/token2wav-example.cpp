@@ -9,6 +9,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -87,6 +88,26 @@ std::string parent_dir_of(const std::string & path) {
     return p.empty() ? std::string() : p.string();
 }
 
+bool parse_token_list(const std::string & value, std::vector<int32_t> & tokens) {
+    std::string normalized = value;
+    std::replace(normalized.begin(), normalized.end(), ',', ' ');
+    std::istringstream input(normalized);
+    int64_t token = 0;
+    tokens.clear();
+    while (input >> token) {
+        if (token < 0 || token > 6561) {
+            std::fprintf(stderr, "audio token out of range [0, 6561]: %lld\n", (long long) token);
+            return false;
+        }
+        tokens.push_back(static_cast<int32_t>(token));
+    }
+    if (!input.eof() || tokens.empty()) {
+        std::fprintf(stderr, "OMNI_T2W_TOKENS must be a non-empty comma/space separated integer list\n");
+        return false;
+    }
+    return true;
+}
+
 }  // namespace
 
 int main() {
@@ -98,7 +119,9 @@ int main() {
 
     // 默认路径，根据5个gguf和两个输出位置改动；可用环境变量覆盖，便于做纯 T2W profile。
     //   OMNI_T2W_MODEL_DIR  : token2wav-gguf 目录（内含 encoder/flow_*/hifigan2/prompt_cache）
-    //   OMNI_T2W_DEVICE     : "cpu" / "gpu" / "gpu:<idx>"（token2mel 设备）
+    //   OMNI_T2W_DEVICE     : "cpu" / "gpu:<idx>" / "npu:<idx>"（token2mel 设备）
+    //   OMNI_T2W_PROMPT_BUNDLE : optional prompt bundle directory; replaces prompt_cache.gguf
+    //   OMNI_T2W_TOKENS     : optional comma/space-separated relative audio tokens [0, 6561]
     //   OMNI_VOC_DEVICE : 可选，覆盖 vocoder 设备；macOS 默认走 CPU，避免 Metal vocoder 慢路径
     //   OMNI_T2W_OUT_WAV    : 合并输出 WAV 路径
     //   OMNI_T2W_OUT_CHUNK_DIR : 每个 callback chunk 的输出目录（空串 = 不落盘）
@@ -113,6 +136,7 @@ int main() {
     std::string flow_extra_gguf    = model_dir + "/flow_extra.gguf";
     std::string vocoder_gguf       = model_dir + "/hifigan2.gguf";
     std::string prompt_cache_gguf  = model_dir + "/prompt_cache.gguf";
+    std::string prompt_bundle_dir  = env_or("OMNI_T2W_PROMPT_BUNDLE", "");
 
     std::string out_wav            = env_or("OMNI_T2W_OUT_WAV", "/tmp/token2wav_example_stream.wav");
     std::string out_chunk_wav_dir  = env_or("OMNI_T2W_OUT_CHUNK_DIR", "/tmp/token2wav_example_chunks");
@@ -124,7 +148,7 @@ int main() {
     std::string device_vocoder     = env_or("OMNI_VOC_DEVICE", device_token2mel);
 #endif
 
-    int       n_timesteps = std::atoi(env_or("OMNI_T2W_N_TIMESTEPS", "5").c_str());
+    int       n_timesteps = std::atoi(env_or("OMNI_T2W_N_TIMESTEPS", "10").c_str());
     float     temperature = 1.0f;
     const int sr          = omni::flow::Token2Wav::kSampleRate;
 
@@ -140,7 +164,7 @@ int main() {
         }
     }
 
-    if (!file_exists(prompt_cache_gguf)) {
+    if (prompt_bundle_dir.empty() && !file_exists(prompt_cache_gguf)) {
         std::fprintf(stderr, "prompt_cache.gguf not found: %s\n", prompt_cache_gguf.c_str());
         return 2;
     }
@@ -157,20 +181,37 @@ int main() {
         5084, 5027, 4946, 4946, 2678, 575,  575,  521,  518,  638,  1367, 2804, 3402, 4299,
     };
     std::vector<int32_t> tokens;
-    tokens.reserve(tokens_base.size() * (size_t) repeat);
-    for (int r = 0; r < repeat; ++r) {
-        tokens.insert(tokens.end(), tokens_base.begin(), tokens_base.end());
+    const std::string token_list = env_or("OMNI_T2W_TOKENS", "");
+    if (!token_list.empty()) {
+        if (!parse_token_list(token_list, tokens)) {
+            return 2;
+        }
+    } else {
+        tokens.reserve(tokens_base.size() * (size_t) repeat);
+        for (int r = 0; r < repeat; ++r) {
+            tokens.insert(tokens.end(), tokens_base.begin(), tokens_base.end());
+        }
     }
 
     omni::flow::Token2WavSession sess;
-    // 初始化：加载 encoder/flow/vocoder 模型，导入 prompt_cache用于初始化
+    // 初始化：加载 encoder/flow/vocoder 模型，并从 prompt bundle 或 prompt cache 初始化。
     const auto t_init0 = clock::now();
     // CoreML backend: pass the path to init_from_prompt_cache_gguf. Leave empty for GPU-only.
     std::string coreml_model;
-    if (!sess.init_from_prompt_cache_gguf(encoder_gguf, flow_matching_gguf, flow_extra_gguf, prompt_cache_gguf,
-                                          vocoder_gguf, device_token2mel, device_vocoder, n_timesteps, temperature,
-                                          coreml_model)) {
-        std::fprintf(stderr, "init_from_prompt_cache_gguf failed\n");
+    bool init_ok = false;
+    if (!prompt_bundle_dir.empty()) {
+        init_ok = sess.init_from_prompt_bundle(
+            encoder_gguf, flow_matching_gguf, flow_extra_gguf, prompt_bundle_dir,
+            vocoder_gguf, device_token2mel, device_vocoder, n_timesteps, temperature,
+            coreml_model);
+    } else {
+        init_ok = sess.init_from_prompt_cache_gguf(
+            encoder_gguf, flow_matching_gguf, flow_extra_gguf, prompt_cache_gguf,
+            vocoder_gguf, device_token2mel, device_vocoder, n_timesteps, temperature,
+            coreml_model);
+    }
+    if (!init_ok) {
+        std::fprintf(stderr, "Token2Wav initialization failed\n");
         return 3;
     }
     const auto t_init1 = clock::now();
@@ -256,5 +297,3 @@ int main() {
     omni::flow::profile::print_summary(stderr);
     return 0;
 }
-
-

@@ -313,7 +313,8 @@ int main(int argc, char ** argv) {
     printf("  Ref audio:     %s\n", ref_audio_path.c_str());
 
     // media_type=2 表示 omni 模式（audio + vision）
-    auto ctx_omni = omni_init(&params, /*media_type=*/2, use_tts, tts_bin_dir, -1, "gpu:0");
+    auto ctx_omni = omni_init(&params, /*media_type=*/2, use_tts, tts_bin_dir, -1,
+                              omni_default_token2wav_device());
     if (ctx_omni == nullptr) {
         fprintf(stderr, "Error: Failed to initialize omni context\n");
         return 1;
