@@ -316,3 +316,11 @@ if (TARGET omni)
     target_link_libraries(test-audition-mel-length PRIVATE omni)
     llama_test(test-audition-mel-length)
 endif()
+
+add_executable(test-token2wav-runner-rng test-token2wav-runner-rng.cpp)
+target_include_directories(test-token2wav-runner-rng PRIVATE
+    ${PROJECT_SOURCE_DIR}/tools/omni/token2wav
+    ${PROJECT_SOURCE_DIR}/ggml/include
+    ${PROJECT_SOURCE_DIR}/ggml/src)
+target_compile_features(test-token2wav-runner-rng PRIVATE cxx_std_17)
+llama_test(test-token2wav-runner-rng)
