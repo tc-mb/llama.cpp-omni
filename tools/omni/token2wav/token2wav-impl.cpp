@@ -1281,7 +1281,7 @@ ggml_tensor * build_mish(ggml_context * ctx, ggml_tensor * x) {
     ggml_tensor * y              = ggml_mul(ctx, x, tanh_softplus);
     return y;
 }
-ggml_tensor * build_modulate(ggml_context * ctx, ggml_tensor * x, ggml_tensor * shift, ggml_tensor * scale) {
+static ggml_tensor * fm_build_modulate_impl(ggml_context * ctx, ggml_tensor * x, ggml_tensor * shift, ggml_tensor * scale) {
     if (ctx == nullptr || x == nullptr) {
         return nullptr;
     }
@@ -1652,17 +1652,17 @@ ggml_tensor * fmDiTBlock::build_forward_graph(ggml_context * ctx,
     ggml_tensor * scale_conv = chunks[7];
     ggml_tensor * gate_conv  = chunks[8];
     ggml_tensor * x_norm1 = build_layer_norm(ctx, x, norm1_weight_, norm1_bias_, kLnEps);
-    ggml_tensor * x_mod1  = build_modulate(ctx, x_norm1, shift_msa, scale_msa);
+    ggml_tensor * x_mod1  = fm_build_modulate_impl(ctx, x_norm1, shift_msa, scale_msa);
     ggml_tensor * x_attn  = attn_->build_forward_graph(ctx, x_mod1, attn_mask);
     ggml_tensor * x_attn_gated = ggml_mul(ctx, x_attn, gate_msa);
     x                          = ggml_add(ctx, x, x_attn_gated);
     ggml_tensor * x_norm3      = build_layer_norm(ctx, x, norm3_weight_, norm3_bias_, kLnEps);
-    ggml_tensor * x_mod3       = build_modulate(ctx, x_norm3, shift_conv, scale_conv);
+    ggml_tensor * x_mod3       = fm_build_modulate_impl(ctx, x_norm3, shift_conv, scale_conv);
     ggml_tensor * x_conv       = conv_->build_forward_graph(ctx, x_mod3, nullptr);
     ggml_tensor * x_conv_gated = ggml_mul(ctx, x_conv, gate_conv);
     x                          = ggml_add(ctx, x, x_conv_gated);
     ggml_tensor * x_norm2     = build_layer_norm(ctx, x, norm2_weight_, norm2_bias_, kLnEps);
-    ggml_tensor * x_mod2      = build_modulate(ctx, x_norm2, shift_mlp, scale_mlp);
+    ggml_tensor * x_mod2      = fm_build_modulate_impl(ctx, x_norm2, shift_mlp, scale_mlp);
     ggml_tensor * x_mlp       = mlp_->build_forward_graph(ctx, x_mod2);
     ggml_tensor * x_mlp_gated = ggml_mul(ctx, x_mlp, gate_mlp);
     x                         = ggml_add(ctx, x, x_mlp_gated);
@@ -1694,19 +1694,19 @@ ggml_tensor * fmDiTBlock::build_forward_chunk_graph(ggml_context * ctx,
     ggml_tensor * scale_conv = chunks[7];
     ggml_tensor * gate_conv  = chunks[8];
     ggml_tensor * x_norm1 = build_layer_norm(ctx, x, norm1_weight_, norm1_bias_, kLnEps);
-    ggml_tensor * x_mod1  = build_modulate(ctx, x_norm1, shift_msa, scale_msa);
+    ggml_tensor * x_mod1  = fm_build_modulate_impl(ctx, x_norm1, shift_msa, scale_msa);
     ggml_tensor * local_new_att_cache = nullptr;
     ggml_tensor * x_attn = attn_->build_forward_chunk_graph(ctx, x_mod1, att_cache, mask, &local_new_att_cache);
     ggml_tensor * x_attn_gated = ggml_mul(ctx, x_attn, gate_msa);
     x                          = ggml_add(ctx, x, x_attn_gated);
     ggml_tensor * x_norm3             = build_layer_norm(ctx, x, norm3_weight_, norm3_bias_, kLnEps);
-    ggml_tensor * x_mod3              = build_modulate(ctx, x_norm3, shift_conv, scale_conv);
+    ggml_tensor * x_mod3              = fm_build_modulate_impl(ctx, x_norm3, shift_conv, scale_conv);
     ggml_tensor * local_new_cnn_cache = nullptr;
     ggml_tensor * x_conv              = conv_->build_forward_chunk_graph(ctx, x_mod3, cnn_cache, &local_new_cnn_cache);
     ggml_tensor * x_conv_gated        = ggml_mul(ctx, x_conv, gate_conv);
     x                                 = ggml_add(ctx, x, x_conv_gated);
     ggml_tensor * x_norm2     = build_layer_norm(ctx, x, norm2_weight_, norm2_bias_, kLnEps);
-    ggml_tensor * x_mod2      = build_modulate(ctx, x_norm2, shift_mlp, scale_mlp);
+    ggml_tensor * x_mod2      = fm_build_modulate_impl(ctx, x_norm2, shift_mlp, scale_mlp);
     ggml_tensor * x_mlp       = mlp_->build_forward_graph(ctx, x_mod2);
     ggml_tensor * x_mlp_gated = ggml_mul(ctx, x_mlp, gate_mlp);
     x                         = ggml_add(ctx, x, x_mlp_gated);
@@ -1757,7 +1757,7 @@ ggml_tensor * fmFinalLayer::build_forward_graph(ggml_context * ctx, ggml_tensor 
     ggml_tensor * scale = ggml_view_3d(ctx, ada_out, half, 1, B, nb1, nb2, half * nb0);
     constexpr float kLnEps = 1e-6f;
     ggml_tensor *   x_norm = build_layer_norm(ctx, x, ln_weight_, ln_bias_, kLnEps);
-    ggml_tensor * x_mod = build_modulate(ctx, x_norm, shift, scale);
+    ggml_tensor * x_mod = fm_build_modulate_impl(ctx, x_norm, shift, scale);
     ggml_tensor * y = build_linear(ctx, x_mod, linear_weight_, linear_bias_);
     return y;
 }
@@ -2731,7 +2731,7 @@ ggml_tensor * fmModulateUtils::build_modulate(ggml_context * ctx,
                                               ggml_tensor *  x,
                                               ggml_tensor *  shift,
                                               ggml_tensor *  scale) {
-    return build_modulate(ctx, x, shift, scale);
+    return fm_build_modulate_impl(ctx, x, shift, scale);
 }
 }  // namespace flow_matching
 }  // namespace omni
