@@ -308,7 +308,7 @@ if (TARGET gguf-model-data)
     target_link_libraries(export-graph-ops PRIVATE gguf-model-data)
     target_compile_definitions(export-graph-ops PRIVATE LLAMA_HF_FETCH)
 endif()
-if (TARGET omni)
+if (LLAMA_BUILD_TOOLS)
     add_executable(test-audition-mel-length test-audition-mel-length.cpp)
     target_include_directories(test-audition-mel-length PRIVATE
         ${PROJECT_SOURCE_DIR}/tools/omni)
