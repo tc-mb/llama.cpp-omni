@@ -73,6 +73,16 @@
 // Thread-local variable to record the current device of this thread.
 thread_local int g_current_cann_device = -1;
 
+// GLOBAL graph capture and synchronous memory operations may not overlap on
+// the same device. Omni runs encoder, LLM and audio workers concurrently, so
+// serialize only these device-scoped critical sections.
+static std::mutex g_cann_device_op_mutexes[GGML_CANN_MAX_DEVICES];
+
+static std::mutex & ggml_cann_device_op_mutex(int32_t device) {
+    GGML_ASSERT(device >= 0 && device < GGML_CANN_MAX_DEVICES);
+    return g_cann_device_op_mutexes[device];
+}
+
 /**
  * @brief Set the CANN device to be used.
  *
@@ -1281,6 +1291,7 @@ static void ggml_backend_cann_buffer_set_tensor(ggml_backend_buffer_t buffer,
     ggml_backend_cann_buffer_context * ctx = (ggml_backend_cann_buffer_context *) buffer->context;
 
     ggml_cann_set_device(ctx->device);
+    std::lock_guard<std::mutex> device_lock(ggml_cann_device_op_mutex(ctx->device));
 
     // Only check env once.
     static bool weight_to_nz = parse_bool(get_env_as_lowercase("GGML_CANN_WEIGHT_NZ").value_or("on"));
@@ -1371,6 +1382,7 @@ static void ggml_backend_cann_buffer_get_tensor(ggml_backend_buffer_t buffer,
     ggml_backend_cann_buffer_context * ctx = (ggml_backend_cann_buffer_context *) buffer->context;
 
     ggml_cann_set_device(ctx->device);
+    std::lock_guard<std::mutex> device_lock(ggml_cann_device_op_mutex(ctx->device));
 
     if (!need_transform(tensor->type)) {
         ACL_CHECK(aclrtMemcpy(data, size, (char *) tensor->data + offset, size, ACL_MEMCPY_DEVICE_TO_HOST));
@@ -1405,6 +1417,7 @@ static bool ggml_backend_cann_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
         size_t memcpy_size = ggml_nbytes(src);
         // Same device.
         if (src_ctx->device == dst_ctx->device) {
+            std::lock_guard<std::mutex> device_lock(ggml_cann_device_op_mutex(src_ctx->device));
             ACL_CHECK(aclrtMemcpy((char *) dst->data, memcpy_size, (const char *) src->data, memcpy_size,
                                   ACL_MEMCPY_DEVICE_TO_DEVICE));
             return true;
@@ -1417,6 +1430,10 @@ static bool ggml_backend_cann_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
             int32_t canAccessPeer = 0;
             ACL_CHECK(aclrtDeviceCanAccessPeer(&canAccessPeer, src_ctx->device, dst_ctx->device));
             if (canAccessPeer) {
+                const int32_t dev_a = std::min(src_ctx->device, dst_ctx->device);
+                const int32_t dev_b = std::max(src_ctx->device, dst_ctx->device);
+                std::lock_guard<std::mutex> lock_a(ggml_cann_device_op_mutex(dev_a));
+                std::lock_guard<std::mutex> lock_b(ggml_cann_device_op_mutex(dev_b));
                 ggml_cann_set_device(src_ctx->device);
                 ACL_CHECK(aclrtDeviceEnablePeerAccess(dst_ctx->device, 0));
                 ACL_CHECK(aclrtMemcpy((char *) dst->data, memcpy_size, (const char *) src->data, memcpy_size,
@@ -1441,6 +1458,7 @@ static void ggml_backend_cann_buffer_memset_tensor(ggml_backend_buffer_t buffer,
     ggml_backend_cann_buffer_context * ctx = (ggml_backend_cann_buffer_context *) buffer->context;
 
     ggml_cann_set_device(ctx->device);
+    std::lock_guard<std::mutex> device_lock(ggml_cann_device_op_mutex(ctx->device));
     ACL_CHECK(aclrtMemset((char *) tensor->data + offset, size, value, size));
 }
 
@@ -1457,6 +1475,7 @@ static void ggml_backend_cann_buffer_clear(ggml_backend_buffer_t buffer, uint8_t
     ggml_backend_cann_buffer_context * ctx = (ggml_backend_cann_buffer_context *) buffer->context;
 
     ggml_cann_set_device(ctx->device);
+    std::lock_guard<std::mutex> device_lock(ggml_cann_device_op_mutex(ctx->device));
     ACL_CHECK(aclrtMemset(ctx->dev_ptr, buffer->size, value, buffer->size));
 }
 
@@ -2276,7 +2295,10 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
                                             bool                        use_cann_graph,
                                             bool                        cann_graph_capture_required) {
 #ifdef USE_ACL_GRAPH
+    std::unique_lock<std::mutex> capture_lock(
+        ggml_cann_device_op_mutex(cann_ctx->device), std::defer_lock);
     if (use_cann_graph && cann_graph_capture_required) {  // Begin CANN graph capture
+        capture_lock.lock();
         ACL_CHECK(aclmdlRICaptureBegin(cann_ctx->stream(), ACL_MODEL_RI_CAPTURE_MODE_GLOBAL));
     }
 #endif  // USE_ACL_GRAPH
@@ -2319,6 +2341,7 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
 
         if (cann_graph_capture_required) {  // End CANN graph capture
             ACL_CHECK(aclmdlRICaptureEnd(cann_ctx->stream(), &matched_graph->graph));
+            capture_lock.unlock();
         }
 
         // Execute CANN graph
