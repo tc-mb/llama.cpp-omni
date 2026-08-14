@@ -42,13 +42,13 @@ reset()
         env OMNI_T2W_PROFILE=2 OMNI_T2W_PRINT_GRAPH=1 ./token2wav-example
 
 5. Token2Mel 小算子优化回滚开关
-  以下实验项默认保持 legacy 路径；只有显式设为 0 才启用优化：
-    OMNI_T2W_LEGACY_CONV_STATE=0
-    OMNI_T2W_LEGACY_ADALN_SILU=0
-    OMNI_T2W_LEGACY_ADALN_CACHE=0
-    OMNI_T2W_LEGACY_EST_ATTN_CPY=0
-  fused QKV 也保持默认关闭，显式启用：
-    OMNI_T2W_FUSED_QKV=1
+  以下优化已通过单卡真实链路消融和 Seed-TTS 32 条质量检查，在 canonical
+  shape 下默认启用；不满足 shape/type 条件时自动回退。需要恢复旧路径时设置：
+    OMNI_T2W_LEGACY_CONV_STATE=1
+    OMNI_T2W_LEGACY_ADALN_SILU=1
+    OMNI_T2W_LEGACY_ADALN_CACHE=1
+    OMNI_T2W_LEGACY_EST_ATTN_CPY=1
+    OMNI_T2W_FUSED_QKV=0
 
   这些路径仍保留 canonical shape/type 检查；条件不满足时自动执行 legacy 图。
 

@@ -4,17 +4,17 @@ using omni::flow::token2wav_adaln_cache_graph_structure;
 using omni::flow::token2wav_legacy_adaln_cache_requested;
 using omni::flow::token2wav_should_cache_adaln;
 
-static_assert(token2wav_legacy_adaln_cache_requested(nullptr));
-static_assert(token2wav_legacy_adaln_cache_requested(""));
+static_assert(!token2wav_legacy_adaln_cache_requested(nullptr));
+static_assert(!token2wav_legacy_adaln_cache_requested(""));
 static_assert(!token2wav_legacy_adaln_cache_requested("0"));
-static_assert(token2wav_legacy_adaln_cache_requested("01"));
-static_assert(token2wav_legacy_adaln_cache_requested("true"));
+static_assert(!token2wav_legacy_adaln_cache_requested("01"));
+static_assert(!token2wav_legacy_adaln_cache_requested("true"));
 static_assert(token2wav_legacy_adaln_cache_requested("1"));
 
 // Canonical MiniCPM-o 4.5 CFM: 16 DiT blocks, hidden=512, five ODE steps, CFG batch=2, F32 timestep.
-static_assert(!token2wav_should_cache_adaln(nullptr, 16, 512, 5, 2, true));
+static_assert(token2wav_should_cache_adaln(nullptr, 16, 512, 5, 2, true));
 static_assert(token2wav_should_cache_adaln("0", 16, 512, 5, 2, true));
-static_assert(!token2wav_should_cache_adaln("01", 16, 512, 5, 2, true));
+static_assert(token2wav_should_cache_adaln("01", 16, 512, 5, 2, true));
 static_assert(!token2wav_should_cache_adaln("1", 16, 512, 5, 2, true));
 
 // Any topology, step count, CFG shape, or type mismatch keeps the original per-call graph.

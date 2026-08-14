@@ -5,11 +5,11 @@ using omni::flow::token2wav_est_att_writeback_graph_structure;
 using omni::flow::token2wav_legacy_est_att_cpy_requested;
 using omni::flow::token2wav_should_elide_est_att_writeback;
 
-static_assert(token2wav_legacy_est_att_cpy_requested(nullptr));
-static_assert(token2wav_legacy_est_att_cpy_requested(""));
+static_assert(!token2wav_legacy_est_att_cpy_requested(nullptr));
+static_assert(!token2wav_legacy_est_att_cpy_requested(""));
 static_assert(!token2wav_legacy_est_att_cpy_requested("0"));
-static_assert(token2wav_legacy_est_att_cpy_requested("01"));
-static_assert(token2wav_legacy_est_att_cpy_requested("true"));
+static_assert(!token2wav_legacy_est_att_cpy_requested("01"));
+static_assert(!token2wav_legacy_est_att_cpy_requested("true"));
 static_assert(token2wav_legacy_est_att_cpy_requested("1"));
 
 constexpr token2wav_est_att_shape persistent{ 4, 128, 302, 640, 2, true };
@@ -17,7 +17,7 @@ constexpr token2wav_est_att_shape nonlast{ 4, 128, 352, 640, 2, true };
 constexpr token2wav_est_att_shape last{ 4, 128, 358, 640, 2, true };
 
 // Canonical non-last and last graphs prove [current(delta), old] -> slice(delta, L) == old.
-static_assert(!token2wav_should_elide_est_att_writeback(nullptr, nonlast, persistent, 50));
+static_assert(token2wav_should_elide_est_att_writeback(nullptr, nonlast, persistent, 50));
 static_assert(token2wav_should_elide_est_att_writeback("0", last, persistent, 56));
 static_assert(!token2wav_should_elide_est_att_writeback("1", nonlast, persistent, 50));
 

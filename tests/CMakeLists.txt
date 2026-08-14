@@ -290,6 +290,21 @@ target_compile_features(test-duplex-terminal-tracker PRIVATE cxx_std_17)
 target_link_libraries(test-duplex-terminal-tracker PRIVATE Threads::Threads)
 llama_test(test-duplex-terminal-tracker)
 
+add_executable(test-token2wav-final-wav-transaction
+    test-token2wav-final-wav-transaction.cpp)
+target_include_directories(test-token2wav-final-wav-transaction PRIVATE
+    ${PROJECT_SOURCE_DIR}/tools/omni/token2wav)
+target_compile_features(test-token2wav-final-wav-transaction PRIVATE cxx_std_17)
+target_link_libraries(test-token2wav-final-wav-transaction PRIVATE Threads::Threads)
+llama_test(test-token2wav-final-wav-transaction)
+
+add_executable(test-token2wav-runner-rng test-token2wav-runner-rng.cpp)
+target_include_directories(test-token2wav-runner-rng PRIVATE
+    ${PROJECT_SOURCE_DIR}/tools/omni/token2wav)
+target_compile_features(test-token2wav-runner-rng PRIVATE cxx_std_17)
+target_link_libraries(test-token2wav-runner-rng PRIVATE omni)
+llama_test(test-token2wav-runner-rng)
+
 add_executable(test-cann-graph-bypass test-cann-graph-bypass.cpp)
 target_include_directories(test-cann-graph-bypass PRIVATE
     ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cann)

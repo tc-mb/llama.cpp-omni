@@ -137,5 +137,35 @@ int main() {
     assert(!break_state.load());
     assert(!break_state.acknowledge(DuplexBreakStage::LLM, break_5 + 1));
 
+    // Model the duplex LLM stop barrier exactly: it waits until the in-flight
+    // prefill count reaches zero OR running becomes false. The stop path must
+    // notify the same CV so join cannot deadlock with a non-zero count.
+    std::atomic<int> in_flight_prefill{1};
+    std::atomic<bool> pipeline_running{true};
+    std::mutex in_flight_mtx;
+    std::condition_variable in_flight_cv;
+    std::atomic<bool> barrier_waiting{false};
+    std::atomic<bool> barrier_released{false};
+    std::thread barrier_waiter([&]() {
+        std::unique_lock<std::mutex> lock(in_flight_mtx);
+        barrier_waiting.store(true);
+        in_flight_cv.wait(lock, [&]() {
+            return in_flight_prefill.load() == 0 ||
+                !pipeline_running.load();
+        });
+        barrier_released.store(true);
+    });
+    while (!barrier_waiting.load()) {
+        std::this_thread::yield();
+    }
+    {
+        std::lock_guard<std::mutex> lock(in_flight_mtx);
+        pipeline_running.store(false);
+    }
+    in_flight_cv.notify_all();
+    barrier_waiter.join();
+    assert(barrier_released.load());
+    assert(in_flight_prefill.load() == 1);
+
     return 0;
 }

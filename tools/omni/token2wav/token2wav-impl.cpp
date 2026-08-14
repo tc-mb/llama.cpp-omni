@@ -144,7 +144,6 @@ static bool omni_cann_graph_enabled(ggml_backend_t backend) {
     return getter && getter(backend);
 }
 
-
 #if ENABLE_STDERR_LOG
 #ifndef LOG_ERROR
 #define LOG_ERROR(...) std::fprintf(stderr, __VA_ARGS__)
@@ -2376,12 +2375,13 @@ void backend_tensor_set(ggml_backend_t backend,
         ggml_backend_tensor_set(tensor, data, 0, size_bytes);
     }
 }
-// Experimental fused QKV is opt-in until tensor and WAV equivalence are
-// established on the evaluation model.
+// Fused QKV is the measured default on the evaluation model. Keep an exact
+// rollback for diagnosis and non-canonical backends; build_fused_qkv() still
+// validates the model shape before the fused path is wired into the graph.
 bool fm_fused_qkv_enabled() {
     static const bool enabled = [] {
         const char * s = std::getenv("OMNI_T2W_FUSED_QKV");
-        return s != nullptr && s[0] == '1' && s[1] == '\0';
+        return s == nullptr || (s[0] == '1' && s[1] == '\0');
     }();
     return enabled;
 }
@@ -7759,14 +7759,14 @@ void runner_fill_noise_ctb(std::vector<float> & noise_ctb,
                     int64_t              T,
                     int64_t              B,
                     float                temperature,
-                    int64_t              offset_ct) {
+                    int64_t              offset_ct,
+                    std::mt19937 &        noise_gen) {
     noise_ctb.resize((size_t) C * (size_t) T * (size_t) B);
     const int64_t total = C * T * B;
     // 🔧 使用真随机数替代周期性伪噪声，避免音频伪影
-    static std::mt19937 gen(42);  // 固定种子保证可复现
     std::normal_distribution<float> dist(0.0f, 1.0f);
     for (int64_t i = 0; i < total; ++i) {
-        noise_ctb[(size_t) i] = temperature * dist(gen);
+        noise_ctb[(size_t) i] = temperature * dist(noise_gen);
     }
 }
 void runner_fill_timestep_1d(std::vector<float> & t_host, int64_t B_total, float t_value) {
@@ -7810,7 +7810,8 @@ void runner_feed_cfm_noise_ts(ggml_backend_t backend,
                               int64_t        last_att_len,
                               int64_t        C,
                               int64_t        T,
-                              int64_t        B) {
+                              int64_t        B,
+                              std::mt19937 &  noise_gen) {
     if (!backend || !ctx) {
         return;
     }
@@ -7821,7 +7822,8 @@ void runner_feed_cfm_noise_ts(ggml_backend_t backend,
         std::snprintf(noise_name, sizeof(noise_name), "fm_cfm_noise_chunk%d", call_id);
         if (ggml_tensor * t_noise = ggml_get_tensor(ctx, noise_name)) {
             std::vector<float> noise_ctb;
-            runner_fill_noise_ctb(noise_ctb, t_noise->ne[0], t_noise->ne[1], t_noise->ne[2], temperature, offset_ct);
+            runner_fill_noise_ctb(noise_ctb, t_noise->ne[0], t_noise->ne[1], t_noise->ne[2], temperature, offset_ct,
+                                  noise_gen);
             backend_tensor_set(backend, t_noise, noise_ctb.data(), noise_ctb.size() * sizeof(float));
         }
     }
@@ -7972,6 +7974,12 @@ struct flowGGUFModelRunner::streamSession {
 flowGGUFModelRunner::flowGGUFModelRunner() = default;
 flowGGUFModelRunner::~flowGGUFModelRunner() {
     reset();
+}
+std::mt19937 flowGGUFModelRunner::capture_noise_state() const {
+    return noise_state_.capture();
+}
+void flowGGUFModelRunner::restore_noise_state(const std::mt19937 & state) {
+    noise_state_.restore(state);
 }
 void flowGGUFModelRunner::reset() {
     if (sess_) {
@@ -8289,7 +8297,7 @@ bool flowGGUFModelRunner::setup_cache(const int32_t *       token_bt,
                                      mel_ctb.size() * sizeof(float));
     runner_feed_enc_stream_pos(loader_.backend(), sess_->ctx, loader_.encoder());
     runner_feed_cfm_noise_ts(loader_.backend(), sess_->ctx, sess_->call_id_setup, n_timesteps, temperature, 0,
-                             C_mel, T_mel, B);
+                             C_mel, T_mel, B, noise_state_.generator());
     const ggml_status st = ggml_backend_graph_compute(loader_.backend(), sess_->gf_setup);
     if (st != GGML_STATUS_SUCCESS) {
         return false;
@@ -8377,7 +8385,7 @@ bool flowGGUFModelRunner::inference_chunk(const int32_t *             token_bt,
     {
         omni::flow::profile::ScopeTimer _t("t2m.feed_noise");
         runner_feed_cfm_noise_ts(loader_.backend(), sess_->ctx, call_id, n_timesteps, temperature, last_att_len, C, T,
-                                 B);
+                                 B, noise_state_.generator());
     }
     if (sess_->adaln_cache_enabled) {
         bool & cache_ready = last_chunk ? sess_->adaln_cache_last_ready : sess_->adaln_cache_nonlast_ready;
@@ -9017,7 +9025,7 @@ bool flowGGUFModelRunner::init_from_host_caches(const flowStreamCacheHost & cach
             const int64_t C            = feat ? feat->ne[0] : 80;
             const int64_t T            = feat ? feat->ne[1] : 1;
             runner_feed_cfm_noise_ts(loader_.backend(), sess_->ctx, call_id, n_timesteps, temperature, last_att_len,
-                                     C, T, B);
+                                     C, T, B, noise_state_.generator());
         }
         if (sess_->adaln_cache_enabled && !sess_->adaln_cache_nonlast_ready) {
             if (runner_compute_oneoff_graph(loader_.backend(), sess_->gf_adaln_init_nonlast) != GGML_STATUS_SUCCESS) {

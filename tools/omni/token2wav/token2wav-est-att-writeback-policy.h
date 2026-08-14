@@ -6,7 +6,7 @@ namespace omni {
 namespace flow {
 
 constexpr bool token2wav_legacy_est_att_cpy_requested(const char * value) {
-    return value == nullptr || value[0] != '0' || value[1] != '\0';
+    return value != nullptr && value[0] == '1' && value[1] == '\0';
 }
 
 struct token2wav_est_att_shape {

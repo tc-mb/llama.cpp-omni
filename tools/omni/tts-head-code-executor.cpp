@@ -46,7 +46,29 @@ void TtsHeadCodeExecutor::compute_range(
         std::size_t shard_count) {
     const std::size_t begin = job.rows * shard_index / shard_count;
     const std::size_t end = job.rows * (shard_index + 1) / shard_count;
-    for (std::size_t row_index = begin; row_index < end; ++row_index) {
+    std::size_t row_index = begin;
+    for (; row_index + 3 < end; row_index += 4) {
+        const float * row0 = job.weights + (row_index + 0) * job.cols;
+        const float * row1 = job.weights + (row_index + 1) * job.cols;
+        const float * row2 = job.weights + (row_index + 2) * job.cols;
+        const float * row3 = job.weights + (row_index + 3) * job.cols;
+        float sum0 = 0.0f;
+        float sum1 = 0.0f;
+        float sum2 = 0.0f;
+        float sum3 = 0.0f;
+        for (std::size_t column = 0; column < job.cols; ++column) {
+            const float value = job.hidden[column];
+            sum0 += value * row0[column];
+            sum1 += value * row1[column];
+            sum2 += value * row2[column];
+            sum3 += value * row3[column];
+        }
+        job.logits[row_index + 0] = sum0;
+        job.logits[row_index + 1] = sum1;
+        job.logits[row_index + 2] = sum2;
+        job.logits[row_index + 3] = sum3;
+    }
+    for (; row_index < end; ++row_index) {
         const float * row = job.weights + row_index * job.cols;
         float sum = 0.0f;
         for (std::size_t column = 0; column < job.cols; ++column) {

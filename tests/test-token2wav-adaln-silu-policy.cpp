@@ -4,18 +4,18 @@ using omni::flow::token2wav_adaln_silu_graph_structure;
 using omni::flow::token2wav_legacy_adaln_silu_requested;
 using omni::flow::token2wav_should_share_adaln_silu;
 
-static_assert(token2wav_legacy_adaln_silu_requested(nullptr));
-static_assert(token2wav_legacy_adaln_silu_requested(""));
+static_assert(!token2wav_legacy_adaln_silu_requested(nullptr));
+static_assert(!token2wav_legacy_adaln_silu_requested(""));
 static_assert(!token2wav_legacy_adaln_silu_requested("0"));
-static_assert(token2wav_legacy_adaln_silu_requested("01"));
-static_assert(token2wav_legacy_adaln_silu_requested("true"));
+static_assert(!token2wav_legacy_adaln_silu_requested("01"));
+static_assert(!token2wav_legacy_adaln_silu_requested("true"));
 static_assert(token2wav_legacy_adaln_silu_requested("1"));
 
 // Canonical MiniCPM-o 4.5 DiT: 16 blocks, hidden=512, CFG batch=2.
-static_assert(!token2wav_should_share_adaln_silu(nullptr, 16, 512, 3, 512, 1, 2, true));
+static_assert(token2wav_should_share_adaln_silu(nullptr, 16, 512, 3, 512, 1, 2, true));
 static_assert(token2wav_should_share_adaln_silu("0", 16, 512, 3, 512, 1, 2, true));
-static_assert(!token2wav_should_share_adaln_silu("01", 16, 512, 3, 512, 1, 2, true));
-static_assert(!token2wav_should_share_adaln_silu("true", 16, 512, 3, 512, 1, 2, true));
+static_assert(token2wav_should_share_adaln_silu("01", 16, 512, 3, 512, 1, 2, true));
+static_assert(token2wav_should_share_adaln_silu("true", 16, 512, 3, 512, 1, 2, true));
 static_assert(!token2wav_should_share_adaln_silu("1", 16, 512, 3, 512, 1, 2, true));
 
 // Unknown topology, layout, batch, or type keeps the legacy per-consumer graph.

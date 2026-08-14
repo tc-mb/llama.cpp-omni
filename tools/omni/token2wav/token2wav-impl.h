@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <new>
+#include <random>
 #include "ggml-backend.h"
 #include "ggml-alloc.h"
 
@@ -1696,6 +1697,23 @@ struct flowStreamCacheHost {
                estimator_att_cache.empty();
     }
 };
+
+// Lightweight, model-independent RNG state used by one streaming runner.
+// Each runner starts from the legacy seed and consumes one continuous stream
+// across setup and inference chunks. Keeping capture/restore on this object
+// prevents final-WAV replay in one session from rewinding another session.
+class flowRunnerNoiseState {
+  public:
+    flowRunnerNoiseState() : generator_(42) {}
+
+    std::mt19937 capture() const { return generator_; }
+    void restore(const std::mt19937 & state) { generator_ = state; }
+    std::mt19937 & generator() { return generator_; }
+
+  private:
+    std::mt19937 generator_;
+};
+
 class flowGGUFModelRunner {
   public:
     flowGGUFModelRunner();
@@ -1710,6 +1728,8 @@ class flowGGUFModelRunner {
     void set_num_threads(int n_threads);
     const std::string & backend_name() const { return loader_.backend_name(); }
     void set_export_caches_to_host(bool enable) { export_caches_to_host_ = enable; }
+    std::mt19937 capture_noise_state() const;
+    void restore_noise_state(const std::mt19937 & state);
     void reset_stream();
     bool setup_cache(const int32_t *       token_bt,
                      int64_t               B,
@@ -1777,7 +1797,8 @@ class flowGGUFModelRunner {
     struct streamSessionEncOnly;
     int  num_threads_           = 1;
     bool export_caches_to_host_ = true;
-    flowGGUFModelLoader            loader_;
+    flowRunnerNoiseState                  noise_state_;
+    flowGGUFModelLoader                   loader_;
     std::unique_ptr<streamSession>        sess_;
     std::unique_ptr<streamSessionEncOnly> sess_enc_only_;
 };
@@ -2123,6 +2144,8 @@ class Token2Mel {
 
     void reset_stream();
     uint64_t debug_stream_cache_checksum() const;
+    std::mt19937 capture_noise_state() const { return runner_.capture_noise_state(); }
+    void restore_noise_state(const std::mt19937 & state) { runner_.restore_noise_state(state); }
 
     bool is_ane_mode() const { return backend_kind_ == Backend::ANE; }
 
@@ -2281,6 +2304,8 @@ class Token2Wav {
 
     void reset_stream();
     uint64_t debug_stream_cache_checksum() const;
+    std::mt19937 capture_noise_state() const { return t2m_.capture_noise_state(); }
+    void restore_noise_state(const std::mt19937 & state) { t2m_.restore_noise_state(state); }
 
     static constexpr int32_t kSampleRate = omni::vocoder::hifigan2::hg2_hift_generator::HG2_SAMPLING_RATE;
 
@@ -2345,6 +2370,17 @@ struct Token2WavSession {
         return feed_window(tokens.data(), (int64_t) tokens.size(), is_final, wave_bt_out);
     }
 
+    // Single-session bounded speculation. Normal feed_window calls are recorded
+    // exactly; tentative output stays private until the caller commits it.
+    void enable_bounded_replay(bool enable, std::size_t max_calls = 64);
+    bool begin_tentative();
+    bool feed_window_tentative(const std::vector<int32_t> & tokens, bool is_final,
+                               std::vector<float> & wave_bt_out);
+    bool abort_tentative_replay();
+    bool recover_committed_replay();
+    bool commit_tentative();
+    bool bounded_replay_available() const;
+
     using audio_chunk_callback = std::function<void(const float * pcm, int64_t n_samples)>;
 
     bool feed_window(const int32_t *              tokens,
@@ -2370,8 +2406,31 @@ struct Token2WavSession {
     Token2Wav t2w;
 
   private:
+    struct ReplayCall {
+        std::vector<int32_t> tokens;
+        bool is_final = false;
+    };
+    enum class PromptKind { none, cache_gguf, bundle };
+
+    bool restart_replay_base();
+
     std::vector<int32_t> pending_;
     std::vector<float>   wave_tmp_;
+    PromptKind replay_prompt_kind_ = PromptKind::none;
+    std::string replay_prompt_cache_path_;
+    Token2Mel::PromptBundle replay_prompt_bundle_;
+    int replay_n_timesteps_ = 10;
+    float replay_temperature_ = 1.0f;
+    std::mt19937 replay_initial_noise_{42};
+    std::vector<ReplayCall> replay_calls_;
+    std::vector<ReplayCall> replay_tentative_calls_;
+    std::size_t replay_max_calls_ = 64;
+    uint64_t replay_checkpoint_checksum_ = 0;
+    std::mt19937 replay_checkpoint_noise_{42};
+    bool replay_checkpoint_valid_ = false;
+    bool replay_enabled_ = false;
+    bool replay_tentative_ = false;
+    bool replay_replaying_ = false;
 };
 
 }  // namespace flow

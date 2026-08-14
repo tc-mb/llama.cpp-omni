@@ -11,8 +11,12 @@
 #include <mutex>
 #include <condition_variable>
 #include <chrono>
+#include <cstdint>
 #include <functional>
 #include <atomic>
+#include <unordered_map>
+
+#include "token2wav/token2wav-final-wav-transaction.h"
 
 // Windows compatibility: pid_t is not defined on MSVC
 #ifdef _WIN32
@@ -40,6 +44,12 @@ struct DuplexPipeline;
 // 让外部只需要 push_frame / wait_next_frame，无需知道 stream_prefill/stream_decode
 // 的"index 语义"和并发约束。
 struct DuplexSession;
+
+enum class Token2WavLifecycleState : uint8_t {
+    uninitialized,
+    ready,
+    invalidated,
+};
 class TtsHeadCodeExecutor;
 
 //
@@ -75,11 +85,13 @@ struct LLMThreadInfo {
 };
 
 struct T2WOut {
+    omni::flow::final_wav_command command = omni::flow::final_wav_command::data;
     std::vector<llama_token> audio_tokens;  // Audio token IDs (25 tokens per chunk)
     bool is_final = false;  // Whether this is the final chunk (turn end)
     bool is_chunk_end = false;  // Whether this is the end of a TTS chunk (flush buffer, but not final)
     int round_idx = -1;  // 🔧 [修复目录同步] 轮次索引，由 TTS 线程设置，T2W 线程使用此值确定输出目录
     int turn_id = -1;  // Duplex RTF 关联键；-1 表示旧/非 duplex 数据
+    uint64_t epoch = 0; // Final-WAV transaction key; DATA merging may not cross it.
     uint64_t terminal_seq = 0;  // 唯一 EOT 序号；0 表示普通数据
     std::chrono::steady_clock::time_point enqueue_time = std::chrono::steady_clock::now();
 };
@@ -89,6 +101,9 @@ struct T2WThreadInfo {
     std::queue<T2WOut*> queue;
     std::mutex mtx;
     std::condition_variable cv;
+    bool busy = false;  // Protected by mtx; true while C++ T2W processes a dequeued batch.
+    bool tentative = false; // Protected by mtx; private speculative render exists.
+    omni::flow::final_wav_admission_state final_wav_admission; // Protected by mtx.
     std::chrono::steady_clock::time_point start;
     std::chrono::steady_clock::time_point end;
 
@@ -473,7 +488,9 @@ struct omni_context {
     
     // C++ Token2Wav session for audio synthesis
     std::unique_ptr<omni::flow::Token2WavSession> token2wav_session;
-    bool token2wav_initialized = false;
+    std::atomic<Token2WavLifecycleState> token2wav_lifecycle{
+        Token2WavLifecycleState::uninitialized};
+    bool token2wav_replay_configured = false;
     std::string token2wav_model_dir;  // Directory containing token2wav GGUF models
     
     // 🔧 [Python Token2Wav] 使用 Python stepaudio2 库实现的 Token2Wav
@@ -715,8 +732,7 @@ bool tts_projector_semantic(struct omni_context* ctx_omni, const float * hidden,
 void normalize_l2_per_token(float * embeddings, int n_tokens, int n_embd, float eps = 1e-8f);
 
 // Projector 函数声明（精度验证版本）
-bool projector_init(projector_model & model, const std::string & fname, bool use_cuda,
-                    const char * device_name = nullptr);
+bool projector_init(projector_model & model, const std::string & fname, bool use_cuda);
 void projector_free(projector_model & model);
 std::vector<float> projector_forward(projector_model & model, const float * input_data, int n_tokens);
 

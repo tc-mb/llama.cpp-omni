@@ -6,7 +6,7 @@ namespace omni {
 namespace flow {
 
 constexpr bool token2wav_legacy_conv_state_requested(const char * value) {
-    return value == nullptr || value[0] != '0' || value[1] != '\0';
+    return value != nullptr && value[0] == '1' && value[1] == '\0';
 }
 
 constexpr bool token2wav_use_current_tail_for_conv_state(int64_t      dt,
