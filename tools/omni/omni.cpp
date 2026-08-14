@@ -252,6 +252,14 @@ static OmniTokenType get_token_type(struct omni_context * ctx, llama_token token
     return OmniTokenType::NORMAL;
 }
 
+static bool is_simplex_terminator_token(struct omni_context * ctx, llama_token token) {
+    return token >= 0 &&
+           (token == ctx->special_token_tts_eos ||
+            token == ctx->special_token_im_end ||
+            token == ctx->special_token_slash_s ||
+            token == ctx->special_token_eos);
+}
+
 // 检查是否是会话/轮次结束 token
 static bool is_end_token(struct omni_context * ctx, llama_token token) {
     OmniTokenType type = get_token_type(ctx, token);
@@ -1402,7 +1410,9 @@ static const char * sample_with_hidden_and_token(struct common_sampler * smpl, s
             ctx_omni->tts_bos_token_id,
         };
         for (const llama_token token : simplex_forbidden) {
-            if (token >= 0) {
+            // Some vocabularies alias a control token to an EOS id. Never mask
+            // a valid simplex terminator when token ids overlap.
+            if (token >= 0 && !is_simplex_terminator_token(ctx_omni, token)) {
                 logits[token] = -INFINITY;
             }
         }
@@ -11137,11 +11147,13 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
                 }
                 
                 total_tokens_generated++;
+                const OmniTokenType token_type = get_token_type(ctx_omni, sampled_token);
                 
                 // 🔧 [过滤逻辑] 只收集有效的 TTS token
                 // 特殊 token（如 <think>, </think>, 换行等）不计入 step_size
                 if (tmp != nullptr && hidden_states != nullptr) {
-                    if (is_valid_tts_token(sampled_token)) {
+                    if (token_type == OmniTokenType::NORMAL &&
+                        is_valid_tts_token(sampled_token)) {
                         // 有效 token：收集并计入计数
                         chunk_token_ids.push_back(sampled_token);
                         chunk_hidden_states.insert(chunk_hidden_states.end(), hidden_states, hidden_states + llm_n_embd);
@@ -11190,7 +11202,6 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
                 // 🔧 [调试日志] 记录每个生成的 token 到文件
                 
                 // 🔧 [使用 token ID 检测] 使用缓存的 token ID 进行检测，比字符串比较更高效
-                OmniTokenType token_type = get_token_type(ctx_omni, sampled_token);
                 if (token_type != OmniTokenType::NORMAL) {
                 }
 
