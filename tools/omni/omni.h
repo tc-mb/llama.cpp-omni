@@ -535,6 +535,10 @@ bool omni_tts_queues_empty(struct omni_context * ctx_omni);
 // 停止所有线程（在 join 之前调用）
 void omni_stop_threads(struct omni_context * ctx_omni);
 
+// Signal every inference stage and wake blocked workers. The flag is cleared
+// only after the caller has joined workers or begins a new decode generation.
+void omni_request_break(struct omni_context * ctx_omni);
+
 bool stream_prefill(struct omni_context * ctx_omni,
                             std::string aud_fname,
                             std::string img_fname = "",

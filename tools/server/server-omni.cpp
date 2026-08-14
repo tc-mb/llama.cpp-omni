@@ -503,7 +503,7 @@ int main(int argc, char ** argv) {
             std::lock_guard<std::mutex> octx_lock(state.octx_mutex);
             auto * closing = state.session_mgr.get(session_id);
             if (closing && closing->octx) {
-                closing->octx->break_event = true;
+                omni_request_break(closing->octx);
                 {
                     std::lock_guard<std::mutex> lk(closing->octx->text_mtx);
                     closing->octx->text_queue.clear();

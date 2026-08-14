@@ -5949,7 +5949,7 @@ int main(int argc, char ** argv) {
             SRV_INF("%s: break requested, reason=%s\n", __func__, reason.c_str());
             
             // 1. 设置打断标志 - 原子操作，线程安全
-            ctx_server.octx->break_event = true;
+            omni_request_break(ctx_server.octx);
             ctx_server.octx->current_turn_ended = true;
             
             // 2. 清空 text_queue 并通知等待的消费者
@@ -6002,6 +6002,11 @@ int main(int argc, char ** argv) {
             }
             
             SRV_INF("%s: reset requested, clearing KV caches\n", __func__);
+
+            // Workers may still be reading KV/TTS state. Cancel and join them
+            // before clearing caches that the next session will reuse.
+            omni_request_break(ctx_server.octx);
+            omni_prepare_for_reuse(ctx_server.octx);
             
             // 1. 清空 LLM KV cache
             if (ctx_server.octx->ctx_llama) {
@@ -6085,6 +6090,9 @@ int main(int argc, char ** argv) {
             }
             
             SRV_INF("%s: update_session_config requested\n", __func__);
+
+            omni_request_break(ctx_server.octx);
+            omni_prepare_for_reuse(ctx_server.octx);
             
             // 1. 更新 media_type（如果提供）
             bool media_type_changed = false;

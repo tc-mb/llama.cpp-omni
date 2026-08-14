@@ -4715,6 +4715,29 @@ bool omni_tts_queues_empty(struct omni_context * ctx_omni) {
     return tts_empty && t2w_empty;
 }
 
+void omni_request_break(struct omni_context * ctx_omni) {
+    if (ctx_omni == nullptr) {
+        return;
+    }
+
+    ctx_omni->break_event.store(true, std::memory_order_release);
+    if (ctx_omni->llm_thread_info) {
+        ctx_omni->llm_thread_info->cv.notify_all();
+    }
+    if (ctx_omni->tts_thread_info) {
+        ctx_omni->tts_thread_info->cv.notify_all();
+    }
+    if (ctx_omni->t2w_thread_info) {
+        ctx_omni->t2w_thread_info->cv.notify_all();
+    }
+    if (ctx_omni->duplex) {
+        ctx_omni->duplex->encoder_cv.notify_all();
+        ctx_omni->duplex->llm_cv.notify_all();
+        ctx_omni->duplex->decode_done_cv.notify_all();
+    }
+    ctx_omni->text_cv.notify_all();
+}
+
 // 停止所有线程（发送信号，不等待）
 void omni_stop_threads(struct omni_context * ctx_omni) {
     // 发送停止信号

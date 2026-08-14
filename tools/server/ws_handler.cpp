@@ -165,6 +165,7 @@ static void clear_text_stream_state(omni_context * octx) {
 }
 
 static void stop_reusable_octx_threads(omni_context * octx) {
+    omni_request_break(octx);
     omni_prepare_for_reuse(octx);
 }
 
@@ -1267,7 +1268,7 @@ cleanup:
         std::lock_guard<std::mutex> lock(octx_mutex);
         OmniSession * session = session_mgr.get(session_id);
         if (session && session->octx) {
-            session->octx->break_event = true;
+            omni_request_break(session->octx);
             {
                 std::lock_guard<std::mutex> lk(session->octx->text_mtx);
                 session->octx->text_queue.clear();
