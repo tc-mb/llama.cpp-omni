@@ -4803,6 +4803,10 @@ void omni_prepare_for_reuse(struct omni_context * ctx_omni) {
         }
     }
 
+    if (ctx_omni->ctx_sampler) {
+        common_sampler_reset(ctx_omni->ctx_sampler);
+    }
+
     print_with_timestamp("omni_prepare_for_reuse: inference threads stopped and queues cleared\n");
 }
 
