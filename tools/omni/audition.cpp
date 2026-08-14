@@ -22,6 +22,8 @@
 #include <set>
 #include <unordered_set>
 #include <vector>
+
+#define GGML_KQ_MASK_PAD 256
 #include <sstream>
 #include <cinttypes>
 #include <limits>
@@ -446,6 +448,20 @@ struct audition_graph {
         }
         
         ggml_tensor * inpL = cur;
+
+        // MiniCPM-o uses a one-second chunk mask: a query can attend to all
+        // preceding chunks and every token in its own 50-token chunk, but not
+        // to future chunks. This also applies to offline reference audio.
+        const int n_query_tokens = cur->ne[1];
+        const int n_past_tokens = ctx->whisper_kv_cache.buffer != nullptr
+            ? ctx->whisper_kv_cache.iter * n_query_tokens
+            : 0;
+        const int n_key_tokens = n_past_tokens + n_query_tokens;
+        ggml_tensor * whisper_attn_mask = ggml_new_tensor_2d(
+            ctx0, GGML_TYPE_F32, n_key_tokens,
+            GGML_PAD(n_query_tokens, GGML_KQ_MASK_PAD));
+        ggml_set_name(whisper_attn_mask, "whisper_attn_mask");
+        ggml_set_input(whisper_attn_mask);
         
         // Step 4: Transformer encoder layers (800-940)
         for (int il = 0; il < n_layer; ++il) {
@@ -635,7 +651,8 @@ struct audition_graph {
                 
                 // Step 3: Attention computation
                 ggml_tensor * KQ = ggml_mul_mat(ctx0, K, Q);
-                ggml_tensor * KQ_soft_max = ggml_soft_max_ext(ctx0, KQ, nullptr, KQscale, 0.0f);
+                ggml_tensor * KQ_soft_max = ggml_soft_max_ext(
+                    ctx0, KQ, whisper_attn_mask, KQscale, 0.0f);
                 
                 ggml_tensor * KQV = ggml_mul_mat(ctx0, V, KQ_soft_max);
                 ggml_tensor * KQV_merged = ggml_permute(ctx0, KQV, 0, 2, 1, 3);
@@ -1381,11 +1398,11 @@ int audition_n_output_tokens(const struct audition_ctx * ctx, struct audition_au
                 // Whisper encoder 输出 token 数计算：
                 // 1. 输入: mel frames = audio->nx
                 // 2. Conv1 (stride=1, padding=k/2): 输出 ≈ 输入 (same padding)
-                // 3. Conv2 (stride=2, padding=k/2): 输出 ≈ 输入/2 (向下取整)
+                // 3. Conv2 (stride=2, padding=k/2): 输出 = ceil(输入/2)
                 // 4. Pool (k=5, s=5, p=0): 输出 = (输入 - 5) / 5 + 1
                 // 公式: conv_out = (in + 2*p - d*(k-1) - 1) / s + 1 (floor)
                 //       pool_out = (in + 2*p - k) / s + 1 (floor)
-                const int n_tokens_after_conv = audio->nx / 2;  // conv2 stride=2 下采样
+                const int n_tokens_after_conv = (audio->nx + 1) / 2;
                 const int pool_k = 5;
                 const int pool_s = 5;
                 n_patches = (n_tokens_after_conv - pool_k) / pool_s + 1;
@@ -1487,6 +1504,29 @@ bool audition_audio_batch_encode(audition_ctx * ctx, const int n_threads, const 
         std::vector<float> inp_raw(n_step * n_mel);
         std::memcpy(inp_raw.data(), mel_inp->buf.data(), n_step * n_mel * sizeof(float));
         set_input_f32("inp_raw", inp_raw);
+
+        const int n_query_tokens = (n_step + 1) / 2;
+        const int n_past_tokens = ctx->whisper_kv_cache.buffer != nullptr
+            ? ctx->whisper_kv_cache.iter * n_query_tokens
+            : 0;
+        const int n_key_tokens = n_past_tokens + n_query_tokens;
+        const int n_padded_queries = GGML_PAD(n_query_tokens, GGML_KQ_MASK_PAD);
+        const float neg_inf = -std::numeric_limits<float>::infinity();
+        std::vector<float> attn_mask(
+            static_cast<size_t>(n_key_tokens) * static_cast<size_t>(n_padded_queries),
+            neg_inf);
+        constexpr int chunk_tokens = 50;
+        for (int q = 0; q < n_query_tokens; ++q) {
+            const int absolute_q = n_past_tokens + q;
+            const int chunk_end = std::min(
+                ((absolute_q / chunk_tokens) + 1) * chunk_tokens,
+                n_key_tokens);
+            for (int k = 0; k < chunk_end; ++k) {
+                attn_mask[static_cast<size_t>(k) +
+                          static_cast<size_t>(q) * static_cast<size_t>(n_key_tokens)] = 0.0f;
+            }
+        }
+        set_input_f32("whisper_attn_mask", attn_mask);
     }
 
     // set input per projector
@@ -1524,7 +1564,7 @@ bool audition_audio_batch_encode(audition_ctx * ctx, const int n_threads, const 
         // After conv2 stride=2: 100/2 = 50 tokens
         // Note: pooling happens later in projector, so n_tokens here is before pooling
         const int input_frames = audios.entries[0]->nx;
-        const int n_tokens = input_frames / 2; // After conv2 with stride=2
+        const int n_tokens = (input_frames + 1) / 2; // Conv2 stride=2 with same padding
         
         const int current_total_tokens = ctx->whisper_kv_cache.iter * n_tokens;
         const int new_total_tokens = current_total_tokens + n_tokens;
@@ -1908,12 +1948,12 @@ static bool log_mel_spectrogram(
     // reflective pad 200 samples at the beginning of audio
     std::reverse_copy(samples + 1, samples + 1 + stage_2_pad, samples_padded.begin());
 
-    mel.n_mel     = n_mel;
-    // https://github.com/pytorch/pytorch/blob/main/aten/src/ATen/native/SpectralOps.cpp#L936
-    // Calculate number of frames + remove the last frame
-    mel.n_len     = (samples_padded.size() - frame_size) / frame_step;
-    // Calculate semi-padded sample length to ensure compatibility
-    mel.n_len_org = 1 + (n_samples + stage_2_pad - frame_size) / frame_step;
+    mel.n_mel = n_mel;
+    // Match the official processor's attention-mask crop without allocating
+    // the complete 30-second tail. Floor division drops the last partially
+    // filled frame for non-aligned reference audio.
+    mel.n_len = (n_samples + frame_step - 1) / frame_step;
+    mel.n_len_org = mel.n_len;
     mel.data.resize(mel.n_mel * mel.n_len);
 
     {
@@ -2057,16 +2097,9 @@ bool audition_audio_preprocess(
     LOG_INF("%s: Decoded audio - sample_rate=%d, n_samples=%zu\n",
             __func__, sample_rate, pcm_f32.size());
     
-    // 🔧 [修复] 将音频 pad 到 100ms 的倍数（1600 samples @ 16kHz）
-    // 这是为了确保 Whisper encoder 的输出 token 数与预期一致
-    // 原因：
-    //   - mel_frames = n_samples / 160
-    //   - conv2 下采样 2 倍：mel_frames / 2
-    //   - pool (k=5, s=5)：(mel_frames/2 - 5) / 5 + 1
-    //   - 只有当 mel_frames 是 10 的倍数时，token 数才能精确计算
-    //   - mel_frames = 10 对应 n_samples = 1600 (100ms)
-    // 
-    // 尾音处理：流式音频的最后一片可能不足 100ms 的倍数，需要 pad 静音
+    // Preserve the original offline length. Rounding every clip up to a
+    // 100 ms boundary changes the final mel frames and LLM audio embeddings.
+    // Keep only a minimum-length guard for exceptionally short input.
     const size_t CHUNK_SAMPLES = 1600;  // 100ms @ 16kHz
     size_t original_size = pcm_f32.size();
     
@@ -2075,13 +2108,6 @@ bool audition_audio_preprocess(
         pcm_f32.resize(CHUNK_SAMPLES, 0.0f);
         LOG_WRN("%s: Audio too short (%zu samples = %.1fms), padded with silence to %zu samples (100ms)\n",
                 __func__, original_size, original_size * 1000.0f / sample_rate, CHUNK_SAMPLES);
-    } else if (original_size % CHUNK_SAMPLES != 0) {
-        // 不是 100ms 的倍数，pad 到下一个 100ms 边界
-        size_t padded_size = ((original_size / CHUNK_SAMPLES) + 1) * CHUNK_SAMPLES;
-        pcm_f32.resize(padded_size, 0.0f);
-        LOG_WRN("%s: Audio not aligned to 100ms (%zu samples = %.1fms), padded with silence to %zu samples (%.0fms)\n",
-                __func__, original_size, original_size * 1000.0f / sample_rate, 
-                padded_size, padded_size * 1000.0f / sample_rate);
     }
     
     // ===== 步骤2：获取 Mel 滤波器 =====
