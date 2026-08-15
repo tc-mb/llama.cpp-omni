@@ -324,3 +324,9 @@ target_include_directories(test-token2wav-runner-rng PRIVATE
     ${PROJECT_SOURCE_DIR}/ggml/src)
 target_compile_features(test-token2wav-runner-rng PRIVATE cxx_std_17)
 llama_test(test-token2wav-runner-rng)
+
+add_executable(test-omni-token-policy test-omni-token-policy.cpp)
+target_include_directories(test-omni-token-policy PRIVATE
+    ${PROJECT_SOURCE_DIR}/tools/omni)
+target_compile_features(test-omni-token-policy PRIVATE cxx_std_17)
+llama_test(test-omni-token-policy)
