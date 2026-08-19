@@ -2,6 +2,7 @@
 #include "vision.h"
 #include "audition.h"
 #include "omni.h"
+#include "omni-token-policy.h"
 #include "token2wav/token2wav-impl.h"
 
 #include "llama.h"
@@ -219,35 +220,27 @@ void print_with_timestamp(const char* format, ...);
 //   LISTEN_TOKEN_ID = 128267
 //   SPEAK_TOKEN_ID = 128266
 
-enum class OmniTokenType {
-    NORMAL,           // 普通 token (文本、audio code 等)
-    SPEAK,            // <|speak|> - 开始说话
-    LISTEN,           // <|listen|> - 开始听 (双工)
-    CHUNK_EOS,        // <|chunk_eos|> - 语义 chunk 结束
-    CHUNK_TTS_EOS,    // <|chunk_tts_eos|> - TTS chunk 结束
-    TURN_EOS,         // <|turn_eos|> - 轮次结束
-    TTS_EOS,          // <|tts_eos|> - 旧版 TTS 结束 (单工)
-    EOS               // </s> - 序列结束
-};
+static OmniTokenPolicy get_token_policy(const struct omni_context * ctx) {
+    return {
+        ctx->special_token_speak,
+        ctx->special_token_listen,
+        ctx->special_token_chunk_eos,
+        ctx->special_token_chunk_tts_eos,
+        ctx->special_token_turn_eos,
+        ctx->special_token_tts_eos,
+        ctx->special_token_im_end,
+        ctx->special_token_slash_s,
+        ctx->special_token_eos,
+    };
+}
 
 // 获取 token 类型
 static OmniTokenType get_token_type(struct omni_context * ctx, llama_token token) {
-    if (token == ctx->special_token_speak) {
-        return OmniTokenType::SPEAK;
-    } else if (token == ctx->special_token_listen) {
-        return OmniTokenType::LISTEN;
-    } else if (token == ctx->special_token_chunk_eos) {
-        return OmniTokenType::CHUNK_EOS;
-    } else if (token == ctx->special_token_chunk_tts_eos) {
-        return OmniTokenType::CHUNK_TTS_EOS;
-    } else if (token == ctx->special_token_turn_eos) {
-        return OmniTokenType::TURN_EOS;
-    } else if (token == ctx->special_token_tts_eos) {
-        return OmniTokenType::TTS_EOS;
-    } else if (token == ctx->special_token_eos) {
-        return OmniTokenType::EOS;
-    }
-    return OmniTokenType::NORMAL;
+    return get_token_policy(ctx).classify(token);
+}
+
+static bool is_simplex_terminator_token(struct omni_context * ctx, llama_token token) {
+    return get_token_policy(ctx).is_simplex_terminator(token);
 }
 
 // 检查是否是会话/轮次结束 token
@@ -1384,6 +1377,29 @@ static const char * sample_with_hidden_and_token(struct common_sampler * smpl, s
             } else {
                 // logit <= 0 时，乘以 length_penalty 来降低概率
                 logits[ctx_omni->special_token_tts_eos] = eos_logit * ctx_omni->length_penalty;
+            }
+        }
+    }
+
+    if (!ctx_omni->duplex_mode && logits != nullptr) {
+        // Simplex generation must not enter the duplex state machine. These
+        // control tokens can otherwise form a chunk_eos/listen loop instead
+        // of reaching a simplex terminator.
+        const llama_token simplex_forbidden[] = {
+            ctx_omni->special_token_speak,
+            ctx_omni->special_token_listen,
+            ctx_omni->special_token_chunk_eos,
+            ctx_omni->special_token_chunk_tts_eos,
+            ctx_omni->special_token_turn_eos,
+            ctx_omni->special_token_tts_pad,
+            ctx_omni->special_token_unit_end,
+            ctx_omni->tts_bos_token_id,
+        };
+        for (const llama_token token : simplex_forbidden) {
+            // Some vocabularies alias a control token to an EOS id. Never mask
+            // a valid simplex terminator when token ids overlap.
+            if (token >= 0 && !is_simplex_terminator_token(ctx_omni, token)) {
+                logits[token] = -INFINITY;
             }
         }
     }
@@ -4618,7 +4634,16 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
         ctx_omni->special_token_chunk_tts_eos = find_token("<|chunk_tts_eos|>");
         ctx_omni->special_token_turn_eos = find_token("<|turn_eos|>");
         ctx_omni->special_token_tts_eos = find_token("<|tts_eos|>");
+        ctx_omni->special_token_im_end = find_token("<|im_end|>");
+        ctx_omni->special_token_slash_s = find_token("</s>");
         ctx_omni->special_token_eos = llama_vocab_eos(vocab);
+
+        print_with_timestamp(
+            "LLM terminators: tts_eos=%d, im_end=%d, slash_s=%d, vocab_eos=%d\n",
+            ctx_omni->special_token_tts_eos,
+            ctx_omni->special_token_im_end,
+            ctx_omni->special_token_slash_s,
+            ctx_omni->special_token_eos);
         
         // 同时初始化 tts_bos_token_id（用于双工模式强制继续说话）
         llama_token tts_bos = find_token("<|tts_bos|>");
@@ -4679,6 +4704,29 @@ bool omni_tts_queues_empty(struct omni_context * ctx_omni) {
         t2w_empty = ctx_omni->t2w_thread_info->queue.empty();
     }
     return tts_empty && t2w_empty;
+}
+
+void omni_request_break(struct omni_context * ctx_omni) {
+    if (ctx_omni == nullptr) {
+        return;
+    }
+
+    ctx_omni->break_event.store(true, std::memory_order_release);
+    if (ctx_omni->llm_thread_info) {
+        ctx_omni->llm_thread_info->cv.notify_all();
+    }
+    if (ctx_omni->tts_thread_info) {
+        ctx_omni->tts_thread_info->cv.notify_all();
+    }
+    if (ctx_omni->t2w_thread_info) {
+        ctx_omni->t2w_thread_info->cv.notify_all();
+    }
+    if (ctx_omni->duplex) {
+        ctx_omni->duplex->encoder_cv.notify_all();
+        ctx_omni->duplex->llm_cv.notify_all();
+        ctx_omni->duplex->decode_done_cv.notify_all();
+    }
+    ctx_omni->text_cv.notify_all();
 }
 
 // 停止所有线程（发送信号，不等待）
@@ -4767,6 +4815,10 @@ void omni_prepare_for_reuse(struct omni_context * ctx_omni) {
             delete ctx_omni->t2w_thread_info->queue.front();
             ctx_omni->t2w_thread_info->queue.pop();
         }
+    }
+
+    if (ctx_omni->ctx_sampler) {
+        common_sampler_reset(ctx_omni->ctx_sampler);
     }
 
     print_with_timestamp("omni_prepare_for_reuse: inference threads stopped and queues cleared\n");
@@ -5189,18 +5241,6 @@ void llm_thread_func(omni_context* ctx_omni, common_params* params){
 //   1. chunk_speak_token_ids = [speak_token_id] 中的 token 不会被添加到 TTS 条件
 //   2. j != 0 条件跳过循环中的第一个 token
 // 注意：这些 token 大部分也会被 tid >= 150000 规则过滤，但显式列出便于理解和调试
-static const std::vector<llama_token> g_special_token_ids = {
-    151667,  // <think>
-    151668,  // </think>
-    151704,  // <|tts_eos|> - TTS 结束标记
-    151706,  // <|speak|> - 🔧 Python 的 chunk_speak_token_ids 会过滤此 token
-    151705,  // <|listen|> - 双工模式切换到听的标记
-    151718,  // <|chunk_eos|> - chunk 结束标记
-    151721,  // <|chunk_tts_eos|> - TTS chunk 结束标记
-    151717,  // <|turn_eos|> - 轮次结束标记
-    271,     // <reserved_182> (newline, appears near think tags)
-};
-
 // Known empty token IDs (from file_loader.py)
 // WARNING: These tokens were incorrectly marked as "empty" but they actually decode to real text!
 // 99692 = "好的", 104314 = "给你", 99526 = "讲"
@@ -5211,29 +5251,14 @@ static const std::set<llama_token> g_known_empty_token_ids = {
 
 // Helper function to check if a token should be filtered out
 // Returns true if the token is valid for TTS, false if it should be skipped
-static bool is_valid_tts_token(llama_token tid) {
-    // Skip special tokens
-    for (llama_token sid : g_special_token_ids) {
-        if (tid == sid) {
-            return false;
-        }
-    }
-    
-    // Skip tokens >= 150000 (usually special tokens like <|im_end|>, <|tts_bos|>, etc.)
-    if (tid >= 150000) {
-        return false;
-    }
-    
-    // Skip known empty tokens
-    if (g_known_empty_token_ids.find(tid) != g_known_empty_token_ids.end()) {
-        return false;
-    }
-    
-    return true;
+static bool is_valid_tts_token(struct omni_context * ctx, llama_token tid) {
+    return get_token_policy(ctx).is_tts_condition_token(tid) &&
+           g_known_empty_token_ids.find(tid) == g_known_empty_token_ids.end();
 }
 
 // Helper function to filter special tokens (matching Python file_loader.py logic)
 static void filter_special_tokens(
+    struct omni_context * ctx,
     std::vector<llama_token>& token_ids,
     std::vector<float>& hidden_states,
     int n_embd
@@ -5256,7 +5281,7 @@ static void filter_special_tokens(
         llama_token tid = token_ids[i];
         
         // Use the shared is_valid_tts_token function
-        if (!is_valid_tts_token(tid)) continue;
+        if (!is_valid_tts_token(ctx, tid)) continue;
         
         // Keep this token and its corresponding hidden state
         filtered_token_ids.push_back(tid);
@@ -6696,7 +6721,7 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
             int n_tokens_orig = (int)(current_chunk_hidden_states.size() / current_chunk_n_embd);
             std::vector<llama_token> filtered_token_ids = current_chunk_token_ids;
             std::vector<float> filtered_hidden_states = current_chunk_hidden_states;
-            filter_special_tokens(filtered_token_ids, filtered_hidden_states, current_chunk_n_embd);
+            filter_special_tokens(ctx_omni, filtered_token_ids, filtered_hidden_states, current_chunk_n_embd);
             int n_tokens_filtered = (int)(filtered_hidden_states.size() / current_chunk_n_embd);
             
             if (n_tokens_filtered <= 0) {
@@ -7453,7 +7478,7 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
             
             std::vector<llama_token> filtered_token_ids = current_chunk_token_ids;
             std::vector<float> filtered_hidden_states = current_chunk_hidden_states;
-            filter_special_tokens(filtered_token_ids, filtered_hidden_states, current_chunk_n_embd);
+            filter_special_tokens(ctx_omni, filtered_token_ids, filtered_hidden_states, current_chunk_n_embd);
             
             int n_tokens_filtered = (int)(filtered_hidden_states.size() / current_chunk_n_embd);
             
@@ -10267,7 +10292,7 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
             total_tokens_generated++;
 
             if (tmp != nullptr && hidden_states != nullptr
-                && is_valid_tts_token(sampled_token)) {
+                && is_valid_tts_token(ctx_omni, sampled_token)) {
                 chunk_token_ids.push_back(sampled_token);
                 chunk_hidden_states.insert(chunk_hidden_states.end(),
                                            hidden_states, hidden_states + llm_n_embd);
@@ -11371,11 +11396,13 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
                 }
                 
                 total_tokens_generated++;
+                const OmniTokenType token_type = get_token_type(ctx_omni, sampled_token);
                 
                 // 🔧 [过滤逻辑] 只收集有效的 TTS token
                 // 特殊 token（如 <think>, </think>, 换行等）不计入 step_size
                 if (tmp != nullptr && hidden_states != nullptr) {
-                    if (is_valid_tts_token(sampled_token)) {
+                    if (token_type == OmniTokenType::NORMAL &&
+                        is_valid_tts_token(ctx_omni, sampled_token)) {
                         // 有效 token：收集并计入计数
                         chunk_token_ids.push_back(sampled_token);
                         chunk_hidden_states.insert(chunk_hidden_states.end(), hidden_states, hidden_states + llm_n_embd);
@@ -11424,7 +11451,6 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
                 // 🔧 [调试日志] 记录每个生成的 token 到文件
                 
                 // 🔧 [使用 token ID 检测] 使用缓存的 token ID 进行检测，比字符串比较更高效
-                OmniTokenType token_type = get_token_type(ctx_omni, sampled_token);
                 if (token_type != OmniTokenType::NORMAL) {
                 }
 
@@ -11468,7 +11494,8 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
                     // 🔧 [与 Python 对齐] 设置 llm_generation_done 标志
                     // TTS 线程会检查这个标志来决定是否添加 text_eos_embed
                     if (!ctx_omni->duplex_mode) ctx_omni->llm_generation_done.store(true);
-                    print_with_timestamp("LLM: detected end token, set llm_generation_done=true\n");
+                    print_with_timestamp("LLM: detected end token id=%d type=%s, set llm_generation_done=true\n",
+                                         sampled_token, get_token_type_name(token_type));
                     
                     // 🔧 [P1-双工模式] 设置 current_turn_ended 状态
                     // Python: end_of_turn = last_id in turn_terminator_token_ids (只有 turn_eos)

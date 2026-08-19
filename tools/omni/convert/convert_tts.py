@@ -76,12 +76,13 @@ def convert_tts_to_gguf(model_dir, output_path, output_type='f32'):
     # head_code.0.parametrizations.weight.original0 和 original1 需要合并
     if 'head_code.0.parametrizations.weight.original0' in tensors and \
        'head_code.0.parametrizations.weight.original1' in tensors:
-        g = tensors['head_code.0.parametrizations.weight.original0']  # [6562, 1]
-        v = tensors['head_code.0.parametrizations.weight.original1']  # [6562, 768]
-        # weight_norm: w = g * v / ||v||
-        v_norm = np.linalg.norm(v, axis=1, keepdims=True)
-        weight = g * v / (v_norm + 1e-12)
-        tensors['head_code.0.weight'] = weight.astype(np.float32)
+        g_t = tensors_torch['head_code.0.parametrizations.weight.original0']
+        v_t = tensors_torch['head_code.0.parametrizations.weight.original1']
+        # Match torch._weight_norm's BF16 evaluation order. Computing the
+        # complete expression in NumPy FP32 changes the converted output head.
+        v_norm_t = torch.linalg.vector_norm(v_t.float(), dim=1, keepdim=True).to(v_t.dtype)
+        weight = (v_t * (g_t.to(v_t.dtype) / v_norm_t)).float().numpy()
+        tensors['head_code.0.weight'] = weight.astype(np.float32, copy=False)
         del tensors['head_code.0.parametrizations.weight.original0']
         del tensors['head_code.0.parametrizations.weight.original1']
         print(f"Reconstructed head_code.0.weight: {weight.shape}")

@@ -506,7 +506,9 @@ struct omni_context {
     llama_token special_token_chunk_tts_eos = -1;// <|chunk_tts_eos|>: TTS chunk 结束
     llama_token special_token_turn_eos = -1;     // <|turn_eos|>: 轮次结束
     llama_token special_token_tts_eos = -1;      // <|tts_eos|>: 旧版 TTS 结束
-    llama_token special_token_eos = -1;          // </s>: 序列结束
+    llama_token special_token_im_end = -1;       // <|im_end|>: ChatML 消息结束
+    llama_token special_token_slash_s = -1;      // </s>: 兼容模型显式终止符
+    llama_token special_token_eos = -1;          // GGUF 词表声明的 EOS
     llama_token tts_bos_token_id = -1;           // <|tts_bos|>: TTS 开始（用于双工强制继续说话）
     llama_token special_token_unit_end = -1;     // </unit>: unit 结束标记（双工 chunk 边界）
     llama_token special_token_tts_pad = -1;      // <|tts_pad|>: TTS 填充（双工模式下禁止采样）
@@ -546,6 +548,10 @@ bool omni_tts_queues_empty(struct omni_context * ctx_omni);
 
 // 停止所有线程（在 join 之前调用）
 void omni_stop_threads(struct omni_context * ctx_omni);
+
+// Signal every inference stage and wake blocked workers. The flag is cleared
+// only after the caller has joined workers or begins a new decode generation.
+void omni_request_break(struct omni_context * ctx_omni);
 
 bool stream_prefill(struct omni_context * ctx_omni,
                             std::string aud_fname,

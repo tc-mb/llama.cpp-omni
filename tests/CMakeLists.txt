@@ -308,3 +308,25 @@ if (TARGET gguf-model-data)
     target_link_libraries(export-graph-ops PRIVATE gguf-model-data)
     target_compile_definitions(export-graph-ops PRIVATE LLAMA_HF_FETCH)
 endif()
+if (LLAMA_BUILD_TOOLS)
+    add_executable(test-audition-mel-length test-audition-mel-length.cpp)
+    target_include_directories(test-audition-mel-length PRIVATE
+        ${PROJECT_SOURCE_DIR}/tools/omni)
+    target_compile_features(test-audition-mel-length PRIVATE cxx_std_17)
+    target_link_libraries(test-audition-mel-length PRIVATE omni)
+    llama_test(test-audition-mel-length)
+endif()
+
+add_executable(test-token2wav-runner-rng test-token2wav-runner-rng.cpp)
+target_include_directories(test-token2wav-runner-rng PRIVATE
+    ${PROJECT_SOURCE_DIR}/tools/omni/token2wav
+    ${PROJECT_SOURCE_DIR}/ggml/include
+    ${PROJECT_SOURCE_DIR}/ggml/src)
+target_compile_features(test-token2wav-runner-rng PRIVATE cxx_std_17)
+llama_test(test-token2wav-runner-rng)
+
+add_executable(test-omni-token-policy test-omni-token-policy.cpp)
+target_include_directories(test-omni-token-policy PRIVATE
+    ${PROJECT_SOURCE_DIR}/tools/omni)
+target_compile_features(test-omni-token-policy PRIVATE cxx_std_17)
+llama_test(test-omni-token-policy)

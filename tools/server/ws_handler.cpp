@@ -165,6 +165,7 @@ static void clear_text_stream_state(omni_context * octx) {
 }
 
 static void stop_reusable_octx_threads(omni_context * octx) {
+    omni_request_break(octx);
     omni_prepare_for_reuse(octx);
 }
 
@@ -818,7 +819,7 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
             }
 
             TempMediaFiles tmp_files;
-            std::vector<std::string> extra_image_paths;
+            std::vector<std::string> image_paths;
             std::vector<std::string> turn_temp_paths;
             int turn_vision_slices = 0;
 
@@ -834,9 +835,10 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
             if (last_user_msg) {
                 int input_index = ++msg_counter;
                 for (const auto & img_b64 : last_user_msg->image_b64s) {
-                    std::string ipath = TempMediaFiles::write_image_jpeg(img_b64, temp_dir, input_index);
+                    std::string ipath = TempMediaFiles::write_image_jpeg(
+                        img_b64, temp_dir, ++msg_counter);
                     if (!ipath.empty()) {
-                        tmp_files.image_path = ipath; // last image wins
+                        image_paths.push_back(ipath);
                     }
                 }
                 // Audio: use the first audio from the last user message
@@ -859,14 +861,11 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
                         turn_temp_paths.push_back(video.audio_path);
                     }
                     for (const auto & frame_path : video.frame_paths) {
-                        if (tmp_files.image_path.empty()) {
-                            tmp_files.image_path = frame_path;
-                        } else {
-                            extra_image_paths.push_back(frame_path);
-                        }
+                        image_paths.push_back(frame_path);
                     }
                     if (video.frame_paths.empty()) {
                         tmp_files.cleanup();
+                        for (const auto & path : image_paths) fs::remove(path);
                         for (const auto & path : turn_temp_paths) fs::remove(path);
                         fail_fast(session_id, "video_decode_failed");
                         return;
@@ -879,8 +878,12 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
             // summarizing history into a single natural-language prompt.
             const std::string system_text = first_system_text(parsed_msgs);
             std::string prompt = build_turn_based_chatml_body(parsed_msgs, last_user_msg);
+            const bool has_visual_input = !image_paths.empty();
+            const bool has_audio_input = !tmp_files.audio_path.empty();
+            const std::string prompt_after_media =
+                (has_visual_input || has_audio_input) ? "\n" + prompt : prompt;
 
-            turn_vision_slices = (tmp_files.image_path.empty() ? 0 : 1) + (int)extra_image_paths.size();
+            turn_vision_slices = (int) image_paths.size();
             double prefill_ms = 0.0;
             double generate_ms = 0.0;
             int n_past_before_decode = 0;
@@ -900,30 +903,40 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
                     if (!stream_prefill(octx, /*aud*/"", /*img*/"", /*index*/0)) {
                         octx->use_tts = prev_use_tts;
                         tmp_files.cleanup();
-                        for (const auto & path : extra_image_paths) fs::remove(path);
+                        for (const auto & path : image_paths) fs::remove(path);
                         for (const auto & path : turn_temp_paths) fs::remove(path);
                         fail_fast(session_id, "system_prefill_failed");
                         return;
                     }
                 }
-                int input_index = msg_counter > 0 ? msg_counter : ++msg_counter;
-                if (!stream_prefill(octx, tmp_files.audio_path, tmp_files.image_path,
-                                    input_index, parsed_input.max_slice_nums, prompt)) {
-                    octx->use_tts = prev_use_tts;
-                    tmp_files.cleanup();
-                    for (const auto & path : extra_image_paths) fs::remove(path);
-                    for (const auto & path : turn_temp_paths) fs::remove(path);
-                    fail_fast(session_id, "prefill_failed");
-                    return;
-                }
-                for (const auto & image_path : extra_image_paths) {
-                    if (!stream_prefill(octx, /*aud*/"", image_path,
-                                        ++msg_counter, parsed_input.max_slice_nums, /*text*/"")) {
+                for (size_t i = 0; i < image_paths.size(); ++i) {
+                    const bool is_last_image = i + 1 == image_paths.size();
+                    const std::string image_suffix = !is_last_image
+                        ? ""
+                        : (has_audio_input ? "\n" : prompt_after_media);
+                    if (!stream_prefill(octx, /*aud*/"", image_paths[i],
+                                        ++msg_counter, parsed_input.max_slice_nums,
+                                        image_suffix)) {
                         octx->use_tts = prev_use_tts;
                         tmp_files.cleanup();
-                        for (const auto & path : extra_image_paths) fs::remove(path);
+                        for (const auto & path : image_paths) fs::remove(path);
                         for (const auto & path : turn_temp_paths) fs::remove(path);
                         fail_fast(session_id, "video_frame_prefill_failed");
+                        return;
+                    }
+                }
+                // vLLM joins multimodal content parts with a newline. Treat all
+                // extracted frames as one visual part, then preserve the visual
+                // -> audio and final media -> text boundaries.
+                if (has_audio_input || !has_visual_input) {
+                    if (!stream_prefill(octx, tmp_files.audio_path, /*img*/"",
+                                        ++msg_counter, parsed_input.max_slice_nums,
+                                        prompt_after_media)) {
+                        octx->use_tts = prev_use_tts;
+                        tmp_files.cleanup();
+                        for (const auto & path : image_paths) fs::remove(path);
+                        for (const auto & path : turn_temp_paths) fs::remove(path);
+                        fail_fast(session_id, "prefill_failed");
                         return;
                     }
                 }
@@ -933,11 +946,9 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
             }
 
             if (!tmp_files.audio_path.empty()) retained_media_files.push_back(tmp_files.audio_path);
-            if (!tmp_files.image_path.empty()) retained_media_files.push_back(tmp_files.image_path);
-            for (const auto & path : extra_image_paths) retained_media_files.push_back(path);
+            for (const auto & path : image_paths) retained_media_files.push_back(path);
             for (const auto & path : turn_temp_paths) retained_media_files.push_back(path);
             tmp_files.audio_path.clear();
-            tmp_files.image_path.clear();
 
             // Decode
             bool streaming = parsed_input.streaming;
@@ -1257,7 +1268,7 @@ cleanup:
         std::lock_guard<std::mutex> lock(octx_mutex);
         OmniSession * session = session_mgr.get(session_id);
         if (session && session->octx) {
-            session->octx->break_event = true;
+            omni_request_break(session->octx);
             {
                 std::lock_guard<std::mutex> lk(session->octx->text_mtx);
                 session->octx->text_queue.clear();

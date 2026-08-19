@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <new>
+#include <random>
 #include "ggml-backend.h"
 #include "ggml-alloc.h"
 
@@ -1647,6 +1648,22 @@ struct flowStreamCacheHost {
                estimator_att_cache.empty();
     }
 };
+
+// RNG state belongs to one streaming runner. A process-global generator lets
+// concurrent sessions advance or rewind each other's noise sequence.
+class flowRunnerNoiseState {
+  public:
+    flowRunnerNoiseState() : generator_(42) {}
+
+    void reset() { generator_.seed(42); }
+    std::mt19937 capture() const { return generator_; }
+    void restore(const std::mt19937 & state) { generator_ = state; }
+    std::mt19937 & generator() { return generator_; }
+
+  private:
+    std::mt19937 generator_;
+};
+
 class flowGGUFModelRunner {
   public:
     flowGGUFModelRunner();
@@ -1728,6 +1745,7 @@ class flowGGUFModelRunner {
     struct streamSessionEncOnly;
     int  num_threads_           = 1;
     bool export_caches_to_host_ = true;
+    flowRunnerNoiseState                  noise_state_;
     flowGGUFModelLoader            loader_;
     std::unique_ptr<streamSession>        sess_;
     std::unique_ptr<streamSessionEncOnly> sess_enc_only_;
