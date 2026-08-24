@@ -14,6 +14,8 @@
 #include "session.h"
 #include "protocol.h"
 #include "omni.h"
+#include "runtime-profile.h"
+#include "runtime-profile-session.h"
 #include "common.h"
 #include "llama.h"
 #include "log.h"
@@ -172,11 +174,11 @@ static void stop_reusable_octx_threads(omni_context * octx) {
 // clear LLM/TTS/whisper KV caches, so the next session starts clean on the same
 // loaded model. Used by the shared-octx reuse path in create_session_octx.
 static void reset_octx_for_session(omni_context * octx, const ParsedSessionInit & init,
-                                   const std::string & output_dir) {
+                                   const std::string & output_dir,
+                                   bool duplex_mode, bool async_mode) {
     stop_reusable_octx_threads(octx);
 
-    const bool duplex_mode = (init.mode == "full_duplex");
-    octx->async = true;
+    octx->async = async_mode;
     octx->duplex_mode = duplex_mode;
     octx->base_output_dir = output_dir;
 
@@ -520,10 +522,14 @@ static void configure_turn_based_prompt(omni_context * octx,
 static omni_context * create_session_octx(common_params & params, const ParsedSessionInit & init,
                                           llama_model * model, llama_context * ctx,
                                           omni_context *& shared_octx,
-                                          const std::string & output_dir) {
+                                          const std::string & output_dir,
+                                          const omni::effective_runtime_config * runtime_config) {
     int media_type = 2; // omni
-    bool duplex_mode = (init.mode == "full_duplex");
     bool use_tts = init.use_tts;
+    const auto session_options = omni::resolve_runtime_session_options(
+            runtime_config, init.mode == "full_duplex", /*requested_tts_gpu_layers=*/99,
+            /*requested_token2wav_device=*/"gpu:0", params.omni_runtime_profile.token2wav_threads);
+    const bool duplex_mode = session_options.duplex_mode;
 
     // Build params for omni_init
     auto & p = params;
@@ -533,7 +539,7 @@ static omni_context * create_session_octx(common_params & params, const ParsedSe
     // Reuse the server-owned context if it matches this session's mode (avoids
     // reloading the model); otherwise tear it down and build a fresh one.
     if (shared_octx && shared_octx->duplex_mode == duplex_mode && shared_octx->use_tts == use_tts) {
-        reset_octx_for_session(shared_octx, init, output_dir);
+        reset_octx_for_session(shared_octx, init, output_dir, duplex_mode, session_options.async_mode);
         apply_session_config(p, shared_octx, init);
         LOG_INF("create_session_octx: reused shared octx, duplex=%d, output_dir=%s\n",
                 duplex_mode, output_dir.c_str());
@@ -545,15 +551,19 @@ static omni_context * create_session_octx(common_params & params, const ParsedSe
         shared_octx = nullptr;
     }
 
-    omni_context * octx = omni_init(&p, media_type, use_tts, p.tts_bin_dir, /*tts_gpu_layers*/99,
-                                     /*token2wav_device*/"gpu:0", duplex_mode,
-                                     model, ctx, output_dir);
+    const int tts_gpu_layers = session_options.tts_gpu_layers;
+    const std::string token2wav_device = session_options.token2wav_device;
+    const int token2wav_threads = session_options.token2wav_threads;
+    omni_context * octx = omni_init(&p, media_type, use_tts, p.tts_bin_dir, tts_gpu_layers,
+                                     token2wav_device, duplex_mode,
+                                     model, ctx, output_dir, runtime_config,
+                                     session_options.strict_runtime_config, token2wav_threads);
     if (!octx) {
         LOG_ERR("create_session_octx: omni_init failed\n");
         return nullptr;
     }
 
-    octx->async = true;
+    octx->async = session_options.async_mode;
     octx->duplex_mode = duplex_mode;
     apply_session_config(p, octx, init);
 
@@ -578,7 +588,8 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
                         llama_model * model,
                         llama_context * ctx,
                         omni_context *& shared_octx,
-                        std::mutex & octx_mutex) {
+                        std::mutex & octx_mutex,
+                        const omni::effective_runtime_config * runtime_config) {
     const std::string temp_dir = (fs::temp_directory_path() / "omni_ws").string();
     fs::create_directories(temp_dir);
     int msg_counter = 0;
@@ -646,7 +657,8 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
     omni_context * octx = nullptr;
     {
         std::lock_guard<std::mutex> lock(octx_mutex);
-        octx = create_session_octx(params_base, parsed_init, model, ctx, shared_octx, session_output_dir);
+        octx = create_session_octx(
+                params_base, parsed_init, model, ctx, shared_octx, session_output_dir, runtime_config);
     }
     if (!octx) {
         fail_fast(session_id, "omni_init_failed");
@@ -655,7 +667,7 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
 
     // Full-duplex requires index=0 prefill before the first frame. This
     // initializes the system prompt and starts the duplex encoder/LLM pipeline.
-    if (parsed_init.mode == "full_duplex" || !parsed_init.ref_audio_b64.empty()) {
+    if (octx->duplex_mode || !parsed_init.ref_audio_b64.empty()) {
         std::string voice_wav;
         if (!parsed_init.ref_audio_b64.empty()) {
             voice_wav = TempMediaFiles::write_audio_wav(parsed_init.ref_audio_b64, temp_dir, msg_counter++);
@@ -694,9 +706,10 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
     }
 
     // Send session.created
-    send_event(make_session_created(session_id, parsed_init.mode, make_runtime_metrics(octx)));
+    const std::string effective_mode = octx->duplex_mode ? "full_duplex" : "turn_based";
+    send_event(make_session_created(session_id, effective_mode, make_runtime_metrics(octx)));
 
-    LOG_INF("WS /backend: session %s activated, mode=%s\n", session_id.c_str(), parsed_init.mode.c_str());
+    LOG_INF("WS /backend: session %s activated, mode=%s\n", session_id.c_str(), effective_mode.c_str());
 
     // ================================================================
     // Setup audio output callback — sends audio_delta events via WS
@@ -803,7 +816,7 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
         // session mode (schema §7.4 / network §7): turn_based MUST carry
         // `messages`, full_duplex MUST NOT. A mismatch is a fatal protocol
         // violation, not a recoverable branch.
-        if (parsed_init.mode == "turn_based") {
+        if (!octx->duplex_mode) {
             // ================================================================
             // Turn-based input processing
             // ================================================================

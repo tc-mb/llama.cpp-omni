@@ -27,6 +27,7 @@ namespace omni {
 namespace flow {
 class Token2WavSession;
 }
+struct effective_runtime_config;
 }
 
 // 🔧 [Duplex Pipeline] 仅在 duplex_mode=true 时分配；
@@ -170,6 +171,7 @@ struct omni_context {
     // true: omni_init 内部加载的模型，omni_free 时需要释放
     // false: 外部传入的已有模型（模型复用），omni_free 时不释放
     bool owns_model = true;
+    bool strict_runtime_config = false;
 
     // 🔧 [Length Penalty] 用于调整 EOS token 的采样概率
     // length_penalty > 1.0 会降低 EOS 概率，让模型生成更长的输出
@@ -488,7 +490,10 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
                                 int tts_gpu_layers = -1, const std::string & token2wav_device = "gpu:0",
                                 bool duplex_mode = false,
                                 llama_model * existing_model = nullptr, llama_context * existing_ctx = nullptr,
-                                const std::string & base_output_dir = "./tools/omni/output");
+                                const std::string & base_output_dir = "./tools/omni/output",
+                                const omni::effective_runtime_config * runtime_config = nullptr,
+                                bool strict_runtime_config = false,
+                                int token2wav_threads = 8);
 
 void omni_free(struct omni_context * ctx_omni);
 // Stop/join inference threads and clear queues so the same context can serve a
@@ -608,6 +613,7 @@ llama_token sample_tts_token(struct common_sampler * smpl, struct omni_context *
 
 // Projector 函数声明（精度验证版本）
 bool projector_init(projector_model & model, const std::string & fname, bool use_cuda);
+bool projector_init(projector_model & model, const std::string & fname, const std::string & device);
 void projector_free(projector_model & model);
 std::vector<float> projector_forward(projector_model & model, const float * input_data, int n_tokens);
 

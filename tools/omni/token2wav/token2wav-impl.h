@@ -1589,7 +1589,8 @@ class flowGGUFModelLoader {
     bool load_from_gguf(const std::string & encoder_gguf_path,
                         const std::string & flow_matching_gguf_path,
                         const std::string & flow_extra_gguf_path,
-                        const std::string & device = "cpu");
+                        const std::string & device = "cpu",
+                        bool                  allow_backend_fallback = true);
     std::shared_ptr<upsample_encoder_v2::ueUpsampleConformerEncoderV2> encoder() const { return encoder_model_; }
     std::shared_ptr<flow_matching::fmDiT> estimator() const { return estimator_; }
     std::shared_ptr<flow_matching::fmCausalConditionalCFM> decoder() const { return decoder_; }
@@ -1603,7 +1604,7 @@ class flowGGUFModelLoader {
     }
   private:
     void reset();
-    bool init_backend(const std::string & device);
+    bool init_backend(const std::string & device, bool allow_backend_fallback);
     bool bind_all();
   private:
     ggml_backend_t backend_ = nullptr;
@@ -1657,7 +1658,8 @@ class flowGGUFModelRunner {
     bool load_from_gguf(const std::string & encoder_gguf_path,
                         const std::string & flow_matching_gguf_path,
                         const std::string & flow_extra_gguf_path,
-                        const std::string & device);
+                        const std::string & device,
+                        bool                  allow_backend_fallback = true);
     void set_num_threads(int n_threads);
     const std::string & backend_name() const { return loader_.backend_name(); }
     void set_export_caches_to_host(bool enable) { export_caches_to_host_ = enable; }
@@ -2001,7 +2003,8 @@ struct voc_hg2_model {
     ~voc_hg2_model() { voc_hg2_model_free(); }
     bool voc_hg2_model_init_from_gguf(const std::string & gguf_path_in,
                                       const std::string & device,
-                                      int32_t             num_threads_in);
+                                      int32_t             num_threads_in,
+                                      bool                allow_backend_fallback = true);
     void voc_hg2_model_free();
 };
 struct voc_hg2_runner {
@@ -2031,6 +2034,9 @@ struct voc_hg2_runner {
 namespace omni {
 namespace flow {
 
+// Profile serving must fail closed when a requested device cannot be initialized.
+bool token2wav_device_fallback_allowed(bool strict_runtime_config);
+
 class Token2Mel {
   public:
     struct PromptBundle {
@@ -2056,7 +2062,8 @@ class Token2Mel {
                     const std::string & flow_extra_gguf,
                     const std::string & device              = "gpu",
                     int                 threads             = 8,
-                    const std::string & coreml_model_path  = "");
+                    const std::string & coreml_model_path  = "",
+                    bool                allow_device_fallback = true);
 
     static bool load_prompt_bundle_dir(const std::string & dir, PromptBundle & out);
 
@@ -2140,7 +2147,8 @@ struct Token2MelSession {
                                  int                 threads,
                                  const std::string & prompt_bundle_dir,
                                  int                 n_timesteps = 10,
-                                 float               temperature = 1.0f);
+                                 float               temperature = 1.0f,
+                                 bool                allow_device_fallback = true);
 
     bool init_from_prompt_cache_gguf(const std::string & encoder_gguf,
                                      const std::string & flow_matching_gguf,
@@ -2149,7 +2157,8 @@ struct Token2MelSession {
                                      int                 threads,
                                      const std::string & prompt_cache_gguf_path,
                                      int                 n_timesteps = -1,
-                                     float               temperature = -1.0f);
+                                     float               temperature = -1.0f,
+                                     bool                allow_device_fallback = true);
 
     bool feed_tokens(const int32_t * tokens, int64_t n_tokens, bool is_final, std::vector<float> & mel_bct_out);
 
@@ -2206,7 +2215,9 @@ class Token2Wav {
                      const std::string & vocoder_gguf,
                      const std::string & device_token2mel    = "gpu",
                      const std::string & device_vocoder      = "gpu",
-                     const std::string & coreml_model_path  = "");
+                     const std::string & coreml_model_path  = "",
+                     int                 threads             = 8,
+                     bool                allow_device_fallback = true);
 
     bool start_stream_with_prompt_cache_gguf(const std::string & prompt_cache_gguf_path,
                                              int                 n_timesteps = -1,
@@ -2264,7 +2275,9 @@ struct Token2WavSession {
                                      const std::string & device_vocoder      = "gpu",
                                      int                 n_timesteps         = 10,
                                      float               temperature         = 1.0f,
-                                     const std::string & coreml_model_path  = "");
+                                     const std::string & coreml_model_path  = "",
+                                     int                 threads             = 8,
+                                     bool                allow_device_fallback = true);
 
     bool init_from_prompt_bundle(const std::string & encoder_gguf,
                                  const std::string & flow_matching_gguf,
@@ -2275,7 +2288,9 @@ struct Token2WavSession {
                                  const std::string & device_vocoder      = "gpu",
                                  int                 n_timesteps         = 10,
                                  float               temperature         = 1.0f,
-                                 const std::string & coreml_model_path  = "");
+                                 const std::string & coreml_model_path  = "",
+                                 int                 threads             = 8,
+                                 bool                allow_device_fallback = true);
 
     bool feed_tokens(const int32_t * tokens, int64_t n_tokens, bool is_final, std::vector<float> & wave_bt_out);
 

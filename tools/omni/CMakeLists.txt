@@ -12,6 +12,10 @@ endif()
 add_library(omni
             omni.cpp
             omni.h
+            runtime-profile-session.cpp
+            runtime-profile-session.h
+            runtime-profile.cpp
+            runtime-profile.h
             tts-condition-graph.cpp
             tts-condition-graph.h
             audition.cpp
@@ -201,6 +205,13 @@ endif()
 # voxcpm2-cli build + smoke test (no weights). --help exits non-zero by design,
 # so assert on the usage banner instead of the exit code.
 if (LLAMA_BUILD_TESTS)
+    set(TARGET_RUNTIME_PROFILE_TEST test-runtime-profile)
+    add_executable(${TARGET_RUNTIME_PROFILE_TEST} test/test-runtime-profile.cpp)
+    target_link_libraries(${TARGET_RUNTIME_PROFILE_TEST} PRIVATE omni)
+    target_compile_features(${TARGET_RUNTIME_PROFILE_TEST} PRIVATE cxx_std_17)
+    add_test(NAME ${TARGET_RUNTIME_PROFILE_TEST} COMMAND ${TARGET_RUNTIME_PROFILE_TEST})
+    set_tests_properties(${TARGET_RUNTIME_PROFILE_TEST} PROPERTIES LABELS "main;omni")
+
     add_test(
         NAME voxcpm2-cli-smoke
         COMMAND ${TARGET_VOXCPM2_CLI} --help

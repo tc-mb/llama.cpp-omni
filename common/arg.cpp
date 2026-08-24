@@ -53,6 +53,10 @@
 using json = nlohmann::ordered_json;
 using namespace common_arg_utils;
 
+static bool is_server_example(enum llama_example ex) {
+    return ex == LLAMA_EXAMPLE_SERVER || ex == LLAMA_EXAMPLE_OMNI_SERVER;
+}
+
 static std::initializer_list<enum llama_example> mmproj_examples = {
     LLAMA_EXAMPLE_MTMD,
     LLAMA_EXAMPLE_SERVER,
@@ -628,7 +632,7 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
 
     // model is required (except for server)
     // TODO @ngxson : maybe show a list of available models in CLI in this case
-    if (params.model.path.empty() && ctx_arg.ex != LLAMA_EXAMPLE_SERVER && !skip_model_download && !params.usage && !params.completion) {
+    if (params.model.path.empty() && !is_server_example(ctx_arg.ex) && !skip_model_download && !params.usage && !params.completion) {
         throw std::invalid_argument("error: --model is required\n");
     }
 
@@ -1038,7 +1042,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         params.use_jinja = false;   // disable jinja by default
         params.sampling.temp = 0.2; // lower temp by default for better quality
 
-    } else if (ex == LLAMA_EXAMPLE_SERVER) {
+    } else if (is_server_example(ex)) {
         params.n_parallel = -1;     // auto by default
     }
 
@@ -1067,7 +1071,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
      * - if both {LLAMA_EXAMPLE_COMMON, LLAMA_EXAMPLE_*,} are set, we will prioritize the LLAMA_EXAMPLE_* matching current example
      */
     auto add_opt = [&](common_arg arg) {
-        if ((arg.in_example(ex) || arg.in_example(LLAMA_EXAMPLE_COMMON)) && !arg.is_exclude(ex)) {
+        const bool inherits_server = ex == LLAMA_EXAMPLE_OMNI_SERVER && arg.in_example(LLAMA_EXAMPLE_SERVER);
+        const bool excluded_as_server = ex == LLAMA_EXAMPLE_OMNI_SERVER && arg.is_exclude(LLAMA_EXAMPLE_SERVER);
+        if ((arg.in_example(ex) || inherits_server || arg.in_example(LLAMA_EXAMPLE_COMMON)) &&
+            !arg.is_exclude(ex) && !excluded_as_server) {
             ctx_arg.options.push_back(std::move(arg));
         }
     };
@@ -1089,6 +1096,48 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             exit(0);
         }
     ));
+    add_opt(common_arg(
+        {"--profile"}, "NAME",
+        "select an Omni runtime profile (supported: auto)",
+        [](common_params & params, const std::string & value) {
+            if (value != "auto") {
+                throw std::invalid_argument("unsupported Omni runtime profile: " + value);
+            }
+            params.omni_runtime_profile.profile = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_OMNI_SERVER}));
+    add_opt(common_arg(
+        {"--model-dir"}, "DIR",
+        "directory containing the MiniCPM-o 4.5 GGUF model tree used by --profile",
+        [](common_params & params, const std::string & value) {
+            params.omni_runtime_profile.model_dir = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_OMNI_SERVER}));
+    add_opt(common_arg(
+        {"--profile-config"}, "PATH",
+        "static JSON runtime profile read by --profile auto (default: MODEL_DIR/omni-runtime-profile.json)",
+        [](common_params & params, const std::string & value) {
+            params.omni_runtime_profile.profile_config = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_OMNI_SERVER}));
+    add_opt(common_arg(
+        {"--token2wav-threads"}, "N",
+        "number of CPU threads used by Token2Wav (default: 8)",
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("--token2wav-threads must be positive");
+            }
+            params.omni_runtime_profile.token2wav_threads = value;
+            params.omni_runtime_profile.token2wav_threads_explicit = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_OMNI_SERVER}));
+    add_opt(common_arg(
+        {"--print-effective-config"},
+        "print the resolved Omni runtime configuration and exit",
+        [](common_params & params) {
+            params.omni_runtime_profile.print_effective_config = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_OMNI_SERVER}));
     add_opt(common_arg(
         {"-cl", "--cache-list"},
         "show list of models in cache",
@@ -1267,6 +1316,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("size of the prompt context (default: %d, 0 = loaded from model)", params.n_ctx),
         [](common_params & params, int value) {
             params.n_ctx = value;
+            params.omni_runtime_profile.n_ctx_explicit = true;
             if (value == 0) {
                 // disable context reduction in llama_params_fit if the user explicitly requests the full context size:
                 params.fit_params_min_ctx = UINT32_MAX;
@@ -2143,7 +2193,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             LOG_WRN("DEPRECATED: --defrag-thold is deprecated and no longer necessary to specify\n");
         }
     ).set_env("LLAMA_ARG_DEFRAG_THOLD"));
-    if (ex == LLAMA_EXAMPLE_SERVER) {
+    if (is_server_example(ex)) {
         // this is to make sure this option appears in the server-specific section of the help message
         add_opt(common_arg(
             {"-np", "--parallel"}, "N",
@@ -2350,6 +2400,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             } else {
                 params.n_gpu_layers = std::stoi(value);
             }
+            params.omni_runtime_profile.n_gpu_layers_explicit = true;
             if (!llama_supports_gpu_offload()) {
                 fprintf(stderr, "warning: no usable GPU found, --gpu-layers option will be ignored\n");
                 fprintf(stderr, "warning: one possible reason is that llama.cpp was compiled without GPU support\n");
@@ -2592,6 +2643,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             : "model path to load",
         [](common_params & params, const std::string & value) {
             params.model.path = value;
+            params.omni_runtime_profile.model_explicit = true;
         }
     ).set_examples({LLAMA_EXAMPLE_COMMON, LLAMA_EXAMPLE_EXPORT_LORA}).set_env("LLAMA_ARG_MODEL"));
     add_opt(common_arg(

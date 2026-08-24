@@ -228,10 +228,17 @@ struct vision_ctx {
             throw std::runtime_error("failed to initialize CPU backend");
         }
         if (ctx_params.use_gpu) {
-            auto backend_name = std::getenv("Omni_BACKEND_DEVICE");
+            const char * backend_name = ctx_params.backend_device;
+            const bool explicit_backend = backend_name != nullptr && std::strlen(backend_name) > 0;
+            if (backend_name == nullptr || std::strlen(backend_name) == 0) {
+                backend_name = std::getenv("Omni_BACKEND_DEVICE");
+            }
             if (backend_name != nullptr) {
                 backend = ggml_backend_init_by_name(backend_name, nullptr);
                 if (!backend) {
+                    if (explicit_backend) {
+                        throw std::runtime_error(std::string("failed to initialize requested vision backend: ") + backend_name);
+                    }
                     LOG_WRN("%s: Warning: Failed to initialize \"%s\" backend, falling back to default GPU backend\n", __func__, backend_name);
                 }
             }
