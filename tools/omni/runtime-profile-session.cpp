@@ -8,13 +8,13 @@ runtime_session_options resolve_runtime_session_options(const effective_runtime_
                                                         bool                             requested_duplex_mode,
                                                         int32_t                          requested_tts_gpu_layers,
                                                         const std::string &              requested_token2wav_device,
-                                                        int32_t                          requested_token2wav_threads) {
+    int32_t                          requested_token2wav_threads) {
     if (config != nullptr) {
-        return { config->duplex_mode, config->tts_gpu_layers, config->token2wav_device, config->token2wav_threads,
-                 true };
+        return { config->duplex_mode, config->async_mode, config->tts_gpu_layers, config->token2wav_device,
+                 config->token2wav_threads, true };
     }
-    return { requested_duplex_mode, requested_tts_gpu_layers, requested_token2wav_device, requested_token2wav_threads,
-             false };
+    return { requested_duplex_mode, true, requested_tts_gpu_layers, requested_token2wav_device,
+             requested_token2wav_threads, false };
 }
 
 bool apply_effective_runtime_config(common_params &                  params,

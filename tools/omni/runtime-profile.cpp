@@ -444,6 +444,13 @@ runtime_profile_result resolve_runtime_profile_from_config(const std::string &  
     result.config.tts_gpu_layers   = tts_gpu_layers;
     result.config.token2wav_threads = token2wav_threads;
 
+    const std::string detected_quantization = quantization_from_path(result.config.llm_model);
+    if (detected_quantization != "UNKNOWN" && detected_quantization != llm_quantization) {
+        result.error = "profile config llm.quantization " + llm_quantization +
+                       " does not match the LLM model filename (detected " + detected_quantization + ")";
+        return result;
+    }
+
     if (!require_profile_file("llm", result.config.llm_model, result.error) ||
         !require_profile_file("vision", result.config.vision_model, result.error) ||
         !require_profile_file("audio", result.config.audio_model, result.error) ||

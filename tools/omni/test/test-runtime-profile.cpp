@@ -204,6 +204,21 @@ static void test_static_profile_reports_missing_model_file() {
     assert(result.error.find("missing.gguf") != std::string::npos);
 }
 
+static void test_static_profile_rejects_quantization_filename_mismatch() {
+    temporary_model_tree tree;
+    create_complete_model_tree(tree);
+    auto config = complete_profile_config();
+    const auto marker = "\"quantization\": \"Q4_K_M\"";
+    config.replace(config.find(marker), std::string(marker).size(), "\"quantization\": \"F16\"");
+    tree.write("omni-runtime-profile.json", config);
+
+    const auto result = resolve_from_tree(tree, two_accelerators());
+
+    assert(!result.ok);
+    assert(result.error.find("quantization") != std::string::npos);
+    assert(result.error.find("Q4_K_M") != std::string::npos);
+}
+
 static void test_static_profile_reports_unavailable_logical_device() {
     temporary_model_tree tree;
     create_complete_model_tree(tree);
@@ -254,6 +269,7 @@ static void test_runtime_profile_controls_session_options_when_present() {
 
     const auto profiled = omni::resolve_runtime_session_options(&config, false, 100, "cpu", 4);
     assert(profiled.duplex_mode);
+    assert(!profiled.async_mode);
     assert(profiled.tts_gpu_layers == -1);
     assert(profiled.token2wav_device == "gpu:0");
     assert(profiled.token2wav_threads == 32);
@@ -261,6 +277,7 @@ static void test_runtime_profile_controls_session_options_when_present() {
 
     const auto legacy = omni::resolve_runtime_session_options(nullptr, false, 100, "cpu", 4);
     assert(!legacy.duplex_mode);
+    assert(legacy.async_mode);
     assert(legacy.tts_gpu_layers == 100);
     assert(legacy.token2wav_device == "cpu");
     assert(legacy.token2wav_threads == 4);
@@ -331,6 +348,7 @@ int main() {
     test_static_profile_reports_invalid_json();
     test_static_profile_reports_missing_required_field();
     test_static_profile_reports_missing_model_file();
+    test_static_profile_rejects_quantization_filename_mismatch();
     test_static_profile_reports_unavailable_logical_device();
     test_static_profile_rejects_empty_device_value();
     test_effective_config_reports_static_source();

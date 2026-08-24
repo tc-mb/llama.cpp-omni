@@ -4283,15 +4283,17 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
         // Check if token2wav model files exist
         // 优先检查 HF 模型目录下的 token2wav-gguf (tts_bin_dir 的父目录)
         // 目录结构: {model_dir}/token2wav-gguf/
-        std::string gguf_root_dir = tts_bin_dir;
-        size_t last_slash = gguf_root_dir.find_last_of("/\\");
-        if (last_slash != std::string::npos) {
-            gguf_root_dir = gguf_root_dir.substr(0, last_slash);  // 获取 tts 的父目录
-        }
-        ctx_omni->token2wav_model_dir = gguf_root_dir + "/token2wav-gguf";
-        
-        std::string encoder_test = ctx_omni->token2wav_model_dir + "/encoder.gguf";
-        {
+        if (runtime_config != nullptr && !runtime_config->token2wav_model_dir.empty()) {
+            ctx_omni->token2wav_model_dir = runtime_config->token2wav_model_dir;
+        } else {
+            std::string gguf_root_dir = tts_bin_dir;
+            size_t last_slash = gguf_root_dir.find_last_of("/\\");
+            if (last_slash != std::string::npos) {
+                gguf_root_dir = gguf_root_dir.substr(0, last_slash);  // 获取 tts 的父目录
+            }
+            ctx_omni->token2wav_model_dir = gguf_root_dir + "/token2wav-gguf";
+
+            std::string encoder_test = ctx_omni->token2wav_model_dir + "/encoder.gguf";
             std::ifstream f(encoder_test);
             if (!f.good()) {
                 // 尝试备用路径 (本地开发用)
@@ -4344,13 +4346,18 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
                     return NULL;
                 }
             } else {
+                if (ctx_omni->strict_runtime_config) {
+                    device_vocoder = token2wav_device;
+                    print_with_timestamp("Token2Wav: profile requires vocoder on %s\n", device_vocoder.c_str());
+                } else {
 #ifdef GGML_USE_CUDA
-                device_vocoder = token2wav_device;
-                print_with_timestamp("Token2Wav: CUDA detected, vocoder using GPU (%s)\n", device_vocoder.c_str());
+                    device_vocoder = token2wav_device;
+                    print_with_timestamp("Token2Wav: CUDA detected, vocoder using GPU (%s)\n", device_vocoder.c_str());
 #else
-                device_vocoder = "cpu";
-                print_with_timestamp("Token2Wav: non-CUDA backend, vocoder using CPU for better performance\n");
+                    device_vocoder = "cpu";
+                    print_with_timestamp("Token2Wav: non-CUDA backend, vocoder using CPU for better performance\n");
 #endif
+                }
             }
             
             // 🔧 优先使用 prompt_bundle (setup_cache 路径)，否则 fallback 到 prompt_cache.gguf
@@ -4545,7 +4552,7 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
             print_with_timestamp("Token2Wav: 使用 C++ 实现\n");
         }
     }
-    ctx_omni->async = true;
+    ctx_omni->async = runtime_config != nullptr ? runtime_config->async_mode : true;
     
     // ==================== 初始化特殊 Token ID ====================
     // 从 LLM 词表中查找并缓存特殊 token ID

@@ -11,6 +11,7 @@ namespace omni {
 
 struct runtime_session_options {
     bool        duplex_mode          = false;
+    bool        async_mode           = true;
     int32_t     tts_gpu_layers       = 100;
     std::string token2wav_device     = "gpu:0";
     int32_t     token2wav_threads    = 8;
