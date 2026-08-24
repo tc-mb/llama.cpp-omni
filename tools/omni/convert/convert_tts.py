@@ -30,6 +30,13 @@ GGUF_VERSION = 3
 GGML_TYPE_F32 = 0
 GGML_TYPE_F16 = 1
 
+# GGUF metadata value types (GGUF v3)
+GGUF_TYPE_UINT32 = 4
+GGUF_TYPE_INT32 = 5
+GGUF_TYPE_FLOAT32 = 6
+GGUF_TYPE_BOOL = 7
+GGUF_TYPE_STRING = 8
+
 
 def write_string(f, s):
     """写入字符串 (长度 + 内容)"""
@@ -43,13 +50,13 @@ def write_metadata_kv(f, key, value_type, value):
     write_string(f, key)
     f.write(struct.pack('<I', value_type))
     
-    if value_type == 4:  # string
+    if value_type == GGUF_TYPE_STRING:
         write_string(f, value)
-    elif value_type == 5:  # uint32
+    elif value_type == GGUF_TYPE_UINT32:
         f.write(struct.pack('<I', value))
-    elif value_type == 6:  # int32
+    elif value_type == GGUF_TYPE_INT32:
         f.write(struct.pack('<i', value))
-    elif value_type == 7:  # float32
+    elif value_type == GGUF_TYPE_FLOAT32:
         f.write(struct.pack('<f', value))
 
 
@@ -116,16 +123,16 @@ def convert_tts_to_gguf(model_dir, output_path, output_type='f32'):
         f.write(struct.pack('<Q', n_kv))
         
         # 写入元数据
-        write_metadata_kv(f, 'general.architecture', 4, 'minicpmtts')
-        write_metadata_kv(f, 'general.name', 4, 'MiniCPM-TTS')
-        write_metadata_kv(f, 'minicpmtts.context_length', 5, config.get('max_position_embeddings', 4096))
-        write_metadata_kv(f, 'minicpmtts.embedding_length', 5, config.get('hidden_size', 768))
-        write_metadata_kv(f, 'minicpmtts.block_count', 5, config.get('num_hidden_layers', 20))
-        write_metadata_kv(f, 'minicpmtts.attention.head_count', 5, config.get('num_attention_heads', 12))
-        write_metadata_kv(f, 'minicpmtts.attention.head_count_kv', 5, config.get('num_key_value_heads', 12))
-        write_metadata_kv(f, 'minicpmtts.feed_forward_length', 5, config.get('intermediate_size', 3072))
-        write_metadata_kv(f, 'minicpmtts.llm_hidden_size', 5, config.get('llm_hidden_size', 4096))
-        write_metadata_kv(f, 'general.file_type', 5, GGML_TYPE_F32 if output_type == 'f32' else GGML_TYPE_F16)
+        write_metadata_kv(f, 'general.architecture', GGUF_TYPE_STRING, 'minicpmtts')
+        write_metadata_kv(f, 'general.name', GGUF_TYPE_STRING, 'MiniCPM-TTS')
+        write_metadata_kv(f, 'minicpmtts.context_length', GGUF_TYPE_UINT32, config.get('max_position_embeddings', 4096))
+        write_metadata_kv(f, 'minicpmtts.embedding_length', GGUF_TYPE_UINT32, config.get('hidden_size', 768))
+        write_metadata_kv(f, 'minicpmtts.block_count', GGUF_TYPE_UINT32, config.get('num_hidden_layers', 20))
+        write_metadata_kv(f, 'minicpmtts.attention.head_count', GGUF_TYPE_UINT32, config.get('num_attention_heads', 12))
+        write_metadata_kv(f, 'minicpmtts.attention.head_count_kv', GGUF_TYPE_UINT32, config.get('num_key_value_heads', 12))
+        write_metadata_kv(f, 'minicpmtts.feed_forward_length', GGUF_TYPE_UINT32, config.get('intermediate_size', 3072))
+        write_metadata_kv(f, 'minicpmtts.llm_hidden_size', GGUF_TYPE_UINT32, config.get('llm_hidden_size', 4096))
+        write_metadata_kv(f, 'general.file_type', GGUF_TYPE_UINT32, GGML_TYPE_F32 if output_type == 'f32' else GGML_TYPE_F16)
         
         # 写入张量信息
         tensor_infos = []
@@ -207,4 +214,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

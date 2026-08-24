@@ -143,6 +143,59 @@ cmake --build build --target llama-omni-server --target llama-omni-cli -j
 
 > CMake will auto-detect and enable Metal (macOS) or CUDA (Linux with NVIDIA GPU).
 
+### Runtime profile
+
+`--profile auto` reads a static JSON profile. The default path is
+`<model-dir>/omni-runtime-profile.json`; `--profile-config PATH` selects a
+different file. The JSON file names every Omni module, its quantization, GGML
+backend device name, and runtime settings. The server does not select a model
+from available files and does not have a built-in CPU or accelerator fallback.
+
+The server exits before loading weights when the profile file is missing or
+invalid, a required field is absent, a configured model path does not exist, or
+a configured GGML backend device cannot be mapped to a visible accelerator. A
+complete example is in
+[`docs/examples/omni-runtime-profile-auto.md`](docs/examples/omni-runtime-profile-auto.md).
+
+```bash
+./build/bin/llama-omni-server \
+    --profile auto \
+    --model-dir /path/to/MiniCPM-o-4_5-gguf \
+    --host 0.0.0.0 \
+    --port 9060
+```
+
+Inspect the selection without loading weights or opening the HTTP port:
+
+```bash
+./build/bin/llama-omni-server \
+    --profile auto \
+    --model-dir /path/to/MiniCPM-o-4_5-gguf \
+    --print-effective-config
+```
+
+The resolver assigns LLM, Vision, Audio, TTS, Projector, and Token2Wav to the
+devices named in the JSON file. The example uses fixed `CUDA0` and `CUDA1`
+backend names for the first and second visible CUDA devices; `cpu` always means
+the CPU backend. The configured names must be present in the current process,
+otherwise profile validation fails. `primary` and `secondary` remain accepted
+as backward-compatible aliases. `CUDA_VISIBLE_DEVICES` (or the corresponding
+vendor visibility variable) limits which accelerators can be mapped.
+
+The output contains one `placement=` line for each module. Each line names the
+model path, precision, GGML backend class, selected device, execution mode, and
+`active` status. `llama-omni-server` passes the LLM and TTS placements to
+`llama_model_params`, and passes the Vision, Audio, and Projector placements to
+their GGML backend initializers. Token2Wav receives the resolved `gpu:N` or
+`cpu` device string.
+
+Explicit `--model`, `--n-gpu-layers`, `--ctx-size`, and
+`--token2wav-threads` values are applied after the JSON file for compatibility
+with existing scripts. Per-module placement still comes from the JSON file.
+Use `--print-effective-config` to inspect the loaded file, model paths,
+quantization, module placement, and Token2Wav thread count before starting the
+server.
+
 ### Usage
 
 ```bash
@@ -476,6 +529,8 @@ POST /v1/stream/omni_init
 | `duplex_mode` | `true` enables full-duplex streaming |
 | `voice_audio` | Reference WAV for voice cloning. Omit to use default voice |
 | `output_dir` | Directory where TTS WAV files will be written |
+
+When the server starts with `--profile`, the effective runtime configuration controls `duplex_mode`, `tts_gpu_layers`, and `token2wav_device`. Values for those fields in the `omni_init` request are ignored so a request cannot silently replace the static profile placement. Without `--profile`, the request fields keep their legacy behavior.
 
 **Expected response:**
 ```json

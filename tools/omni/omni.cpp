@@ -2,7 +2,9 @@
 #include "vision.h"
 #include "audition.h"
 #include "omni.h"
+#include "runtime-profile.h"
 #include "token2wav/token2wav-impl.h"
+#include "tts-weight-layout.h"
 
 #include "llama.h"
 #include "common/common.h"
@@ -1418,7 +1420,7 @@ static std::mt19937* get_sampler_rng(struct common_sampler * smpl) {
 // 使用 ggml 后端进行计算，支持 CUDA 加速
 // forward(x): relu(linear1(x)) -> linear2
 // ==============================================================================
-bool projector_init(projector_model & model, const std::string & fname, bool use_cuda) {
+bool projector_init(projector_model & model, const std::string & fname, const std::string & device) {
     
     struct gguf_init_params params = {
         /*.no_alloc = */ true,
@@ -1431,19 +1433,16 @@ bool projector_init(projector_model & model, const std::string & fname, bool use
         return false;
     }
     
-#ifdef GGML_USE_CUDA
-    if (use_cuda) {
+    if (device == "cpu") {
+        model.backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, NULL);
+    } else if (!device.empty()) {
+        model.backend = ggml_backend_init_by_name(device.c_str(), NULL);
+    } else {
         model.backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, NULL);
         if (!model.backend) {
             model.backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, NULL);
         }
-    } else {
-        model.backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, NULL);
     }
-#else
-    (void)use_cuda;
-    model.backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, NULL);
-#endif
 
     if (!model.backend) {
         LOG_ERR("Projector: failed to init backend\n");
@@ -1525,6 +1524,10 @@ bool projector_init(projector_model & model, const std::string & fname, bool use
     
     model.initialized = true;
     return true;
+}
+
+bool projector_init(projector_model & model, const std::string & fname, bool use_cuda) {
+    return projector_init(model, fname, use_cuda ? std::string() : std::string("cpu"));
 }
 
 void projector_free(projector_model & model) {
@@ -1609,19 +1612,50 @@ std::vector<float> projector_forward(projector_model & model, const float * inpu
 }
 // ==============================================================================
 
+static void free_tts_raw_weights(struct omni_context * ctx_omni) {
+    free(ctx_omni->emb_code_weight);
+    ctx_omni->emb_code_weight = nullptr;
+    ctx_omni->emb_code_vocab_size = 0;
+    ctx_omni->emb_code_hidden_size = 0;
+    ctx_omni->emb_code_stored_as_transposed = false;
+
+    free(ctx_omni->emb_text_weight);
+    ctx_omni->emb_text_weight = nullptr;
+    ctx_omni->emb_text_vocab_size = 0;
+    ctx_omni->emb_text_hidden_size = 0;
+
+    free(ctx_omni->projector_semantic_linear1_weight);
+    ctx_omni->projector_semantic_linear1_weight = nullptr;
+    free(ctx_omni->projector_semantic_linear1_bias);
+    ctx_omni->projector_semantic_linear1_bias = nullptr;
+    free(ctx_omni->projector_semantic_linear2_weight);
+    ctx_omni->projector_semantic_linear2_weight = nullptr;
+    free(ctx_omni->projector_semantic_linear2_bias);
+    ctx_omni->projector_semantic_linear2_bias = nullptr;
+    ctx_omni->projector_semantic_input_dim = 0;
+    ctx_omni->projector_semantic_output_dim = 0;
+
+    free(ctx_omni->head_code_weight);
+    ctx_omni->head_code_weight = nullptr;
+    ctx_omni->head_code_hidden_size = 0;
+    ctx_omni->head_code_num_audio_tokens = 0;
+}
+
 // Load TTS weights from GGUF file
 bool load_tts_weights_from_gguf(struct omni_context * ctx_omni, const char * tts_model_path) {
 
-    auto ggml_tensor_to_f32 = [](const ggml_tensor * t, float * dst, int64_t n) {
+    auto ggml_tensor_to_f32 = [](const ggml_tensor * t, float * dst, int64_t n) -> bool {
         if (t->type == GGML_TYPE_F32) {
             memcpy(dst, t->data, (size_t)n * sizeof(float));
-            return;
+            return true;
         }
         const auto * traits = ggml_get_type_traits(t->type);
         if (traits && traits->to_float) {
             traits->to_float(t->data, dst, n);
+            return true;
         } else {
             LOG_ERR("TTS: no to_float converter for ggml type %d\n", (int)t->type);
+            return false;
         }
     };
 
@@ -1637,6 +1671,13 @@ bool load_tts_weights_from_gguf(struct omni_context * ctx_omni, const char * tts
         LOG_ERR("TTS: Failed to load GGUF file: %s\n", tts_model_path);
         return false;
     }
+
+    auto fail = [&]() -> bool {
+        free_tts_raw_weights(ctx_omni);
+        ggml_free(ctx_meta);
+        gguf_free(ctx_gguf);
+        return false;
+    };
     
     // Load emb_code.0.weight: (num_audio_tokens=6562, hidden_size=768)
     // This is used to convert audio token IDs to embeddings during decode phase
@@ -1664,9 +1705,7 @@ bool load_tts_weights_from_gguf(struct omni_context * ctx_omni, const char * tts
                 hidden_size = dim1;
             } else {
                 LOG_ERR("TTS: emb_code.0.weight has unexpected shape [%ld, %ld], expected [768, 6562] or [6562, 768]\n", dim0, dim1);
-                ggml_free(ctx_meta);
-                gguf_free(ctx_gguf);
-                return false;
+                return fail();
             }
             
             // Allocate memory and copy data
@@ -1674,16 +1713,12 @@ bool load_tts_weights_from_gguf(struct omni_context * ctx_omni, const char * tts
             ctx_omni->emb_code_weight = (float *)malloc(emb_code_size);
             if (!ctx_omni->emb_code_weight) {
                 LOG_ERR("TTS: Failed to allocate memory for emb_code.0.weight\n");
-                ggml_free(ctx_meta);
-                gguf_free(ctx_gguf);
-                return false;
+                return fail();
             }
             
-            // Copy/convert tensor data based on type
-            enum ggml_type emb_code_type = emb_code_tensor->type;
-            int64_t emb_code_elements = dim0 * dim1;
-            
-            ggml_tensor_to_f32(emb_code_tensor, ctx_omni->emb_code_weight, dim0 * dim1);
+            if (!ggml_tensor_to_f32(emb_code_tensor, ctx_omni->emb_code_weight, dim0 * dim1)) {
+                return fail();
+            }
             
             ctx_omni->emb_code_vocab_size = num_audio_tokens;  // 6562
             ctx_omni->emb_code_hidden_size = hidden_size;     // 768
@@ -1694,9 +1729,7 @@ bool load_tts_weights_from_gguf(struct omni_context * ctx_omni, const char * tts
             ctx_omni->emb_code_stored_as_transposed = false; // Data is always (vocab_size, hidden_size) in memory
         } else {
             LOG_ERR("TTS: Failed to get tensor %s from GGUF context\n", emb_code_name);
-            ggml_free(ctx_meta);
-            gguf_free(ctx_gguf);
-            return false;
+            return fail();
         }
     } else {
         LOG_ERR("TTS: Tensor %s not found in GGUF file (this is OK if using token IDs)\n", emb_code_name);
@@ -1740,15 +1773,11 @@ bool load_tts_weights_from_gguf(struct omni_context * ctx_omni, const char * tts
                 vocab_size = dim0;   // 152064
                 hidden_size = dim1;  // 768
                 LOG_ERR("TTS: emb_text.weight has unusual GGML shape, not handled\n");
-                ggml_free(ctx_meta);
-                gguf_free(ctx_gguf);
-                return false;
+                return fail();
             } else {
                 LOG_ERR("TTS: emb_text.weight has unexpected shape [%ld, %ld], expected ne=[%ld, %ld]\n", 
                        dim0, dim1, expected_hidden_size, expected_vocab_size);
-                ggml_free(ctx_meta);
-                gguf_free(ctx_gguf);
-                return false;
+                return fail();
             }
             
             // Allocate memory for the weight
@@ -1756,30 +1785,23 @@ bool load_tts_weights_from_gguf(struct omni_context * ctx_omni, const char * tts
             ctx_omni->emb_text_weight = (float *)malloc(emb_text_size);
             if (!ctx_omni->emb_text_weight) {
                 LOG_ERR("TTS: Failed to allocate memory for emb_text.weight\n");
-                ggml_free(ctx_meta);
-                gguf_free(ctx_gguf);
-                return false;
+                return fail();
             }
-            
-            // Copy/convert tensor data based on type
-            enum ggml_type emb_text_type = emb_text_tensor->type;
-            int64_t emb_text_elements = vocab_size * hidden_size;
-            
-            ggml_tensor_to_f32(emb_text_tensor, ctx_omni->emb_text_weight, vocab_size * hidden_size);
+
+            if (!ggml_tensor_to_f32(
+                    emb_text_tensor, ctx_omni->emb_text_weight, vocab_size * hidden_size)) {
+                return fail();
+            }
             
             ctx_omni->emb_text_vocab_size = vocab_size;   // 152064
             ctx_omni->emb_text_hidden_size = hidden_size;  // 768
         } else {
             LOG_ERR("TTS: Failed to get tensor %s from GGUF context\n", emb_text_name);
-            ggml_free(ctx_meta);
-            gguf_free(ctx_gguf);
-            return false;
+            return fail();
         }
     } else {
         LOG_ERR("TTS: Tensor %s not found in GGUF file\n", emb_text_name);
-        ggml_free(ctx_meta);
-        gguf_free(ctx_gguf);
-        return false;
+        return fail();
     }
     
     // Load projector_semantic weights
@@ -1864,16 +1886,7 @@ bool load_tts_weights_from_gguf(struct omni_context * ctx_omni, const char * tts
                     *projector_ptrs[i] = (float *)malloc(transposed_size);
                     if (!*projector_ptrs[i]) {
                         LOG_ERR("TTS: Failed to allocate memory for transposed %s\n", projector_names[i]);
-                        // Clean up
-                        for (int j = 0; j < i; j++) {
-                            if (*projector_ptrs[j]) {
-                                free(*projector_ptrs[j]);
-                                *projector_ptrs[j] = nullptr;
-                            }
-                        }
-                        ggml_free(ctx_meta);
-                        gguf_free(ctx_gguf);
-                        return false;
+                        return fail();
                     }
                     
                     // Transpose: src[out_dim][in_dim] -> dst[in_dim][out_dim]
@@ -1887,7 +1900,9 @@ bool load_tts_weights_from_gguf(struct omni_context * ctx_omni, const char * tts
                         }
                     } else {
                         std::vector<float> tmp(dim0 * dim1);
-                        ggml_tensor_to_f32(tensor, tmp.data(), dim0 * dim1);
+                        if (!ggml_tensor_to_f32(tensor, tmp.data(), dim0 * dim1)) {
+                            return fail();
+                        }
                         for (int64_t out = 0; out < out_dim; out++) {
                             for (int64_t in = 0; in < in_dim; in++) {
                                 dst_data[in * out_dim + out] = tmp[out * in_dim + in];
@@ -1900,36 +1915,19 @@ bool load_tts_weights_from_gguf(struct omni_context * ctx_omni, const char * tts
                     *projector_ptrs[i] = (float *)malloc(output_size);
                     if (!*projector_ptrs[i]) {
                         LOG_ERR("TTS: Failed to allocate memory for %s\n", projector_names[i]);
-                        for (int j = 0; j < i; j++) { free(*projector_ptrs[j]); *projector_ptrs[j] = nullptr; }
-                        ggml_free(ctx_meta); gguf_free(ctx_gguf); return false;
+                        return fail();
                     }
-                    ggml_tensor_to_f32(tensor, *projector_ptrs[i], num_elements);
+                    if (!ggml_tensor_to_f32(tensor, *projector_ptrs[i], num_elements)) {
+                        return fail();
+                    }
                 }
             } else {
                 LOG_ERR("TTS: Failed to get tensor %s from GGUF context\n", projector_names[i]);
-                // Clean up
-                for (int j = 0; j < i; j++) {
-                    if (*projector_ptrs[j]) {
-                        free(*projector_ptrs[j]);
-                        *projector_ptrs[j] = nullptr;
-                    }
-                }
-                ggml_free(ctx_meta);
-                gguf_free(ctx_gguf);
-                return false;
+                return fail();
             }
         } else {
             LOG_ERR("TTS: Tensor %s not found in GGUF file\n", projector_names[i]);
-            // Clean up
-            for (int j = 0; j < i; j++) {
-                if (*projector_ptrs[j]) {
-                    free(*projector_ptrs[j]);
-                    *projector_ptrs[j] = nullptr;
-                }
-            }
-            ggml_free(ctx_meta);
-            gguf_free(ctx_gguf);
-            return false;
+            return fail();
         }
     }
     
@@ -1946,164 +1944,78 @@ bool load_tts_weights_from_gguf(struct omni_context * ctx_omni, const char * tts
         if (head_code_tensor) {
             // head_code is Linear(hidden_size, num_audio_tokens, bias=False)
             // In PyTorch: weight shape is (num_audio_tokens, hidden_size) = [6562, 768]
-            // In GGUF: stored as (hidden_size, num_audio_tokens) = [768, 6562] (already transposed)
+            // GGML reports ne[0]=hidden_size and ne[1]=num_audio_tokens. Contiguous data is
+            // output-major: [num_audio_tokens][hidden_size].
             int64_t dim0 = head_code_tensor->ne[0];
             int64_t dim1 = (ggml_n_dims(head_code_tensor) > 1) ? head_code_tensor->ne[1] : 0;
             
             // Expected shape in GGUF: (hidden_size=768, num_audio_tokens=6562)
             int64_t expected_hidden_size = 768;
             int64_t expected_num_audio_tokens = 6562;
-            
-            // Allocate memory for weight: (hidden_size, num_audio_tokens) = [768, 6562]
+
+            const int64_t n_dims = ggml_n_dims(head_code_tensor);
+            const int64_t n_elements = ggml_nelements(head_code_tensor);
+            if (!omni::has_supported_head_code_weight_layout(
+                    n_dims, n_elements, dim0, dim1,
+                    expected_hidden_size, expected_num_audio_tokens)) {
+                LOG_ERR("TTS: head_code.0.weight has unexpected shape: n_dims=%ld, nelements=%ld, "
+                        "ne=[%ld, %ld], expected a 2D tensor with ne=[%ld, %ld] or [%ld, %ld]\n",
+                        n_dims, n_elements, dim0, dim1,
+                        expected_hidden_size, expected_num_audio_tokens,
+                        expected_num_audio_tokens, expected_hidden_size);
+                return fail();
+            }
+
+            // Allocate the normalized output-major weight: [num_audio_tokens][hidden_size].
             size_t head_code_size = expected_hidden_size * expected_num_audio_tokens * sizeof(float);
             ctx_omni->head_code_weight = (float *)malloc(head_code_size);
             if (!ctx_omni->head_code_weight) {
                 LOG_ERR("TTS: Failed to allocate memory for head_code.0.weight\n");
-                // Clean up already loaded weights
-                if (ctx_omni->emb_text_weight) {
-                    free(ctx_omni->emb_text_weight);
-                    ctx_omni->emb_text_weight = nullptr;
-                }
-                for (int j = 0; j < 4; j++) {
-                    if (*projector_ptrs[j]) {
-                        free(*projector_ptrs[j]);
-                        *projector_ptrs[j] = nullptr;
-                    }
-                }
-                ggml_free(ctx_meta);
-                gguf_free(ctx_gguf);
-                return false;
+                return fail();
             }
-            
-            // CRITICAL FIX: The conversion script transposes head_code weight to [768, 6562] before saving,
-            // but the GGUF metadata shape may still be [6562, 768] due to how add_tensor works.
-            // We need to detect the actual data format by testing both layouts.
-            // 
-            // Strategy: Try both formats and see which one produces correct logits.
-            // But a simpler approach: Since the conversion script always transposes to [768, 6562],
-            // and the actual data is stored in that format, we should always use the data as-is
-            // (treating it as [768, 6562]) regardless of metadata shape.
-            //
-            // However, to be safe, we'll check: if metadata says [6562, 768], the data might be
-            // in that format (old conversion) or already transposed (new conversion).
-            // We'll use a heuristic: check if the first few values match what we expect.
-            
-            const float * src_data = (const float *)head_code_tensor->data;
-            bool need_transpose = false;
-            
-            // CRITICAL FIX: Based on conversion script analysis, the script always transposes
-            // head_code to [768, 6562] before saving. So the actual data is always [768, 6562],
-            // regardless of metadata shape. We should NOT transpose based on metadata.
-            //
-            // However, if metadata says [6562, 768], it might be an old conversion that didn't transpose.
-            // We'll use a simple heuristic: if metadata says [6562, 768], assume data needs transpose.
-            // If metadata says [768, 6562], assume data is already correct.
-            
-            if (dim0 == expected_hidden_size && dim1 == expected_num_audio_tokens) {
-                // Metadata says (768, 6562) - data should already be in correct format
-                need_transpose = false;
-            } else if (dim0 == expected_num_audio_tokens && dim1 == expected_hidden_size) {
-                // Metadata says (6562, 768) - but conversion script may have already transposed the data
-                // We need to check: if conversion script transposed, data is actually [768, 6562] and we should NOT transpose
-                // If conversion script didn't transpose, data is [6562, 768] and we SHOULD transpose
-                //
-                // Since the conversion script ALWAYS transposes (line 351: W_transposed = W.T),
-                // the data is always [768, 6562] regardless of metadata.
-                // So we should NOT transpose.
-                need_transpose = false;  // CRITICAL FIX: Don't transpose, data is already [768, 6562]
-            } else {
-                LOG_ERR("TTS: head_code.0.weight has unexpected shape [%ld, %ld], expected [%d, %d] or [%d, %d]\n",
-                       dim0, dim1, expected_hidden_size, expected_num_audio_tokens, expected_num_audio_tokens, expected_hidden_size);
-                // Clean up
-                free(ctx_omni->head_code_weight);
-                ctx_omni->head_code_weight = nullptr;
-                if (ctx_omni->emb_text_weight) {
-                    free(ctx_omni->emb_text_weight);
-                    ctx_omni->emb_text_weight = nullptr;
-                }
-                for (int j = 0; j < 4; j++) {
-                    if (*projector_ptrs[j]) {
-                        free(*projector_ptrs[j]);
-                        *projector_ptrs[j] = nullptr;
-                    }
-                }
-                ggml_free(ctx_meta);
-                gguf_free(ctx_gguf);
-                return false;
-            }
-            
-            // Check tensor type and copy/convert accordingly
-            // ⚡ 优化：转置存储为 [6562, 768]，使每个output token的权重连续存储
-            // 这样在计算logits时可以用高效的向量点积
-            // 原始: weight[j * 6562 + i] = W[j, i]  (j=hidden, i=output)
-            // 转置后: weight[i * 768 + j] = W[i, j] (i=output, j=hidden)
+
+            const bool has_standard_layout = dim0 == expected_hidden_size && dim1 == expected_num_audio_tokens;
+
             enum ggml_type tensor_type = head_code_tensor->type;
             int64_t total_elements = expected_hidden_size * expected_num_audio_tokens;
-            
-            print_with_timestamp("TTS: head_code shape: dim0=%ld, dim1=%ld, will transpose to [%ld, %ld]\n", 
-                                dim0, dim1, expected_num_audio_tokens, expected_hidden_size);
-            
-            // Transpose: [hidden, audio_tokens] -> [audio_tokens, hidden]
+
+            const float * source = nullptr;
+            std::vector<float> converted;
             if (tensor_type == GGML_TYPE_F32) {
-                const float * src_data = (const float *)head_code_tensor->data;
-                for (int64_t i = 0; i < expected_num_audio_tokens; ++i) {
-                    for (int64_t j = 0; j < expected_hidden_size; ++j) {
-                        ctx_omni->head_code_weight[i * expected_hidden_size + j] = src_data[j * expected_num_audio_tokens + i];
-                    }
-                }
+                source = static_cast<const float *>(head_code_tensor->data);
             } else {
-                std::vector<float> tmp(expected_hidden_size * expected_num_audio_tokens);
-                ggml_tensor_to_f32(head_code_tensor, tmp.data(), expected_hidden_size * expected_num_audio_tokens);
-                for (int64_t i = 0; i < expected_num_audio_tokens; ++i) {
-                    for (int64_t j = 0; j < expected_hidden_size; ++j) {
-                        ctx_omni->head_code_weight[i * expected_hidden_size + j] = tmp[j * expected_num_audio_tokens + i];
-                    }
+                converted.resize(total_elements);
+                if (!ggml_tensor_to_f32(head_code_tensor, converted.data(), total_elements)) {
+                    return fail();
                 }
+                source = converted.data();
             }
-            
+
+            if (!omni::copy_head_code_weight_to_output_major(
+                    source, dim0, dim1, expected_hidden_size, expected_num_audio_tokens,
+                    ctx_omni->head_code_weight)) {
+                LOG_ERR("TTS: failed to normalize head_code.0.weight layout\n");
+                return fail();
+            }
+
+            print_with_timestamp("TTS: head_code shape: dim0=%ld, dim1=%ld, source_layout=%s, normalized=[%ld, %ld]\n",
+                                 dim0, dim1, has_standard_layout ? "output-major" : "legacy-hidden-major",
+                                 expected_num_audio_tokens, expected_hidden_size);
+
             ctx_omni->head_code_hidden_size = expected_hidden_size;
             ctx_omni->head_code_num_audio_tokens = expected_num_audio_tokens;
-            
-            // 🔍 调试：验证加载的数据
-            // Python weight[0, 0:5] = [0.01385498, -0.01647949, 0.0111084, -0.01367188, -0.01141357]
-            // C++ head_code_weight[0..4] 应该和 Python 一致
+
             print_with_timestamp("TTS: head_code loaded, verifying first few values:\n");
-            print_with_timestamp("  head_code_weight[0] = %.8f (expect ~0.01385498)\n", ctx_omni->head_code_weight[0]);
-            print_with_timestamp("  head_code_weight[1] = %.8f (expect ~-0.01647949)\n", ctx_omni->head_code_weight[1]);
-            print_with_timestamp("  head_code_weight[768] = %.8f (this is weight[1, 0], expect ~0.04150391)\n", ctx_omni->head_code_weight[768]);
+            print_with_timestamp("  head_code_weight[0] = %.8f\n", ctx_omni->head_code_weight[0]);
+            print_with_timestamp("  head_code_weight[1] = %.8f\n", ctx_omni->head_code_weight[1]);
+            print_with_timestamp("  head_code_weight[768] = %.8f\n", ctx_omni->head_code_weight[768]);
         } else {
             LOG_ERR("TTS: Failed to get tensor %s from GGUF context\n", head_code_name);
-            // Clean up
-            if (ctx_omni->emb_text_weight) {
-                free(ctx_omni->emb_text_weight);
-                ctx_omni->emb_text_weight = nullptr;
-            }
-            for (int j = 0; j < 4; j++) {
-                if (*projector_ptrs[j]) {
-                    free(*projector_ptrs[j]);
-                    *projector_ptrs[j] = nullptr;
-                }
-            }
-            ggml_free(ctx_meta);
-            gguf_free(ctx_gguf);
-            return false;
+            return fail();
         }
     } else {
         LOG_ERR("TTS: Tensor %s not found in GGUF file\n", head_code_name);
-        // Clean up
-        if (ctx_omni->emb_text_weight) {
-            free(ctx_omni->emb_text_weight);
-            ctx_omni->emb_text_weight = nullptr;
-        }
-        for (int j = 0; j < 4; j++) {
-            if (*projector_ptrs[j]) {
-                free(*projector_ptrs[j]);
-                *projector_ptrs[j] = nullptr;
-            }
-        }
-        ggml_free(ctx_meta);
-        gguf_free(ctx_gguf);
-        return false;
+        return fail();
     }
     
     ggml_free(ctx_meta);
@@ -3888,6 +3800,8 @@ struct DuplexPrefillPacket {
     std::vector<std::vector<float>> vision_embed;  // [0]=overview, [1..]=slices
     std::vector<float>              audio_embed;
     int                             index = 0;
+    double                          encoder_ms = 0;
+    bool                            modalities_ok = true;
 };
 
 struct DuplexDecodeReq {
@@ -3895,6 +3809,8 @@ struct DuplexDecodeReq {
     int                round_idx = -1;
     std::atomic<bool>  done{false};
     std::atomic<bool>  ok{false};
+    double             encoder_ms = 0;
+    double             ttft_ms    = 0;
 };
 
 // Duplex Stage 3: 特殊 token 的 embedding 查表。
@@ -3977,6 +3893,42 @@ void print_with_timestamp(const char* format, ...)
     va_end(args);
 }
 
+static std::string omni_runtime_module_device(const omni::effective_runtime_config * config,
+                                              const std::string & module) {
+    if (config == nullptr) {
+        return {};
+    }
+    for (const auto & placement : config->placements) {
+        if (placement.module == module) {
+            return placement.device;
+        }
+    }
+    return {};
+}
+
+static bool configure_llama_model_device(llama_model_params & model_params,
+                                         const std::string & device,
+                                         std::vector<ggml_backend_dev_t> & device_storage) {
+    if (device.empty()) {
+        return true;
+    }
+    ggml_backend_dev_t backend_device = device == "cpu"
+                                            ? ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)
+                                            : ggml_backend_dev_by_name(device.c_str());
+    if (backend_device == nullptr) {
+        LOG_ERR("Omni: unable to resolve model device '%s'\n", device.c_str());
+        return false;
+    }
+    device_storage = { backend_device, nullptr };
+    model_params.devices = device_storage.data();
+    model_params.split_mode = LLAMA_SPLIT_MODE_NONE;
+    model_params.main_gpu = 0;
+    if (device == "cpu") {
+        model_params.n_gpu_layers = 0;
+    }
+    return true;
+}
+
 static struct llama_model * llama_init(common_params * params, std::string model_path) {
     llama_backend_init();
     llama_numa_init(params->numa);
@@ -3992,16 +3944,26 @@ static struct llama_model * llama_init(common_params * params, std::string model
 
 // TTS专用模型加载 - 支持独立的GPU层数设置
 // 通过环境变量 TTS_GPU_LAYERS 控制，-1 表示使用与LLM相同的设置
-static struct llama_model * llama_init_tts(common_params * params, std::string model_path, int n_gpu_layers_override = -1) {
+static struct llama_model * llama_init_tts(common_params * params, std::string model_path,
+                                           int n_gpu_layers_override = -1,
+                                           const std::string & device = {}) {
     llama_backend_init();
     llama_numa_init(params->numa);
     
     llama_model_params model_params = common_model_params_to_llama(*params);
     model_params.partial_load = true;  // TTS GGUF contains extra tensors (emb_code, head_code, projector_*) beyond standard llama
 
+    std::vector<ggml_backend_dev_t> device_storage;
+    if (!configure_llama_model_device(model_params, device, device_storage)) {
+        return NULL;
+    }
+
     // 如果指定了override值(>=0)，使用它；否则保持与LLM相同的设置
     if (n_gpu_layers_override >= 0) {
         model_params.n_gpu_layers = n_gpu_layers_override;
+    }
+    if (device == "cpu") {
+        model_params.n_gpu_layers = 0;
     }
     
     llama_model * model = llama_load_model_from_file(model_path.c_str(), model_params);
@@ -4015,7 +3977,10 @@ static struct llama_model * llama_init_tts(common_params * params, std::string m
 struct omni_context * omni_init(struct common_params * params, int media_type, bool use_tts, std::string tts_bin_dir,
                                 int tts_gpu_layers, const std::string & token2wav_device, bool duplex_mode,
                                 llama_model * existing_model, llama_context * existing_ctx,
-                                const std::string & base_output_dir) {
+                                const std::string & base_output_dir,
+                                const omni::effective_runtime_config * runtime_config,
+                                bool strict_runtime_config,
+                                int token2wav_threads) {
     // process the prompt
     print_with_timestamp("=== omni_init start\n");
     // if (params->prompt.empty() && params->interactive == false) {
@@ -4029,6 +3994,15 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
     ctx_omni->media_type = media_type;
     ctx_omni->use_tts = use_tts;
     ctx_omni->duplex_mode = duplex_mode;
+    ctx_omni->strict_runtime_config = strict_runtime_config;
+    if (runtime_config != nullptr) {
+        token2wav_threads = runtime_config->token2wav_threads;
+    }
+    if (token2wav_threads <= 0) {
+        LOG_ERR("%s: token2wav_threads must be positive\n", __func__);
+        delete ctx_omni;
+        return NULL;
+    }
     ctx_omni->base_output_dir = base_output_dir;  // 🔧 [多实例支持] 设置可配置的输出目录
     print_with_timestamp("media_type = %d, duplex_mode = %d, base_output_dir = %s\n", media_type, duplex_mode, base_output_dir.c_str());
     // 🔧 [对齐 Python MiniCPM-o-4_5-latest] prompt 格式
@@ -4128,13 +4102,13 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
     ctx_omni->ctx_llama = ctx_llama;
     ctx_omni->model = model;
     ctx_omni->ctx_sampler = sampler;
-
     if (use_tts && !params->tts_model.empty()) {
         print_with_timestamp("=== omni_init: loading TTS model\n");
         // 使用TTS专用的模型加载函数，支持独立的GPU层数设置
         // tts_gpu_layers 从 omni_init 参数传入，-1 表示使用与LLM相同的设置
         print_with_timestamp("TTS model: loading with n_gpu_layers=%d\n", tts_gpu_layers);
-        llama_model * tts_model = llama_init_tts(params, params->tts_model, tts_gpu_layers);
+        const std::string tts_device = omni_runtime_module_device(runtime_config, "tts");
+        llama_model * tts_model = llama_init_tts(params, params->tts_model, tts_gpu_layers, tts_device);
         if (tts_model == NULL) {
             LOG_ERR("%s: error: failed to init TTS model from %s\n", __func__, params->tts_model.c_str());
             llama_free(ctx_llama);
@@ -4196,15 +4170,23 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
             return NULL;
         }
         print_with_timestamp("TTS: weights loaded successfully\n");
-        
-        // Load Projector Semantic from GGUF file
-        // 路径: {tts_bin_dir}/MiniCPM-o-4_5-projector-F16.gguf
-        std::string projector_path = tts_bin_dir + "/MiniCPM-o-4_5-projector-F16.gguf";
+        // Load Projector Semantic from the profile-provided path when available.
+        std::string projector_path = params->projector_model.empty()
+                                          ? tts_bin_dir + "/MiniCPM-o-4_5-projector-F16.gguf"
+                                          : params->projector_model;
         print_with_timestamp("Projector: loading from %s\n", projector_path.c_str());
-        if (projector_init(ctx_omni->projector, projector_path, true)) {
+        const std::string projector_device = omni_runtime_module_device(runtime_config, "projector");
+        if (projector_init(ctx_omni->projector, projector_path,
+                           projector_device.empty() ? std::string() : projector_device)) {
             print_with_timestamp("Projector: loaded successfully\n");
         } else {
             print_with_timestamp("Projector: failed to load, will use fallback implementation\n");
+            if (ctx_omni->strict_runtime_config) {
+                LOG_ERR("%s: strict runtime config requires the requested Projector backend\n", __func__);
+                projector_free(ctx_omni->projector);
+                omni_free(ctx_omni);
+                return NULL;
+            }
         }
     }
 
@@ -4224,7 +4206,11 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
         delete ctx_omni;
         return NULL;
     }
-    ctx_omni->ctx_audio = audition_init(params->apm_model.c_str(), audition_context_params{true, GGML_LOG_LEVEL_INFO});
+    const std::string audio_device = omni_runtime_module_device(runtime_config, "audio");
+    ctx_omni->ctx_audio = audition_init(
+        params->apm_model.c_str(),
+        audition_context_params{audio_device != "cpu", GGML_LOG_LEVEL_INFO,
+                                audio_device.empty() || audio_device == "cpu" ? nullptr : audio_device.c_str()});
     print_with_timestamp("APM: init from %s\n", params->apm_model.c_str());
     if (ctx_omni->ctx_audio == nullptr) {
         LOG_ERR("%s: error: failed to init audition model from %s\n", __func__, params->apm_model.c_str());
@@ -4240,14 +4226,23 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
         delete ctx_omni;
         return NULL;
     }
-
     ctx_omni->n_past = 0;
     
     if (media_type == 2) {
         LOG_INF("init vision....");
         const char * vision_path = ctx_omni->params->vpm_model.c_str();
-        auto * ctx_vision = vision_init(vision_path, vision_context_params{true, GGML_LOG_LEVEL_INFO, nullptr});
+        const std::string vision_device = omni_runtime_module_device(runtime_config, "vision");
+        auto * ctx_vision = vision_init(
+            vision_path,
+            vision_context_params{vision_device != "cpu", GGML_LOG_LEVEL_INFO, nullptr,
+                                  vision_device.empty() || vision_device == "cpu" ? nullptr : vision_device.c_str()});
         ctx_omni->ctx_vision = ctx_vision;
+
+        if (ctx_vision == nullptr && ctx_omni->strict_runtime_config) {
+            LOG_ERR("%s: strict runtime config requires the requested Vision backend\n", __func__);
+            omni_free(ctx_omni);
+            return NULL;
+        }
 
         // 🔧 [batch encode 开关] 由 common_params 控制（默认关闭）
         if (ctx_vision) {
@@ -4266,7 +4261,6 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
             }
         }
     }
-    
     ctx_omni->llm_thread_info = new LLMThreadInfo(1000);
     if (ctx_omni->use_tts) {
         LOG_INF("init tts....");
@@ -4343,6 +4337,12 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
             if (voc_dev_env) {
                 device_vocoder = voc_dev_env;
                 print_with_timestamp("Token2Wav: vocoder device overridden by OMNI_VOC_DEVICE=%s\n", voc_dev_env);
+                if (ctx_omni->strict_runtime_config && device_vocoder != token2wav_device) {
+                    LOG_ERR("%s: strict runtime config rejects OMNI_VOC_DEVICE=%s because Token2Wav placement is %s\n",
+                            __func__, voc_dev_env, token2wav_device.c_str());
+                    omni_free(ctx_omni);
+                    return NULL;
+                }
             } else {
 #ifdef GGML_USE_CUDA
                 device_vocoder = token2wav_device;
@@ -4402,21 +4402,24 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
 
             init_ok = ctx_omni->token2wav_session->init_from_prompt_cache_gguf(
                     encoder_gguf, flow_matching_gguf, flow_extra_gguf, prompt_cache_gguf,
-                    vocoder_gguf, device_token2mel, device_vocoder, 5, 1.0f, coreml_model_path);
+                    vocoder_gguf, device_token2mel, device_vocoder, 5, 1.0f, coreml_model_path,
+                    token2wav_threads,
+                    omni::flow::token2wav_device_fallback_allowed(ctx_omni->strict_runtime_config));
             if (!init_ok && use_prompt_bundle) {
                 print_with_timestamp("Token2Wav: prompt_cache failed, fallback to prompt_bundle from %s\n", prompt_bundle_dir.c_str());
                 init_ok = ctx_omni->token2wav_session->init_from_prompt_bundle(
                         encoder_gguf, flow_matching_gguf, flow_extra_gguf, prompt_bundle_dir,
-                        vocoder_gguf, device_token2mel, device_vocoder, 5, 1.0f);
+                        vocoder_gguf, device_token2mel, device_vocoder, 5, 1.0f, "", token2wav_threads,
+                        omni::flow::token2wav_device_fallback_allowed(ctx_omni->strict_runtime_config));
             }
             // Fallback to CPU
-            if (!init_ok) {
+            if (!init_ok && omni::flow::token2wav_device_fallback_allowed(ctx_omni->strict_runtime_config)) {
                 print_with_timestamp("Token2Wav: GPU init failed, trying CPU mode...\n");
                 ctx_omni->token2wav_session.reset();
                 ctx_omni->token2wav_session = std::make_unique<omni::flow::Token2WavSession>();
                 init_ok = ctx_omni->token2wav_session->init_from_prompt_cache_gguf(
                         encoder_gguf, flow_matching_gguf, flow_extra_gguf, prompt_cache_gguf,
-                        vocoder_gguf, "cpu", "cpu", 5, 1.0f);
+                        vocoder_gguf, "cpu", "cpu", 5, 1.0f, "", token2wav_threads);
             }
             
             if (init_ok) {
@@ -4434,7 +4437,12 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
         } else {
             print_with_timestamp("Token2Wav: model files not found in %s\n", ctx_omni->token2wav_model_dir.c_str());
         }
-        
+
+        if (ctx_omni->strict_runtime_config && !ctx_omni->token2wav_initialized) {
+            LOG_ERR("%s: strict runtime config requires Token2Wav on the requested device\n", __func__);
+            omni_free(ctx_omni);
+            return NULL;
+        }
         // ==================== 初始化 Python Token2Wav ====================
         // 🔧 默认使用 Python Token2Wav（精度更高）
         // 设置 Python T2W 脚本目录和模型目录
@@ -4774,35 +4782,7 @@ void omni_free(struct omni_context * ctx_omni) {
             tts_condition_graph_free(ctx_omni);
         }
         
-        // Free TTS weights
-        if (ctx_omni->emb_code_weight) {
-            free(ctx_omni->emb_code_weight);
-            ctx_omni->emb_code_weight = nullptr;
-        }
-        if (ctx_omni->emb_text_weight) {
-            free(ctx_omni->emb_text_weight);
-            ctx_omni->emb_text_weight = nullptr;
-        }
-        if (ctx_omni->projector_semantic_linear1_weight) {
-            free(ctx_omni->projector_semantic_linear1_weight);
-            ctx_omni->projector_semantic_linear1_weight = nullptr;
-        }
-        if (ctx_omni->projector_semantic_linear1_bias) {
-            free(ctx_omni->projector_semantic_linear1_bias);
-            ctx_omni->projector_semantic_linear1_bias = nullptr;
-        }
-        if (ctx_omni->projector_semantic_linear2_weight) {
-            free(ctx_omni->projector_semantic_linear2_weight);
-            ctx_omni->projector_semantic_linear2_weight = nullptr;
-        }
-        if (ctx_omni->projector_semantic_linear2_bias) {
-            free(ctx_omni->projector_semantic_linear2_bias);
-            ctx_omni->projector_semantic_linear2_bias = nullptr;
-        }
-        if (ctx_omni->head_code_weight) {
-            free(ctx_omni->head_code_weight);
-            ctx_omni->head_code_weight = nullptr;
-        }
+        free_tts_raw_weights(ctx_omni);
         
         // Free C++ Token2Wav session
         if (ctx_omni->token2wav_session) {
@@ -8683,6 +8663,15 @@ void t2w_thread_func_python(struct omni_context * ctx_omni, common_params *param
         }
         
         lock.unlock();
+
+        if (ctx_omni->tts_token_output_cb) {
+            if (!new_tokens.empty()) {
+                ctx_omni->tts_token_output_cb(new_tokens.data(), new_tokens.size(), false);
+            }
+            if (is_final) {
+                ctx_omni->tts_token_output_cb(nullptr, 0, true);
+            }
+        }
         
         if (new_tokens.empty() && !is_chunk_end && !is_final) {
             continue;
@@ -8983,6 +8972,15 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
         }
         
         lock.unlock();
+
+        if (ctx_omni->tts_token_output_cb) {
+            if (!new_tokens.empty()) {
+                ctx_omni->tts_token_output_cb(new_tokens.data(), new_tokens.size(), false);
+            }
+            if (is_final) {
+                ctx_omni->tts_token_output_cb(nullptr, 0, true);
+            }
+        }
         
         if (new_tokens.empty() && !is_chunk_end && !is_final) {
             continue;
@@ -9374,8 +9372,12 @@ static void duplex_encoder_thread_func(omni_context * ctx_omni, common_params * 
         DuplexPrefillPacket * packet = new DuplexPrefillPacket();
         packet->index = req->index;
 
-        const bool has_img = !req->img_fname.empty() && ctx_omni->ctx_vision != nullptr;
-        const bool has_aud = !req->aud_fname.empty();
+        const bool wants_img = !req->img_fname.empty();
+        const bool wants_aud = !req->aud_fname.empty();
+        const bool has_img   = wants_img && ctx_omni->ctx_vision != nullptr;
+        const bool has_aud   = wants_aud && ctx_omni->ctx_audio != nullptr;
+        bool       vpm_ok    = !wants_img;
+        bool       apm_ok    = !wants_aud;
 
         auto t_enc_begin = std::chrono::high_resolution_clock::now();
 
@@ -9398,6 +9400,9 @@ static void duplex_encoder_thread_func(omni_context * ctx_omni, common_params * 
                 LOG_ERR("Duplex encoder: vision encode failed for %s\n",
                         req->img_fname.c_str());
                 packet->vision_embed.clear();
+                vpm_ok = false;
+            } else {
+                vpm_ok = !packet->vision_embed.empty();
             }
             auto t1 = std::chrono::high_resolution_clock::now();
             return std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -9414,9 +9419,14 @@ static void duplex_encoder_thread_func(omni_context * ctx_omni, common_params * 
                 std::memcpy(packet->audio_embed.data(), audio_embeds->embed,
                             packet->audio_embed.size() * sizeof(float));
                 omni_embed_free(audio_embeds);
+                apm_ok = true;
             } else {
                 LOG_WRN("Duplex encoder: audio encode returned empty for %s\n",
                         req->aud_fname.c_str());
+                if (audio_embeds != nullptr) {
+                    omni_embed_free(audio_embeds);
+                }
+                apm_ok = false;
             }
             auto t1 = std::chrono::high_resolution_clock::now();
             return std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -9436,6 +9446,8 @@ static void duplex_encoder_thread_func(omni_context * ctx_omni, common_params * 
 
         auto t_enc_end = std::chrono::high_resolution_clock::now();
         double enc_wall_ms = std::chrono::duration<double, std::milli>(t_enc_end - t_enc_begin).count();
+        packet->encoder_ms = enc_wall_ms;
+        packet->modalities_ok = !ctx_omni->strict_runtime_config || (vpm_ok && apm_ok);
 
         print_with_timestamp(
             "[prof] encoder index=%d VPM=%.1fms APM=%.1fms wall=%.1fms parallel_savings=%.1fms\n",
@@ -9796,7 +9808,7 @@ static void duplex_do_prefill_one(omni_context * ctx_omni, common_params * param
 // 返回 false 表示内部异常或被 break 打断。
 // ---------------------------------------------------------------------------
 static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
-                             const std::string & debug_dir, int round_idx) {
+                             const std::string & debug_dir, int round_idx, double * ttft_ms) {
     // ---- 轮次同步（与老 stream_decode 对齐） ----
     if (round_idx >= 0) {
         if (ctx_omni->simplex_round_idx != round_idx) {
@@ -9864,6 +9876,10 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
             ctx_omni->text_streaming = false;
             ctx_omni->text_cv.notify_all();
         }
+        if (ttft_ms != nullptr) {
+            *ttft_ms = std::chrono::duration<double, std::milli>(
+                           std::chrono::high_resolution_clock::now() - t_dec_begin).count();
+        }
         return true;
     }
 
@@ -9902,6 +9918,11 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
             tmp = llama_loop_with_hidden_and_token(
                 ctx_omni, params, ctx_omni->ctx_sampler,
                 ctx_omni->n_past, hidden_states, sampled_token);
+
+            if (ttft_ms != nullptr && *ttft_ms == 0.0) {
+                *ttft_ms = std::chrono::duration<double, std::milli>(
+                               std::chrono::high_resolution_clock::now() - t_dec_begin).count();
+            }
 
             total_tokens_generated++;
 
@@ -10152,6 +10173,7 @@ static void duplex_llm_thread_func(omni_context * ctx_omni, common_params * para
         //   - chunk 0（老路径 prefill）：in_flight=0，直接 decode
         //   - chunk N (N≥1)：in_flight ≥ 1，必有 packet 在途；
         //     wait prefill_queue 非空，消费队头（encoder 是单线程 FIFO 顺序）
+        bool prefill_ok = true;
         if (dup->in_flight_prefill.load() > 0) {
             DuplexPrefillPacket * packet = nullptr;
             {
@@ -10170,9 +10192,13 @@ static void duplex_llm_thread_func(omni_context * ctx_omni, common_params * para
             dup->llm_cv.notify_all();  // encoder 在等 prefill_queue 腾位
 
             if (packet) {
-                // Stage 3: 先试 fused（1 次 llama_decode），失败回退到老 5-7 段路径。
-                if (!duplex_do_prefill_one_fused(ctx_omni, params, packet, hidden_size)) {
-                    duplex_do_prefill_one(ctx_omni, params, packet, hidden_size);
+                decode_req->encoder_ms = packet->encoder_ms;
+                prefill_ok = packet->modalities_ok;
+                if (prefill_ok) {
+                    // Stage 3: 先试 fused（1 次 llama_decode），失败回退到老 5-7 段路径。
+                    if (!duplex_do_prefill_one_fused(ctx_omni, params, packet, hidden_size)) {
+                        duplex_do_prefill_one(ctx_omni, params, packet, hidden_size);
+                    }
                 }
                 delete packet;
                 dup->in_flight_prefill.fetch_sub(1);
@@ -10181,9 +10207,9 @@ static void duplex_llm_thread_func(omni_context * ctx_omni, common_params * para
         }
 
         // ---- Phase 2: decode ----
-        if (!ctx_omni->break_event.load()) {
+        if (!ctx_omni->break_event.load() && prefill_ok) {
             bool ok = duplex_do_decode(ctx_omni, params,
-                                       decode_req->debug_dir, decode_req->round_idx);
+                                       decode_req->debug_dir, decode_req->round_idx, &decode_req->ttft_ms);
             decode_req->ok.store(ok);
         } else {
             decode_req->ok.store(false);
@@ -10267,6 +10293,8 @@ static bool duplex_decode(omni_context * ctx_omni,
             return req.done.load() || !dup->running.load();
         });
     }
+    ctx_omni->last_duplex_encoder_ms.store(req.encoder_ms);
+    ctx_omni->last_duplex_ttft_ms.store(req.ttft_ms);
     return req.ok.load();
 }
 
@@ -10399,6 +10427,13 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
                                 ctx_omni->params->n_batch, &ctx_omni->n_past);
                 omni_embed_free(audio_embeds);
             } else {
+                if (audio_embeds != nullptr) {
+                    omni_embed_free(audio_embeds);
+                }
+                if (ctx_omni->strict_runtime_config) {
+                    LOG_ERR("%s: strict runtime config could not encode the reference audio\n", __func__);
+                    return false;
+                }
             }
             
             // Step 3: 评估 suffix (assistant_prompt，包含 <|audio_end|><|im_end|>)
@@ -11426,10 +11461,21 @@ struct DuplexSession {
 
     std::atomic<int64_t> frame_id_counter{0};
     std::atomic<int>     in_flight{0};   // push 但还未出 done_results 的帧数
+    std::mutex           in_flight_mtx;
+    std::condition_variable in_flight_cv;
 
     std::thread prefill_worker;
     std::thread decode_worker;
 };
+
+static void duplex_session_complete_frames(DuplexSession * sess, int count = 1) {
+    if (count <= 0) return;
+    {
+        std::lock_guard<std::mutex> lock(sess->in_flight_mtx);
+        sess->in_flight.fetch_sub(count);
+    }
+    sess->in_flight_cv.notify_all();
+}
 
 static void duplex_session_prefill_worker_func(omni_context * ctx_omni) {
     DuplexSession * sess = ctx_omni->duplex_session;
@@ -11440,7 +11486,7 @@ static void duplex_session_prefill_worker_func(omni_context * ctx_omni) {
             sess->pending_cv.wait(lk, [&]{
                 return !sess->pending_frames.empty() || !sess->running.load();
             });
-            if (!sess->running.load() && sess->pending_frames.empty()) break;
+            if (!sess->running.load()) break;
             pf = std::move(sess->pending_frames.front());
             sess->pending_frames.pop();
         }
@@ -11451,15 +11497,29 @@ static void duplex_session_prefill_worker_func(omni_context * ctx_omni) {
         bool ok = stream_prefill(ctx_omni, pf.frame.aud_fname, pf.frame.img_fname,
                                  (int)pf.frame_id, pf.frame.max_slice_nums);
 
+        if (!sess->running.load()) {
+            duplex_session_complete_frames(sess);
+            continue;
+        }
+
         OmniDuplexInflightFrame inf;
         inf.frame_id       = pf.frame_id;
         inf.user_seq       = pf.frame.user_seq;
         inf.t_push         = pf.t_push;
         inf.t_prefilled    = std::chrono::high_resolution_clock::now();
         inf.prefill_failed = !ok;
+        bool cancelled = false;
         {
             std::unique_lock<std::mutex> lk(sess->decode_mtx);
-            sess->decode_pending.push(std::move(inf));
+            if (sess->running.load()) {
+                sess->decode_pending.push(std::move(inf));
+            } else {
+                cancelled = true;
+            }
+        }
+        if (cancelled) {
+            duplex_session_complete_frames(sess);
+            continue;
         }
         sess->decode_cv.notify_all();
     }
@@ -11474,7 +11534,7 @@ static void duplex_session_decode_worker_func(omni_context * ctx_omni) {
             sess->decode_cv.wait(lk, [&]{
                 return !sess->decode_pending.empty() || !sess->running.load();
             });
-            if (!sess->running.load() && sess->decode_pending.empty()) break;
+            if (!sess->running.load()) break;
             inf = std::move(sess->decode_pending.front());
             sess->decode_pending.pop();
         }
@@ -11506,7 +11566,9 @@ static void duplex_session_decode_worker_func(omni_context * ctx_omni) {
             }
 
             r.n_past_after = ctx_omni->n_past;
+            r.ms_encoder = ctx_omni->last_duplex_encoder_ms.load();
             r.ms_decode = std::chrono::duration<double, std::milli>(t_dec_end - t_dec_start).count();
+            r.ms_ttft   = ctx_omni->last_duplex_ttft_ms.load();
             r.ms_total  = std::chrono::duration<double, std::milli>(t_dec_end - inf.t_push).count();
         }
         r.ms_prefill_submit = std::chrono::duration<double, std::milli>(inf.t_prefilled - inf.t_push).count();
@@ -11516,7 +11578,7 @@ static void duplex_session_decode_worker_func(omni_context * ctx_omni) {
             sess->done_results.push(std::move(r));
         }
         sess->done_cv.notify_all();
-        sess->in_flight.fetch_sub(1);
+        duplex_session_complete_frames(sess);
     }
 }
 
@@ -11573,9 +11635,12 @@ int64_t omni_duplex_push_frame(struct omni_context * ctx_omni,
             return sess->pending_frames.size() < DuplexSession::PENDING_MAX || !sess->running.load();
         });
         if (!sess->running.load()) return -1;
-        sess->pending_frames.push(std::move(pf));
+        {
+            std::lock_guard<std::mutex> in_flight_lock(sess->in_flight_mtx);
+            sess->in_flight.fetch_add(1);
+            sess->pending_frames.push(std::move(pf));
+        }
     }
-    sess->in_flight.fetch_add(1);
     sess->pending_cv.notify_all();
     return pf.frame_id;
 }
@@ -11627,18 +11692,46 @@ bool omni_duplex_drain_tts_audio(struct omni_context * ctx_omni,
     return false;
 }
 
-void omni_duplex_session_end(struct omni_context * ctx_omni) {
-    if (!ctx_omni || !ctx_omni->duplex_session) return;
+bool omni_duplex_session_end(struct omni_context * ctx_omni, int timeout_ms) {
+    if (!ctx_omni || !ctx_omni->duplex_session) return true;
     DuplexSession * sess = ctx_omni->duplex_session;
 
-    // 1. 等所有已 push 的帧 LLM 完成（drain）
-    //    注意：调用方负责 wait_next_frame 把 done_results 取空；这里只等 in_flight=0。
-    while (sess->in_flight.load() > 0) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    bool drained = false;
+    {
+        std::unique_lock<std::mutex> lock(sess->in_flight_mtx);
+        const auto all_frames_completed = [&] { return sess->in_flight.load() == 0; };
+        if (timeout_ms < 0) {
+            sess->in_flight_cv.wait(lock, all_frames_completed);
+            drained = true;
+        } else {
+            drained = sess->in_flight_cv.wait_for(
+                lock, std::chrono::milliseconds(timeout_ms), all_frames_completed);
+        }
     }
 
-    // 2. 通知 worker 退出
+    // On timeout, cancel frames that have not entered the backend yet. An
+    // inference call already in progress cannot be interrupted externally;
+    // break_event makes the pipeline exit at its next checkpoint.
+    if (!drained) {
+        ctx_omni->break_event.store(true);
+    }
     sess->running.store(false);
+
+    int cancelled_frames = 0;
+    if (!drained) {
+        {
+            std::lock_guard<std::mutex> lock(sess->pending_mtx);
+            cancelled_frames += static_cast<int>(sess->pending_frames.size());
+            while (!sess->pending_frames.empty()) sess->pending_frames.pop();
+        }
+        {
+            std::lock_guard<std::mutex> lock(sess->decode_mtx);
+            cancelled_frames += static_cast<int>(sess->decode_pending.size());
+            while (!sess->decode_pending.empty()) sess->decode_pending.pop();
+        }
+        duplex_session_complete_frames(sess, cancelled_frames);
+    }
+
     sess->pending_cv.notify_all();
     sess->decode_cv.notify_all();
     sess->done_cv.notify_all();
@@ -11649,6 +11742,31 @@ void omni_duplex_session_end(struct omni_context * ctx_omni) {
     delete sess;
     ctx_omni->duplex_session = nullptr;
     print_with_timestamp("omni_duplex_session_end: session destroyed\n");
+    return drained;
+}
+
+bool omni_duplex_flush_tts(struct omni_context * ctx_omni) {
+    if (!ctx_omni || !ctx_omni->async || !ctx_omni->duplex_mode || !ctx_omni->use_tts ||
+        !ctx_omni->tts_thread_info || !tts_thread_running.load()) {
+        return false;
+    }
+
+    auto * end_of_turn = new LLMOut();
+    end_of_turn->llm_finish    = true;
+    end_of_turn->is_end_of_turn = true;
+    end_of_turn->debug_dir     = ctx_omni->base_output_dir;
+    {
+        std::lock_guard<std::mutex> lock(ctx_omni->tts_thread_info->mtx);
+        if (!tts_thread_running.load() ||
+            ctx_omni->tts_thread_info->queue.size() >=
+                static_cast<size_t>(ctx_omni->tts_thread_info->MAX_QUEUE_SIZE)) {
+            delete end_of_turn;
+            return false;
+        }
+        ctx_omni->tts_thread_info->queue.push(end_of_turn);
+    }
+    ctx_omni->tts_thread_info->cv.notify_all();
+    return true;
 }
 
 bool stop_speek(struct omni_context * ctx_omni){

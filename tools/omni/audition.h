@@ -151,6 +151,7 @@ struct audition_audio_f32_batch {
 struct audition_context_params {
     bool use_gpu;
     enum ggml_log_level verbosity;
+    const char * backend_device = nullptr;
 };
 
 struct audition_ctx * audition_init(const char * fname, struct audition_context_params ctx_params);

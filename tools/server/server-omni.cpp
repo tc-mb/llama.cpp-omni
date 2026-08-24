@@ -2,6 +2,8 @@
 // Based on the old server.cpp omni handlers, adapted for the new llama.cpp APIs
 
 #include "omni.h"
+#include "runtime-profile-session.h"
+#include "runtime-profile.h"
 #include "llama.h"
 #include "common.h"
 #include "log.h"
@@ -12,10 +14,11 @@
 
 #include <mutex>
 #include <thread>
-#include <queue>
-#include <condition_variable>
+#include <chrono>
 #include <fstream>
+#include <optional>
 #include <string>
+#include <vector>
 
 #include "httplib.h"
 #include <nlohmann/json.hpp>
@@ -91,7 +94,7 @@ int main(int argc, char ** argv) {
 
     common_init();
 
-    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_SERVER)) {
+    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_OMNI_SERVER)) {
         return 1;
     }
 
@@ -105,6 +108,74 @@ int main(int argc, char ** argv) {
 
     llama_backend_init();
     llama_numa_init(params.numa);
+
+    std::optional<omni::effective_runtime_config> runtime_config;
+    if (!params.omni_runtime_profile.profile.empty()) {
+        std::string model_root = params.omni_runtime_profile.model_dir;
+        if (model_root.empty() && !params.model.path.empty()) {
+            model_root = parent_dir(params.model.path);
+        }
+        if (model_root.empty()) {
+            LOG_ERR("--profile auto requires --model-dir or --model to locate the model tree and static profile config\n");
+            llama_backend_free();
+            return 1;
+        }
+        if (params.omni_runtime_profile.model_explicit) {
+            std::ifstream explicit_model(params.model.path, std::ios::binary);
+            if (!explicit_model.good()) {
+                LOG_ERR("missing explicit LLM model: %s\n", params.model.path.c_str());
+                llama_backend_free();
+                return 1;
+            }
+        }
+
+        const auto inventory = omni::discover_model_inventory(model_root);
+        const auto hardware = omni::detect_hardware_snapshot();
+        omni::runtime_profile_overrides overrides;
+        if (params.omni_runtime_profile.model_explicit) {
+            overrides.llm_model = params.model.path;
+        }
+        if (params.omni_runtime_profile.n_gpu_layers_explicit) {
+            overrides.n_gpu_layers = params.n_gpu_layers;
+        }
+        if (params.omni_runtime_profile.n_ctx_explicit) {
+            overrides.n_ctx = params.n_ctx;
+        }
+        if (params.omni_runtime_profile.token2wav_threads_explicit) {
+            overrides.token2wav_threads = params.omni_runtime_profile.token2wav_threads;
+        }
+
+        const std::string profile_config = params.omni_runtime_profile.profile_config.empty()
+                                                ? model_root + "/omni-runtime-profile.json"
+                                                : params.omni_runtime_profile.profile_config;
+        auto resolved = params.omni_runtime_profile.profile == "auto"
+                            ? omni::resolve_runtime_profile_from_config(profile_config, hardware, inventory, overrides)
+                            : omni::resolve_runtime_profile(params.omni_runtime_profile.profile, hardware, inventory,
+                                                            overrides);
+        if (!resolved.ok) {
+            LOG_ERR("failed to resolve Omni runtime profile: %s\n", resolved.error.c_str());
+            llama_backend_free();
+            return 1;
+        }
+
+        runtime_config = std::move(resolved.config);
+
+        std::string apply_error;
+        if (!omni::apply_effective_runtime_config(params, *runtime_config, apply_error)) {
+            LOG_ERR("%s\n", apply_error.c_str());
+            llama_backend_free();
+            return 1;
+        }
+
+        const std::string effective_config = omni::format_effective_runtime_config(*runtime_config);
+        if (params.omni_runtime_profile.print_effective_config) {
+            std::fputs(effective_config.c_str(), stdout);
+            std::fflush(stdout);
+            llama_backend_free();
+            return 0;
+        }
+        LOG_INF("Resolved Omni runtime configuration:\n%s", effective_config.c_str());
+    }
 
     LOG_INF("Omni HTTP server starting...\n");
 
@@ -146,9 +217,16 @@ int main(int argc, char ** argv) {
 
         int media_type = data.value("msg_type", data.value("media_type", 2));
         bool use_tts   = data.value("use_tts", true);
-        bool duplex_mode = data.value("duplex_mode", false);
-        int tts_gpu_layers = data.value("tts_gpu_layers", 100);
-        std::string token2wav_device = data.value("token2wav_device", "gpu:0");
+        const auto session_options = omni::resolve_runtime_session_options(
+            runtime_config ? &*runtime_config : nullptr,
+            data.value("duplex_mode", false),
+            data.value("tts_gpu_layers", 100),
+            data.value("token2wav_device", "gpu:0"),
+            data.value("token2wav_threads", params.omni_runtime_profile.token2wav_threads));
+        bool duplex_mode = session_options.duplex_mode;
+        int tts_gpu_layers = session_options.tts_gpu_layers;
+        std::string token2wav_device = session_options.token2wav_device;
+        int token2wav_threads = session_options.token2wav_threads;
         std::string output_dir = data.value("output_dir", "./tools/omni/output");
         std::string voice_audio = data.value("voice_audio", "");
 
@@ -188,7 +266,9 @@ int main(int argc, char ** argv) {
 
         omni_context * octx = omni_init(&params, media_type, use_tts, params.tts_bin_dir, tts_gpu_layers,
                                          token2wav_device, duplex_mode,
-                                         /*existing_model=*/nullptr, /*existing_ctx=*/nullptr, output_dir);
+                                         /*existing_model=*/nullptr, /*existing_ctx=*/nullptr, output_dir,
+                                         runtime_config ? &*runtime_config : nullptr,
+                                         session_options.strict_runtime_config, token2wav_threads);
         if (!octx) {
             res_error(res, format_error_response("omni_init failed"));
             return;
@@ -197,6 +277,15 @@ int main(int argc, char ** argv) {
         // voice clone / assistant prompt
         if (data.contains("voice_clone_prompt")) octx->omni_voice_clone_prompt = data["voice_clone_prompt"];
         if (data.contains("assistant_prompt")) octx->omni_assistant_prompt = data["assistant_prompt"];
+        octx->ref_audio_path = voice_audio;
+
+        // The HTTP contract reserves cnt=0 for session initialization. Complete
+        // that prefill here so the first client frame can start at cnt=1.
+        if (!stream_prefill(octx, voice_audio, /*img_fname=*/"", /*index=*/0)) {
+            omni_free(octx);
+            res_error(res, format_error_response("omni_init failed to initialize the streaming session"));
+            return;
+        }
 
         {
             std::lock_guard<std::mutex> lock(state.octx_mutex);
@@ -339,6 +428,10 @@ int main(int argc, char ** argv) {
                 // send done
                 static const std::string ev_done = "data: [DONE]\n\n";
                 sink.write(ev_done.data(), ev_done.size());
+                // Mark the chunked response complete. Returning false here
+                // skips cpp-httplib's terminating chunk and makes clients
+                // report an incomplete transfer.
+                sink.done();
                 return true;
             });
     });
@@ -368,7 +461,8 @@ int main(int argc, char ** argv) {
     svr.WebSocket("/backend", [&](const httplib::Request &, httplib::ws::WebSocket & ws) {
         handle_ws_backend(ws, state.session_mgr, params,
                           /*model*/nullptr, /*ctx*/nullptr,
-                          state.octx, state.octx_mutex);
+                          state.octx, state.octx_mutex,
+                          runtime_config ? &*runtime_config : nullptr);
     });
 
     svr.Post("/sessions/:session_id/close", [&](const httplib::Request & req, httplib::Response & res) {

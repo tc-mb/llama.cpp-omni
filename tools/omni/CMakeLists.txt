@@ -12,6 +12,12 @@ endif()
 add_library(omni
             omni.cpp
             omni.h
+            runtime-profile-session.cpp
+            runtime-profile-session.h
+            runtime-profile.cpp
+            runtime-profile.h
+            tts-weight-layout.cpp
+            tts-weight-layout.h
             tts-condition-graph.cpp
             tts-condition-graph.h
             audition.cpp
@@ -50,7 +56,9 @@ target_link_libraries     (omni PRIVATE Threads::Threads)
 target_include_directories(omni PUBLIC  .)
 target_include_directories(omni PRIVATE ../..)
 target_include_directories(omni PRIVATE ../../vendor)
+target_include_directories(omni PRIVATE ../../examples/gguf-hash/deps)
 target_compile_features   (omni PRIVATE cxx_std_17)
+target_sources(omni PRIVATE ../../examples/gguf-hash/deps/sha256/sha256.c)
 
 # Link CoreML and Accelerate frameworks when CoreML is enabled
 if(ENABLE_COREML)
@@ -201,6 +209,20 @@ endif()
 # voxcpm2-cli build + smoke test (no weights). --help exits non-zero by design,
 # so assert on the usage banner instead of the exit code.
 if (LLAMA_BUILD_TESTS)
+    set(TARGET_HEAD_CODE_LAYOUT_TEST test-head-code-layout)
+    add_executable(${TARGET_HEAD_CODE_LAYOUT_TEST} test/test-head-code-layout.cpp)
+    target_link_libraries(${TARGET_HEAD_CODE_LAYOUT_TEST} PRIVATE omni)
+    target_compile_features(${TARGET_HEAD_CODE_LAYOUT_TEST} PRIVATE cxx_std_17)
+    add_test(NAME ${TARGET_HEAD_CODE_LAYOUT_TEST} COMMAND ${TARGET_HEAD_CODE_LAYOUT_TEST})
+    set_tests_properties(${TARGET_HEAD_CODE_LAYOUT_TEST} PROPERTIES LABELS "main;omni")
+
+    set(TARGET_RUNTIME_PROFILE_TEST test-runtime-profile)
+    add_executable(${TARGET_RUNTIME_PROFILE_TEST} test/test-runtime-profile.cpp)
+    target_link_libraries(${TARGET_RUNTIME_PROFILE_TEST} PRIVATE omni)
+    target_compile_features(${TARGET_RUNTIME_PROFILE_TEST} PRIVATE cxx_std_17)
+    add_test(NAME ${TARGET_RUNTIME_PROFILE_TEST} COMMAND ${TARGET_RUNTIME_PROFILE_TEST})
+    set_tests_properties(${TARGET_RUNTIME_PROFILE_TEST} PROPERTIES LABELS "main;omni")
+
     add_test(
         NAME voxcpm2-cli-smoke
         COMMAND ${TARGET_VOXCPM2_CLI} --help

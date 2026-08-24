@@ -27,6 +27,7 @@ namespace omni {
 namespace flow {
 class Token2WavSession;
 }
+struct effective_runtime_config;
 }
 
 // 🔧 [Duplex Pipeline] 仅在 duplex_mode=true 时分配；
@@ -157,6 +158,7 @@ struct projector_model {
 // is_final: true if this is the last chunk of the current generation
 // ============================================================================
 using audio_output_cb_t = std::function<void(const float * samples, int n_samples, int sample_rate, bool is_final)>;
+using tts_token_output_cb_t = std::function<void(const int32_t * tokens, size_t count, bool is_final)>;
 
 struct omni_context {
     struct vision_ctx * ctx_vision = NULL;
@@ -170,6 +172,7 @@ struct omni_context {
     // true: omni_init 内部加载的模型，omni_free 时需要释放
     // false: 外部传入的已有模型（模型复用），omni_free 时不释放
     bool owns_model = true;
+    bool strict_runtime_config = false;
 
     // 🔧 [Length Penalty] 用于调整 EOS token 的采样概率
     // length_penalty > 1.0 会降低 EOS 概率，让模型生成更长的输出
@@ -257,6 +260,8 @@ struct omni_context {
     // 持有内部 prefill_worker/decode_worker 线程及 frame 队列。
     // omni_free 时若仍存在，会被强制 session_end 释放。
     DuplexSession * duplex_session = NULL;
+    std::atomic<double> last_duplex_encoder_ms{0.0};
+    std::atomic<double> last_duplex_ttft_ms{0.0};
     
     volatile bool need_speek = false;
     volatile bool speek_done = true;
@@ -390,7 +395,7 @@ struct omni_context {
     
     // head_code: Linear layer (hidden_size=768 -> num_audio_tokens=6562)
     // Note: num_vq=1, so we only need one head_code layer
-    float * head_code_weight = nullptr;  // (768, 6562) - stored as (hidden_size, num_audio_tokens)
+    float * head_code_weight = nullptr;  // [num_audio_tokens, hidden_size], one contiguous row per output token
     int head_code_hidden_size = 0;  // 768
     int head_code_num_audio_tokens = 0;  // 6562
     
@@ -429,6 +434,7 @@ struct omni_context {
     // macOS 上默认使用 C++ 实现（无 CUDA）
     bool use_python_token2wav = false;
     audio_output_cb_t audio_output_cb = nullptr; // called by T2W threads when a chunk of audio is ready
+    tts_token_output_cb_t tts_token_output_cb = nullptr;
     std::string python_t2w_script_dir;  // Python Token2Wav 脚本目录
     std::string python_t2w_model_dir;   // Python Token2Wav 模型目录
     
@@ -488,7 +494,10 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
                                 int tts_gpu_layers = -1, const std::string & token2wav_device = "gpu:0",
                                 bool duplex_mode = false,
                                 llama_model * existing_model = nullptr, llama_context * existing_ctx = nullptr,
-                                const std::string & base_output_dir = "./tools/omni/output");
+                                const std::string & base_output_dir = "./tools/omni/output",
+                                const omni::effective_runtime_config * runtime_config = nullptr,
+                                bool strict_runtime_config = false,
+                                int token2wav_threads = 8);
 
 void omni_free(struct omni_context * ctx_omni);
 // Stop/join inference threads and clear queues so the same context can serve a
@@ -551,7 +560,9 @@ struct OmniDuplexFrameResult {
     std::string text;               // 该帧 SPEAK 时生成的文本片段（已剔除控制 token）
     int      n_past_after = 0;      // 帧处理完成时的 ctx_llama n_past（调试用）
     double   ms_prefill_submit = 0; // push_frame → prefill_worker 完成提交（不等编码）
+    double   ms_encoder = 0;        // VPM/APM parallel encoder wall time
     double   ms_decode = 0;         // decode_worker 内部 stream_decode 阻塞时长
+    double   ms_ttft = 0;           // decode start → first sampled token
     double   ms_total = 0;          // push_frame → 本帧 result 出队的端到端 wall time
 };
 
@@ -579,9 +590,14 @@ bool omni_duplex_wait_next_frame(struct omni_context * ctx_omni,
                                  OmniDuplexFrameResult * out,
                                  int timeout_ms = -1);
 
-// 结束会话：等所有已 push 但未完成的帧 LLM 完成（drain），停止 worker 线程并释放。
-// TTS / token2wav 后台音频生成线程不在此处停止，由 omni_free 负责。
-void omni_duplex_session_end(struct omni_context * ctx_omni);
+// 结束会话：等待所有已 push 但未完成的 frame 完成（drain），停止 worker 线程并释放。
+// timeout_ms < 0 时无限等待，timeout_ms >= 0 时最多等待指定毫秒数。
+// timeout 后会取消尚未开始处理的 frame，并返回 false；TTS / token2wav 线程仍由 omni_free 停止。
+bool omni_duplex_session_end(struct omni_context * ctx_omni, int timeout_ms = -1);
+
+// 显式结束仍在 SPEAK 的 duplex turn。end-of-turn marker 会排在已有 TTS 请求之后，
+// 由正常 TTS 路径生成尾部 audio token，并让 Token2Wav 发出 is_final=true callback。
+bool omni_duplex_flush_tts(struct omni_context * ctx_omni);
 
 // 阻塞等待 TTS / token2wav 队列彻底空闲（即所有 speak 帧的 audio 文件已写盘）。
 // 返回前会要求队列连续 idle_ms 毫秒为空，避免误判中间瞬态 idle。
@@ -608,6 +624,7 @@ llama_token sample_tts_token(struct common_sampler * smpl, struct omni_context *
 
 // Projector 函数声明（精度验证版本）
 bool projector_init(projector_model & model, const std::string & fname, bool use_cuda);
+bool projector_init(projector_model & model, const std::string & fname, const std::string & device);
 void projector_free(projector_model & model);
 std::vector<float> projector_forward(projector_model & model, const float * input_data, int n_tokens);
 

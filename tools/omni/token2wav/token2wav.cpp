@@ -16,12 +16,14 @@ bool Token2WavSession::init_from_prompt_cache_gguf(const std::string & encoder_g
                                                    const std::string & device_vocoder,
                                                    int                 n_timesteps,
                                                    float               temperature,
-                                                   const std::string & coreml_model_path) {
+                                                   const std::string & coreml_model_path,
+                                                   int                 threads,
+                                                   bool                allow_device_fallback) {
     // 初始化方式第一种，仅需使用此方式即可，加载模型所有的gguf内容
     const auto t0 = std::chrono::steady_clock::now();
     reset();
     if (!t2w.load_models(encoder_gguf, flow_matching_gguf, flow_extra_gguf, vocoder_gguf, device_token2mel,
-                         device_vocoder, coreml_model_path)) {
+                         device_vocoder, coreml_model_path, threads, allow_device_fallback)) {
         return false;
     }
     if (!t2w.start_stream_with_prompt_cache_gguf(prompt_cache_gguf_path, n_timesteps, temperature)) {
@@ -46,11 +48,13 @@ bool Token2WavSession::init_from_prompt_bundle(const std::string & encoder_gguf,
                                                const std::string & device_vocoder,
                                                int                 n_timesteps,
                                                float               temperature,
-                                               const std::string & coreml_model_path) {
+                                               const std::string & coreml_model_path,
+                                               int                 threads,
+                                               bool                allow_device_fallback) {
     // 初始化方式第二种（如要更换示例音频使用此接口作为备用）
     reset();
     if (!t2w.load_models(encoder_gguf, flow_matching_gguf, flow_extra_gguf, vocoder_gguf, device_token2mel,
-                         device_vocoder, coreml_model_path)) {
+                         device_vocoder, coreml_model_path, threads, allow_device_fallback)) {
         return false;
     }
     Token2Mel::PromptBundle pb;

@@ -6578,7 +6578,8 @@ void hg_t1b_to_bt1(const std::vector<float> & t1b, int64_t T, int64_t B, std::ve
 }  // namespace
 bool voc_hg2_model::voc_hg2_model_init_from_gguf(const std::string & gguf_path_in,
                                                  const std::string & device,
-                                                 int32_t             num_threads_in) {
+                                                 int32_t             num_threads_in,
+                                                 bool                allow_backend_fallback) {
     voc_hg2_model_free();
     gguf_path   = gguf_path_in;
     num_threads = num_threads_in > 0 ? num_threads_in : 1;
@@ -6597,12 +6598,19 @@ bool voc_hg2_model::voc_hg2_model_init_from_gguf(const std::string & gguf_path_i
         backend = ggml_backend_cuda_init(gpu_idx);
 #endif
         if (!backend) {
+#ifdef GGML_USE_CUDA
+            if (!allow_backend_fallback) {
+                LOG_ERROR("voc_hg2_model: requested CUDA device %d is unavailable\n", gpu_idx);
+                voc_hg2_model_free();
+                return false;
+            }
+#endif
             backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
         }
         if (!backend) {
             backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU, nullptr);
         }
-        if (!backend) {
+        if (!backend && allow_backend_fallback) {
             backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
         }
         std::fprintf(stderr, "voc_hg2_model: init_backend device=%s, gpu_idx=%d, backend=%s\n",
@@ -7184,12 +7192,12 @@ ggml_backend_t flow_loader_init_backend_cpu(std::string & backend_name_out) {
     }
     return backend;
 }
-ggml_backend_t flow_loader_init_backend_gpu_first(std::string & backend_name_out) {
+ggml_backend_t flow_loader_init_backend_gpu_first(std::string & backend_name_out, bool allow_backend_fallback) {
     ggml_backend_t backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
     if (!backend) {
         backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU, nullptr);
     }
-    if (!backend) {
+    if (!backend && allow_backend_fallback) {
         backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
     }
     if (backend) {
@@ -7217,7 +7225,7 @@ void flowGGUFModelLoader::reset() {
     backend_name_.clear();
     encoder_pre_lookahead_len_ = 3;
 }
-bool flowGGUFModelLoader::init_backend(const std::string & device) {
+bool flowGGUFModelLoader::init_backend(const std::string & device, bool allow_backend_fallback) {
     if (backend_) {
         return true;
     }
@@ -7237,7 +7245,13 @@ bool flowGGUFModelLoader::init_backend(const std::string & device) {
         backend_ = ggml_backend_cuda_init(gpu_idx);
 #endif
         if (!backend_) {
-            backend_ = flow_loader_init_backend_gpu_first(backend_name_);
+#ifdef GGML_USE_CUDA
+            if (!allow_backend_fallback) {
+                LOG_ERROR("flowGGUFModelLoader: requested CUDA device %d is unavailable\n", gpu_idx);
+                return false;
+            }
+#endif
+            backend_ = flow_loader_init_backend_gpu_first(backend_name_, allow_backend_fallback);
         }
         if (backend_) {
             backend_name_ = ggml_backend_name(backend_);
@@ -7278,9 +7292,10 @@ bool flowGGUFModelLoader::bind_all() {
 bool flowGGUFModelLoader::load_from_gguf(const std::string & encoder_gguf_path,
                                          const std::string & flow_matching_gguf_path,
                                          const std::string & flow_extra_gguf_path,
-                                         const std::string & device) {
+                                         const std::string & device,
+                                         bool                  allow_backend_fallback) {
     reset();
-    if (!init_backend(device)) {
+    if (!init_backend(device, allow_backend_fallback)) {
         return false;
     }
     encoder_weights_ = std::make_unique<upsample_encoder_v2::ueUpsampleEncoderModelLoaderGGUF>();
@@ -7599,9 +7614,11 @@ void flowGGUFModelRunner::reset() {
 bool flowGGUFModelRunner::load_from_gguf(const std::string & encoder_gguf_path,
                                          const std::string & flow_matching_gguf_path,
                                          const std::string & flow_extra_gguf_path,
-                                         const std::string & device) {
+                                         const std::string & device,
+                                         bool                  allow_backend_fallback) {
     reset();
-    if (!loader_.load_from_gguf(encoder_gguf_path, flow_matching_gguf_path, flow_extra_gguf_path, device)) {
+    if (!loader_.load_from_gguf(encoder_gguf_path, flow_matching_gguf_path, flow_extra_gguf_path, device,
+                                allow_backend_fallback)) {
         return false;
     }
     set_num_threads(num_threads_);
@@ -8690,6 +8707,10 @@ bool t2m_load_prompt_cache_gguf(const std::string &               gguf_path,
 
 }  // namespace
 
+bool token2wav_device_fallback_allowed(bool strict_runtime_config) {
+    return !strict_runtime_config;
+}
+
 Token2Mel::~Token2Mel() {
 #if defined(ENABLE_COREML) && defined(__APPLE__)
     if (ane_handle_) {
@@ -8704,12 +8725,14 @@ bool Token2Mel::load_model(const std::string & encoder_gguf,
                            const std::string & flow_extra_gguf,
                            const std::string & device,
                            int                 threads,
-                           const std::string & coreml_model_path) {
-    // 用于加载三段GGUF并初始化runner(失败时回退到cpu)
+                           const std::string & coreml_model_path,
+                           bool                allow_device_fallback) {
+    // Load the three GGUF files and keep the requested device when strict mode is active.
     reset_stream();
     runner_.set_num_threads(threads);
-    if (!runner_.load_from_gguf(encoder_gguf, flow_matching_gguf, flow_extra_gguf, device)) {
-        if (device != "cpu") {
+    if (!runner_.load_from_gguf(encoder_gguf, flow_matching_gguf, flow_extra_gguf, device,
+                                allow_device_fallback)) {
+        if (device != "cpu" && allow_device_fallback) {
             LOG_ERROR( "Token2Mel.load_model: load_from_gguf(%s) failed, fallback to cpu\n", device.c_str());
             if (!runner_.load_from_gguf(encoder_gguf, flow_matching_gguf, flow_extra_gguf, "cpu")) {
                 LOG_ERROR( "Token2Mel.load_model: fallback cpu failed\n");
@@ -9478,10 +9501,12 @@ bool Token2MelSession::init_from_prompt_bundle(const std::string & encoder_gguf,
                                                int                 threads,
                                                const std::string & prompt_bundle_dir,
                                                int                 n_timesteps,
-                                               float               temperature) {
+                                               float               temperature,
+                                               bool                allow_device_fallback) {
     // 初始化会话方式1：读取prompt_bundle并执行setup_cache，用于后续feed_*流式推理。
     reset();
-    if (!t2m.load_model(encoder_gguf, flow_matching_gguf, flow_extra_gguf, device, threads)) {
+    if (!t2m.load_model(encoder_gguf, flow_matching_gguf, flow_extra_gguf, device, threads, "",
+                        allow_device_fallback)) {
         return false;
     }
 
@@ -9504,10 +9529,12 @@ bool Token2MelSession::init_from_prompt_cache_gguf(const std::string & encoder_g
                                                    int                 threads,
                                                    const std::string & prompt_cache_gguf_path,
                                                    int                 n_timesteps,
-                                                   float               temperature) {
+                                                   float               temperature,
+                                                   bool                allow_device_fallback) {
     // 初始化会话方式2（从方式1或方式2选自其中一个即可，推荐方式2直接加载gguf）：从prompt_cache.gguf恢复缓存并开始流式推理，跳过prompt_bundle与setup_cache计算。
     reset();
-    if (!t2m.load_model(encoder_gguf, flow_matching_gguf, flow_extra_gguf, device, threads)) {
+    if (!t2m.load_model(encoder_gguf, flow_matching_gguf, flow_extra_gguf, device, threads, "",
+                        allow_device_fallback)) {
         return false;
     }
     if (!t2m.start_stream_with_prompt_cache_gguf(prompt_cache_gguf_path, n_timesteps, temperature)) {
@@ -9652,17 +9679,18 @@ bool Token2Wav::load_models(const std::string & encoder_gguf,
                             const std::string & vocoder_gguf,
                             const std::string & device_token2mel,
                             const std::string & device_vocoder,
-                            const std::string & coreml_model_path) {
+                            const std::string & coreml_model_path,
+                            int                 threads,
+                            bool                allow_device_fallback) {
     reset_stream();
 
-    constexpr int kDefaultThreads = 8;
-    if (!t2m_.load_model(encoder_gguf, flow_matching_gguf, flow_extra_gguf, device_token2mel, kDefaultThreads,
-                         coreml_model_path)) {
+    if (!t2m_.load_model(encoder_gguf, flow_matching_gguf, flow_extra_gguf, device_token2mel, threads,
+                         coreml_model_path, allow_device_fallback)) {
         LOG_ERROR( "Token2Wav.load_models: Token2Mel.load_model failed\n");
         models_loaded_ = false;
         return false;
     }
-    if (!voc_model_.voc_hg2_model_init_from_gguf(vocoder_gguf, device_vocoder, kDefaultThreads)) {
+    if (!voc_model_.voc_hg2_model_init_from_gguf(vocoder_gguf, device_vocoder, threads, allow_device_fallback)) {
         LOG_ERROR( "Token2Wav.load_models: voc_hg2_model_init_from_gguf failed\n");
         models_loaded_ = false;
         return false;

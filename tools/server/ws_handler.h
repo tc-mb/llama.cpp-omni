@@ -12,6 +12,10 @@ struct llama_model;
 struct llama_context;
 class SessionManager;
 
+namespace omni {
+struct effective_runtime_config;
+}
+
 namespace httplib {
 namespace ws { class WebSocket; }
 }
@@ -26,7 +30,8 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
                        llama_model * model,
                        llama_context * ctx,
                        omni_context *& shared_octx,  // server-owned, reused across sessions
-                       std::mutex & octx_mutex);
+                       std::mutex & octx_mutex,
+                       const omni::effective_runtime_config * runtime_config = nullptr);
 
 // ============================================================================
 // Helpers: base64 audio/JPEG → temp files

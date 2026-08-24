@@ -4,6 +4,7 @@ import sys
 import shutil
 import importlib.util
 import re
+import json
 
 import torch
 from safetensors import safe_open
@@ -65,10 +66,39 @@ def load_safetensors(safetensors_path: str) -> dict:
     Returns:
         state_dict 字典
     """
+    # Hugging Face stores larger checkpoints as an index plus multiple shards.
+    # Read each shard once, while keeping the existing single-file path working.
+    if os.path.isdir(safetensors_path):
+        single_file = os.path.join(safetensors_path, "model.safetensors")
+        index_file = os.path.join(safetensors_path, "model.safetensors.index.json")
+        if os.path.exists(single_file):
+            safetensors_files = [single_file]
+        elif os.path.exists(index_file):
+            with open(index_file, "r", encoding="utf-8") as f:
+                index = json.load(f)
+            safetensors_files = sorted(
+                {
+                    os.path.join(safetensors_path, filename)
+                    for filename in index.get("weight_map", {}).values()
+                }
+            )
+            if not safetensors_files:
+                raise ValueError(f"索引文件没有 weight_map: {index_file}")
+        else:
+            raise FileNotFoundError(
+                f"目录中找不到 model.safetensors 或 model.safetensors.index.json: {safetensors_path}"
+            )
+    else:
+        safetensors_files = [safetensors_path]
+
     state_dict = {}
-    with safe_open(safetensors_path, framework="pt", device="cpu") as f:
-        for key in f.keys():
-            state_dict[key] = f.get_tensor(key)
+    for shard_path in safetensors_files:
+        if not os.path.exists(shard_path):
+            raise FileNotFoundError(f"索引引用的 safetensors shard 不存在: {shard_path}")
+        print(f"  读取 shard: {shard_path}")
+        with safe_open(shard_path, framework="pt", device="cpu") as f:
+            for key in f.keys():
+                state_dict[key] = f.get_tensor(key)
     return state_dict
 
 
@@ -121,14 +151,23 @@ def main():
     print(f"  - VPM: {vpm_dir}")
     print(f"  - APM: {apm_dir}")
 
-    # 检查 safetensors 文件
-    safetensors_path = os.path.join(args.model, "model.safetensors")
-    if not os.path.exists(safetensors_path):
-        raise FileNotFoundError(f"找不到 safetensors 文件: {safetensors_path}")
+    # 检查单文件或分片 safetensors checkpoint
+    safetensors_path = args.model
+    single_file = os.path.join(args.model, "model.safetensors")
+    index_file = os.path.join(args.model, "model.safetensors.index.json")
+    if os.path.exists(single_file):
+        safetensors_path = single_file
+    elif not os.path.exists(index_file):
+        raise FileNotFoundError(
+            f"找不到 model.safetensors 或 model.safetensors.index.json: {args.model}"
+        )
     
     print(f"\n正在加载 safetensors: {safetensors_path}")
-    file_size = os.path.getsize(safetensors_path) / 1024 / 1024 / 1024
-    print(f"  文件大小: {file_size:.2f} GB")
+    if os.path.isfile(safetensors_path):
+        file_size = os.path.getsize(safetensors_path) / 1024 / 1024 / 1024
+        print(f"  文件大小: {file_size:.2f} GB")
+    else:
+        print("  使用 model.safetensors.index.json 分片权重")
     
     # 加载 safetensors 文件
     checkpoint = load_safetensors(safetensors_path)

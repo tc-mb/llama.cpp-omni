@@ -16,6 +16,7 @@ Usage:
 import os
 import struct
 import argparse
+import json
 import numpy as np
 
 def write_string(f, s):
@@ -32,30 +33,37 @@ def convert_projector(model_path: str, output_path: str):
     # 查找 safetensors 文件
     if os.path.isdir(model_path):
         safetensors_path = os.path.join(model_path, 'model.safetensors')
-        if not os.path.exists(safetensors_path):
-            # 尝试查找其他 safetensors 文件
-            for f in os.listdir(model_path):
-                if f.endswith('.safetensors'):
-                    safetensors_path = os.path.join(model_path, f)
-                    break
+        if os.path.exists(safetensors_path):
+            safetensors_paths = [safetensors_path]
+        else:
+            index_path = os.path.join(model_path, 'model.safetensors.index.json')
+            if not os.path.exists(index_path):
+                raise FileNotFoundError(f"找不到 safetensors 文件或索引: {model_path}")
+            with open(index_path, 'r', encoding='utf-8') as index_file:
+                index = json.load(index_file)
+            safetensors_paths = sorted({
+                os.path.join(model_path, filename)
+                for filename in index.get('weight_map', {}).values()
+            })
     else:
-        safetensors_path = model_path
-    
-    if not os.path.exists(safetensors_path):
-        raise FileNotFoundError(f"找不到 safetensors 文件: {safetensors_path}")
-    
-    print(f"加载模型权重: {safetensors_path}")
-    f = safe_open(safetensors_path, framework='pt', device='cpu')
-    
+        safetensors_paths = [model_path]
+
+    for path in safetensors_paths:
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"找不到 safetensors shard: {path}")
+
     # 提取 projector_semantic 权重
     weights = {}
-    for key in f.keys():
-        if 'tts.projector_semantic.' in key and 'norm' not in key:
-            # 简化名称: tts.projector_semantic.linear1.weight -> linear1.weight
-            new_key = key.replace('tts.projector_semantic.', '')
-            tensor = f.get_tensor(key).float().numpy()
-            weights[new_key] = tensor
-            print(f"  {key} -> {new_key}: {tensor.shape}")
+    for safetensors_path in safetensors_paths:
+        print(f"加载模型权重: {safetensors_path}")
+        with safe_open(safetensors_path, framework='pt', device='cpu') as f:
+            for key in f.keys():
+                if 'tts.projector_semantic.' in key and 'norm' not in key:
+                    # 简化名称: tts.projector_semantic.linear1.weight -> linear1.weight
+                    new_key = key.replace('tts.projector_semantic.', '')
+                    tensor = f.get_tensor(key).float().numpy()
+                    weights[new_key] = tensor
+                    print(f"  {key} -> {new_key}: {tensor.shape}")
     
     if len(weights) == 0:
         raise ValueError("未找到 projector_semantic 权重")

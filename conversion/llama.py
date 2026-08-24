@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 
 from typing import Callable, Iterable, TYPE_CHECKING
 
@@ -29,6 +30,7 @@ class LlamaModel(TextModel):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self._head_code_params: dict[str, Tensor] = {}
         # fix for SmolVLM2, missing `num_attention_heads` in config.json
         if self.hf_arch == "VLlama3ForCausalLM":
             self.hparams["num_attention_heads"] = self.hparams.get("num_attention_heads", 32)
@@ -40,6 +42,13 @@ class LlamaModel(TextModel):
             self.origin_hf_arch = hparams.get('architectures', [None])[0]
 
     def set_vocab(self):
+        if os.environ.get("OMNI_TTS_NO_VOCAB") == "1":
+            # MiniCPM-o TTS uses emb_text for text tokens; its auxiliary
+            # embed_tokens table is only a 32k placeholder. Avoid emitting
+            # the 158626-entry tokenizer list into this partial model.
+            self._set_vocab_none()
+            return
+
         if self.origin_hf_arch == "GlmasrModel":
             return self._set_vocab_glmedge()
 
@@ -90,7 +99,8 @@ class LlamaModel(TextModel):
         hparams = self.hparams
 
         if not self.is_mistral_format:
-            self.gguf_writer.add_vocab_size(hparams["vocab_size"])
+            vocab_size = 32000 if os.environ.get("OMNI_TTS_NO_VOCAB") == "1" else hparams["vocab_size"]
+            self.gguf_writer.add_vocab_size(vocab_size)
 
         if (rope_dim := hparams.get("head_dim")) is None:
             rope_dim = hparams["hidden_size"] // hparams["num_attention_heads"]
@@ -132,6 +142,55 @@ class LlamaModel(TextModel):
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         n_head = self.find_hparam(["n_heads", "num_attention_heads"])
         n_kv_head = self.find_hparam(["n_kv_heads", "num_key_value_heads"])
+
+        if name == "model.embed_tokens.weight" and os.environ.get("OMNI_TTS_PAD_VOCAB") == "1":
+            # The MiniCPM-o TTS checkpoint carries a 32k placeholder
+            # embed_tokens table, while its tokenizer has 158626 entries and
+            # emb_text contains the real 152064 text embeddings.  llama.cpp
+            # validates token_embd against the tokenizer size, so build the
+            # loader-facing table from emb_text and zero-pad the audio-token
+            # rows.  Omni's direct TTS path still reads emb_text separately.
+            emb_text_gen = self.model_tensors.get("emb_text.weight")
+            if emb_text_gen is None:
+                raise ValueError("OMNI_TTS_PAD_VOCAB requires emb_text.weight")
+            emb_text = emb_text_gen().to(torch.float32)
+            vocab_size = int(self.hparams["vocab_size"])
+            if emb_text.shape[0] > vocab_size:
+                raise ValueError(f"emb_text has {emb_text.shape[0]} rows, larger than vocab_size={vocab_size}")
+            padded = torch.zeros((vocab_size, emb_text.shape[1]), dtype=emb_text.dtype)
+            padded[: emb_text.shape[0]] = emb_text
+            yield "token_embd.weight", padded
+            return
+
+        # MiniCPM-o TTS stores these auxiliary tensors beside the standard
+        # Llama transformer weights.  They are consumed directly by the Omni
+        # runtime, so keep their names unchanged instead of routing them
+        # through the standard Llama tensor map.
+        if name.startswith((
+            "emb_code.",
+            "emb_text.",
+            "projector_semantic.",
+            "projector_spk.",
+        )):
+            yield name, data_torch
+            return
+
+        # Reconstruct the weight-normalized audio-token head. The source
+        # checkpoint stores the scale/vector pair, while the Omni runtime
+        # consumes a single head_code.0.weight tensor.
+        if name in (
+            "head_code.0.parametrizations.weight.original0",
+            "head_code.0.parametrizations.weight.original1",
+        ):
+            self._head_code_params[name] = data_torch
+            scale_name = "head_code.0.parametrizations.weight.original0"
+            vector_name = "head_code.0.parametrizations.weight.original1"
+            if scale_name in self._head_code_params and vector_name in self._head_code_params:
+                scale = self._head_code_params[scale_name].float()
+                vector = self._head_code_params[vector_name].float()
+                norm = torch.linalg.vector_norm(vector, dim=1, keepdim=True).clamp_min(1e-12)
+                yield "head_code.0.weight", scale * vector / norm
+            return
 
         if self.hf_arch == "LlamaModel":
             name = "model." + name

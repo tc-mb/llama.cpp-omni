@@ -75,6 +75,7 @@ struct vision_context_params {
     bool use_gpu;
     enum ggml_log_level verbosity;
     const char * coreml_model_path; // path to CoreML model (.mlmodelc) for ANE acceleration
+    const char * backend_device = nullptr;
 };
 
 

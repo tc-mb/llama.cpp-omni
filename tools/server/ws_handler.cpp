@@ -14,6 +14,8 @@
 #include "session.h"
 #include "protocol.h"
 #include "omni.h"
+#include "runtime-profile.h"
+#include "runtime-profile-session.h"
 #include "common.h"
 #include "llama.h"
 #include "log.h"
@@ -520,7 +522,8 @@ static void configure_turn_based_prompt(omni_context * octx,
 static omni_context * create_session_octx(common_params & params, const ParsedSessionInit & init,
                                           llama_model * model, llama_context * ctx,
                                           omni_context *& shared_octx,
-                                          const std::string & output_dir) {
+                                          const std::string & output_dir,
+                                          const omni::effective_runtime_config * runtime_config) {
     int media_type = 2; // omni
     bool duplex_mode = (init.mode == "full_duplex");
     bool use_tts = init.use_tts;
@@ -545,9 +548,16 @@ static omni_context * create_session_octx(common_params & params, const ParsedSe
         shared_octx = nullptr;
     }
 
-    omni_context * octx = omni_init(&p, media_type, use_tts, p.tts_bin_dir, /*tts_gpu_layers*/99,
-                                     /*token2wav_device*/"gpu:0", duplex_mode,
-                                     model, ctx, output_dir);
+    const auto session_options = omni::resolve_runtime_session_options(
+            runtime_config, duplex_mode, /*requested_tts_gpu_layers=*/99, /*requested_token2wav_device=*/"gpu:0",
+            params.omni_runtime_profile.token2wav_threads);
+    const int tts_gpu_layers = session_options.tts_gpu_layers;
+    const std::string token2wav_device = session_options.token2wav_device;
+    const int token2wav_threads = session_options.token2wav_threads;
+    omni_context * octx = omni_init(&p, media_type, use_tts, p.tts_bin_dir, tts_gpu_layers,
+                                     token2wav_device, duplex_mode,
+                                     model, ctx, output_dir, runtime_config,
+                                     session_options.strict_runtime_config, token2wav_threads);
     if (!octx) {
         LOG_ERR("create_session_octx: omni_init failed\n");
         return nullptr;
@@ -578,7 +588,8 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
                         llama_model * model,
                         llama_context * ctx,
                         omni_context *& shared_octx,
-                        std::mutex & octx_mutex) {
+                        std::mutex & octx_mutex,
+                        const omni::effective_runtime_config * runtime_config) {
     const std::string temp_dir = (fs::temp_directory_path() / "omni_ws").string();
     fs::create_directories(temp_dir);
     int msg_counter = 0;
@@ -646,7 +657,8 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
     omni_context * octx = nullptr;
     {
         std::lock_guard<std::mutex> lock(octx_mutex);
-        octx = create_session_octx(params_base, parsed_init, model, ctx, shared_octx, session_output_dir);
+        octx = create_session_octx(
+                params_base, parsed_init, model, ctx, shared_octx, session_output_dir, runtime_config);
     }
     if (!octx) {
         fail_fast(session_id, "omni_init_failed");
