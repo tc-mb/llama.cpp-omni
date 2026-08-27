@@ -259,6 +259,7 @@ int main(int argc, char ** argv) {
                 res_error(res, format_error_response("VoxCPM2 init failed: " + err, "server_error"));
                 return;
             }
+            rt->set_n_threads(params.cpuparams.n_threads);
             state.runtime = rt;
         }
 
@@ -511,6 +512,7 @@ int main(int argc, char ** argv) {
             llama_backend_free();
             return 1;
         }
+        rt->set_n_threads(params.cpuparams.n_threads);
         state.runtime = rt;
         LOG_INF("VoxCPM2 loaded, sample_rate=%d\n", rt->sample_rate());
     }

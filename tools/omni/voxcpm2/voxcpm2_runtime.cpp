@@ -1,6 +1,7 @@
 #include "voxcpm2_runtime.h"
 
 #include "ggml-alloc.h"
+#include "ggml-cpu.h"
 #include "gguf.h"
 #include "log.h"
 
@@ -689,6 +690,18 @@ bool VoxCPM2Runtime::init(const std::string & base_lm_path,
     reset_state();
     LOG_INF("VoxCPM2Runtime: initialized (embedding_scale=%.3f)\n", embedding_scale);
     return true;
+}
+
+void VoxCPM2Runtime::set_n_threads(int n_threads) {
+    if (n_threads < 1) {
+        return;
+    }
+    if (base_lm.ctx) {
+        llama_set_n_threads(base_lm.ctx, n_threads, n_threads);
+    }
+    if (backend && ggml_backend_is_cpu(backend)) {
+        ggml_backend_cpu_set_n_threads(backend, n_threads);
+    }
 }
 
 bool VoxCPM2Runtime::build_text_tokenizer_metadata(const std::string & base_lm_path) {

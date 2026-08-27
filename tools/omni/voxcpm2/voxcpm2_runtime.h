@@ -173,6 +173,7 @@ struct VoxCPM2Runtime {
                                                               const VoxCPM2GenerateParams &     params = {});
 
     void reset_state();
+    void set_n_threads(int n_threads);
     void free();
 
     bool initialized() const { return is_initialized; }
