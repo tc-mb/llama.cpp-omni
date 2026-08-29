@@ -1,12 +1,22 @@
 #pragma once
 
 #include <nlohmann/json.hpp>
+#include <cstddef>
 #include <string>
 #include <string_view>
 #include <vector>
 #include <cstdint>
 
 using json = nlohmann::ordered_json;
+
+constexpr size_t kWsAudioSampleRate = 16000;
+constexpr size_t kWsMaxAudioDurationSeconds = 30;
+constexpr size_t kWsMaxAudioSamples =
+    kWsAudioSampleRate * kWsMaxAudioDurationSeconds;
+constexpr size_t kWsMaxAudioBase64Chars =
+    ((kWsMaxAudioSamples * sizeof(float) + 2) / 3) * 4;
+
+bool ws_audio_base64_within_limits(std::string_view b64);
 
 // ============================================================================
 // Metrics (attached to downstream events)

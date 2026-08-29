@@ -88,6 +88,9 @@ struct omni_server_state {
 
 int main(int argc, char ** argv) {
     common_params params;
+    // Keep the standalone Omni server reachable from remote clients by
+    // default; an explicit --host still overrides this value.
+    params.hostname = "0.0.0.0";
 
     common_init();
 
@@ -115,10 +118,31 @@ int main(int argc, char ** argv) {
 
     // HTTP server setup
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
-    httplib::SSLServer svr(params.ssl_file_cert.c_str(), params.ssl_file_key.c_str());
+    const bool has_ssl_cert = !params.ssl_file_cert.empty();
+    const bool has_ssl_key  = !params.ssl_file_key.empty();
+    if (has_ssl_cert != has_ssl_key) {
+        LOG_ERR("--ssl-cert-file and --ssl-key-file must be provided together\n");
+        llama_backend_free();
+        return 1;
+    }
+
+    std::unique_ptr<httplib::Server> server;
+    if (has_ssl_cert) {
+        server = std::make_unique<httplib::SSLServer>(
+            params.ssl_file_cert.c_str(), params.ssl_file_key.c_str());
+    } else {
+        server = std::make_unique<httplib::Server>();
+    }
+    httplib::Server & svr = *server;
 #else
     httplib::Server svr;
 #endif
+
+    if (!svr.is_valid()) {
+        LOG_ERR("failed to initialize the HTTP server TLS context\n");
+        llama_backend_free();
+        return 1;
+    }
 
     omni_server_state state;
 
@@ -151,6 +175,7 @@ int main(int argc, char ** argv) {
         std::string token2wav_device = data.value("token2wav_device", "gpu:0");
         std::string output_dir = data.value("output_dir", "./tools/omni/output");
         std::string voice_audio = data.value("voice_audio", "");
+        std::string tts_ref_audio = data.value("tts_ref_audio", voice_audio);
 
         // validate key files
         auto check_file = [&](const std::string & role, const std::string & path) -> bool {
@@ -197,6 +222,22 @@ int main(int argc, char ** argv) {
         // voice clone / assistant prompt
         if (data.contains("voice_clone_prompt")) octx->omni_voice_clone_prompt = data["voice_clone_prompt"];
         if (data.contains("assistant_prompt")) octx->omni_assistant_prompt = data["assistant_prompt"];
+        octx->ref_audio_path = voice_audio;
+        if (use_tts && !tts_ref_audio.empty()) {
+            if (!omni_set_tts_reference_audio(octx, tts_ref_audio)) {
+                omni_free(octx);
+                res_error(res, format_error_response("tts_voice_prepare_failed"));
+                return;
+            }
+        }
+
+        // The HTTP contract reserves cnt=0 for session initialization. Complete
+        // that prefill here so the first client frame can start at cnt=1.
+        if (!stream_prefill(octx, voice_audio, /*img_fname=*/"", /*index=*/0)) {
+            omni_free(octx);
+            res_error(res, format_error_response("omni_init failed to initialize the streaming session"));
+            return;
+        }
 
         {
             std::lock_guard<std::mutex> lock(state.octx_mutex);
@@ -411,7 +452,12 @@ int main(int argc, char ** argv) {
     });
 
     // start server
-    svr.listen("0.0.0.0", params.port);
+    if (!svr.listen(params.hostname, params.port)) {
+        LOG_ERR("failed to bind the Omni HTTP server to %s:%d\n",
+                params.hostname.c_str(), params.port);
+        llama_backend_free();
+        return 1;
+    }
 
     // cleanup
     {

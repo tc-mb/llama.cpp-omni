@@ -143,6 +143,28 @@ cmake --build build --target llama-omni-server --target llama-omni-cli -j
 
 > CMake will auto-detect and enable Metal (macOS) or CUDA (Linux with NVIDIA GPU).
 
+### Native Token2Wav voice cloning
+
+To calculate a voice prompt from a reference WAV at runtime, enable the native
+Token2Wav frontend and provide an ONNX Runtime installation:
+
+```bash
+cmake -B build \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DOMNI_T2W_ENABLE_NATIVE_FRONTEND=ON \
+    -DOMNI_T2W_ORT_INCLUDE_DIR=/path/to/onnxruntime/include \
+    -DOMNI_T2W_ORT_LIBRARY=/path/to/onnxruntime/lib/libonnxruntime.so
+cmake --build build --target llama-omni-server llama-omni-cli -j
+```
+
+The server expects the `speech_tokenizer_v2_25hz.onnx` and `campplus.onnx`
+files from the MiniCPM-o Token2Wav assets. Set their paths with
+`OMNI_T2W_SPEECH_TOKENIZER_ONNX` and `OMNI_T2W_CAMPPLUS_ONNX`. A WebSocket
+`session.init` request can provide the reference as base64 float32 PCM in
+`voice.ref_audio`; the server uses it for both the LLM voice prompt and the
+Token2Wav voice cache. Use `voice.tts_ref_audio` only when those two reference
+audio inputs must be different.
+
 ### Usage
 
 ```bash

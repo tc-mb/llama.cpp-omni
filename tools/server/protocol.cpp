@@ -3,6 +3,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <cstring>
 
 // ============================================================================
 // ProtocolMetrics
@@ -284,8 +286,10 @@ ParsedSessionInit parse_session_init(const json & msg) {
     // voice (reference audio)
     if (p.contains("voice") && p.at("voice").is_object()) {
         const json & v = p.at("voice");
-        out.ref_audio_b64 = json_str_any(v, {"ref_audio", "ref_audio_base64"});
-        out.tts_ref_audio_b64 = json_str_any(v, {"tts_ref_audio", "tts_ref_audio_base64"});
+        out.ref_audio_b64 = strip_data_url_prefix(
+            json_str_any(v, {"ref_audio", "ref_audio_base64"}));
+        out.tts_ref_audio_b64 = strip_data_url_prefix(
+            json_str_any(v, {"tts_ref_audio", "tts_ref_audio_base64"}));
         if (out.tts_ref_audio_b64.empty() && !out.ref_audio_b64.empty()) {
             out.tts_ref_audio_b64 = out.ref_audio_b64;
         }
@@ -510,6 +514,61 @@ std::string build_prompt_from_messages(const std::vector<ParsedMessage> & msgs) 
 // ============================================================================
 // Helpers: base64 ↔ raw bytes
 // ============================================================================
+
+bool ws_audio_base64_within_limits(std::string_view b64) {
+    if (b64.empty() || b64.size() > kWsMaxAudioBase64Chars) {
+        return false;
+    }
+
+    size_t first_padding = b64.find('=');
+    const size_t data_size = first_padding == std::string_view::npos
+        ? b64.size()
+        : first_padding;
+    const size_t padding_size = b64.size() - data_size;
+
+    // Accept standard and URL-safe base64, but only allow padding at the end.
+    for (size_t i = 0; i < data_size; ++i) {
+        const char c = b64[i];
+        const bool is_alpha_numeric =
+            (c >= 'A' && c <= 'Z') ||
+            (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9');
+        if (!is_alpha_numeric && c != '+' && c != '/' && c != '-' && c != '_') {
+            return false;
+        }
+    }
+    if (padding_size > 2 ||
+        (padding_size != 0 && b64.size() % 4 != 0) ||
+        (padding_size == 0 && b64.size() % 4 == 1)) {
+        return false;
+    }
+    for (size_t i = data_size; i < b64.size(); ++i) {
+        if (b64[i] != '=') {
+            return false;
+        }
+    }
+
+    std::string raw;
+    try {
+        raw = base64::decode(std::string(b64));
+    } catch (const base64_error &) {
+        return false;
+    }
+    if (raw.empty() ||
+        raw.size() % sizeof(float) != 0 ||
+        raw.size() > kWsMaxAudioSamples * sizeof(float)) {
+        return false;
+    }
+
+    for (size_t offset = 0; offset < raw.size(); offset += sizeof(float)) {
+        float sample = 0.0f;
+        std::memcpy(&sample, raw.data() + offset, sizeof(sample));
+        if (!std::isfinite(sample)) {
+            return false;
+        }
+    }
+    return true;
+}
 
 std::vector<uint8_t> b64_decode(const std::string & b64) {
     std::string raw = base64::decode(b64);

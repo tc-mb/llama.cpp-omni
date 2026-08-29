@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include "ggml.h"
+#include "token2wav-frontend.h"
 #include <functional>
 #include <memory>
 #include <string>
@@ -2276,6 +2277,26 @@ struct Token2WavSession {
                                  int                 n_timesteps         = 10,
                                  float               temperature         = 1.0f,
                                  const std::string & coreml_model_path  = "");
+
+    // Replace the voice prompt without reloading Token2Wav model weights.
+    // Stage one calls this before the TTS worker starts for a session.
+    bool set_prompt_bundle(const std::string & prompt_bundle_dir,
+                           int                 n_timesteps = 10,
+                           float               temperature = 1.0f);
+
+    // Prepare a PromptBundle from a reference WAV with the native frontend,
+    // then initialize the existing Token2Wav models with the resulting cache.
+    bool set_prompt_wav(const std::string & ref_wav_path,
+                        const std::string & speech_tokenizer_onnx,
+                        const std::string & campplus_onnx,
+                        int                 frontend_threads = 1,
+                        int                 n_timesteps       = 10,
+                        float               temperature       = 1.0f);
+
+    // Restore the static voice cache without reloading model weights.
+    bool reset_to_prompt_cache_gguf(const std::string & prompt_cache_gguf_path,
+                                    int                 n_timesteps = 10,
+                                    float               temperature = 1.0f);
 
     bool feed_tokens(const int32_t * tokens, int64_t n_tokens, bool is_final, std::vector<float> & wave_bt_out);
 

@@ -330,6 +330,8 @@ struct omni_context {
     int use_tts = false;
     std::string tts_bin_dir = "";
     std::string ref_audio_path = "";  // 参考音频路径（用于音色克隆）
+    std::string tts_ref_audio_path = "";  // Token2Wav reference audio path
+    bool tts_ref_audio_owned = false;     // server must remove this temporary file
     
     // 🔧 [高清/高刷模式] 
     // high_image: 高清模式，max_slice_nums 设置为 2，vision 可以看到更多细节
@@ -423,6 +425,8 @@ struct omni_context {
     std::unique_ptr<omni::flow::Token2WavSession> token2wav_session;
     bool token2wav_initialized = false;
     std::string token2wav_model_dir;  // Directory containing token2wav GGUF models
+    std::string token2wav_default_prompt_bundle_dir;
+    std::string token2wav_device = "gpu:0";
     
     // 🔧 [Python Token2Wav] 使用 Python stepaudio2 库实现的 Token2Wav
     // 设置为 true 时使用 Python 实现（精度更高），false 时使用 C++ 实现
@@ -437,6 +441,7 @@ struct omni_context {
     FILE* python_t2w_stdout = nullptr;  // 读取响应
     pid_t python_t2w_pid = -1;          // 进程 ID
     bool python_t2w_initialized = false;
+    bool python_t2w_model_initialized = false;
     std::string python_t2w_gpu_id;      // GPU ID (如 "0", "1")
     
     // 🔧 Python T2W 独立 GPU 配置
@@ -444,6 +449,7 @@ struct omni_context {
     // 单卡 24GB 放不下，需要使用独立 GPU
     // 设置为空字符串表示使用与 C++ 相同的 GPU
     std::string python_t2w_dedicated_gpu = "";  // 独立 GPU ID，如 "1"
+    std::mutex tts_voice_mtx;
     
     // Token2Wav sliding window buffer (跨 chunk 保持状态)
     // Python 逻辑: buffer 初始填充 3 个静音 token (4218)
@@ -491,6 +497,15 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
                                 const std::string & base_output_dir = "./tools/omni/output");
 
 void omni_free(struct omni_context * ctx_omni);
+
+// Prepare a session-level Token2Wav voice from a reference WAV. Stage one
+// uses the Python StepAudio2 frontend to create a PromptBundle, then lets
+// C++ Token2Wav build and own the streaming cache.
+bool omni_set_tts_reference_audio(struct omni_context * ctx_omni,
+                                  const std::string & tts_ref_audio_path);
+bool omni_tts_native_frontend_failure_is_fatal(bool native_frontend_configured);
+// Restore the model-directory default Token2Wav voice for a reused session.
+bool omni_reset_tts_reference_audio(struct omni_context * ctx_omni);
 // Stop/join inference threads and clear queues so the same context can serve a
 // new session, without tearing down the loaded model (unlike omni_free).
 void omni_prepare_for_reuse(struct omni_context * ctx_omni);
