@@ -10277,10 +10277,8 @@ static bool duplex_decode(omni_context * ctx_omni,
 bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::string img_fname, int index, int max_slice_nums, std::string text) {
 
     // 🔧 [Duplex Pipeline Stage 1] 路由：
-    //   duplex_mode && async && index > 0 && system prompt 已初始化 时，走新 duplex 路径。
-    //   index == 0（system prompt 初始化、voice cloning ref_audio prefill、线程启动）
-    //   仍沿用下方原逻辑；线程启动点会在原逻辑末尾调用 duplex_start_threads。
-    if (ctx_omni->duplex_mode && ctx_omni->async && index > 0
+    //   duplex_mode && async && system prompt 已初始化 时，走新 duplex 路径。
+    if (ctx_omni->duplex_mode && ctx_omni->async
         && ctx_omni->system_prompt_initialized && ctx_omni->duplex != nullptr) {
         return duplex_prefill(ctx_omni, aud_fname, img_fname, index, max_slice_nums);
     }
@@ -10614,13 +10612,17 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
             // 🔧 [整合] <|im_start|>user\n 已在 sys prompt 末尾添加，后续轮次在 stream_decode 结束时添加
             // 不再需要在这里设置 is_round_start 标记
             
-            std::unique_lock<std::mutex> lock(ctx_omni->llm_thread_info->mtx);
-            ctx_omni->llm_thread_info->cv.wait(lock, [&] { return ctx_omni->llm_thread_info->queue.size() < ctx_omni->llm_thread_info->MAX_QUEUE_SIZE; });
-            ctx_omni->llm_thread_info->queue.push(omni_embeds);
+            if (ctx_omni->llm_thread_info != nullptr) {
+                std::unique_lock<std::mutex> lock(ctx_omni->llm_thread_info->mtx);
+                ctx_omni->llm_thread_info->cv.wait(lock, [&] { return ctx_omni->llm_thread_info->queue.size() < ctx_omni->llm_thread_info->MAX_QUEUE_SIZE; });
+                ctx_omni->llm_thread_info->queue.push(omni_embeds);
 
-            //notify the llm
-            lock.unlock();
-            ctx_omni->llm_thread_info->cv.notify_all();
+                //notify the llm
+                lock.unlock();
+                ctx_omni->llm_thread_info->cv.notify_all();
+            } else {
+                delete omni_embeds;
+            }
         }
     }
     // 🔧 [诊断] 打印 stream_prefill 结束时的状态
