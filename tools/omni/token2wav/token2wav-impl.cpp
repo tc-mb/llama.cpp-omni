@@ -34,6 +34,7 @@ typedef void (*ggml_backend_cuda_set_disable_graph_t)(ggml_backend_t backend, bo
 #include <cstdint>
 #include <cstdlib>
 #include <utility>
+#include <nlohmann/json.hpp>
 #include "ggml-alloc.h"
 #include <algorithm>
 #include <random>
@@ -8808,6 +8809,46 @@ bool Token2Mel::load_prompt_bundle_dir(const std::string & dir, PromptBundle & o
                      "Token2Mel.load_prompt_bundle_dir: prompt bundle shape mismatch: "
                      "T_token=%lld T_mel=%lld expect_T_mel=%lld\n",
                      (long long) out.T_prompt_token, (long long) out.T_prompt_mel, (long long) expect_T_mel);
+        return false;
+    }
+
+    std::ifstream manifest_file(dir + "/manifest.json");
+    if (!manifest_file.good()) {
+        LOG_ERROR("Token2Mel.load_prompt_bundle_dir: missing manifest.json in %s\n", dir.c_str());
+        return false;
+    }
+
+    try {
+        const nlohmann::json manifest = nlohmann::json::parse(manifest_file);
+        if (manifest.value("schema_version", -1) != 1 ||
+            manifest.value("sample_rate", -1) != 16000 ||
+            manifest.value("channels", -1) != 1 ||
+            manifest.value("mel_channels", -1) != kMelChannels ||
+            manifest.value("speaker_dimensions", -1) != kSpkDim ||
+            manifest.value("prompt_mel_layout", "") != "BTC") {
+            LOG_ERROR("Token2Mel.load_prompt_bundle_dir: unsupported manifest contract in %s\n", dir.c_str());
+            return false;
+        }
+
+        if (manifest.value("prompt_token_count", -1LL) != out.T_prompt_token ||
+            manifest.value("prompt_mel_frames", -1LL) != out.T_prompt_mel) {
+            LOG_ERROR("Token2Mel.load_prompt_bundle_dir: manifest shape does not match binary data in %s\n",
+                      dir.c_str());
+            return false;
+        }
+
+        const auto dtype = manifest.at("dtype");
+        if (!dtype.is_object() ||
+            dtype.value("prompt_tokens", "") != "int32" ||
+            dtype.value("prompt_mel", "") != "float32" ||
+            dtype.value("speaker_embedding", "") != "float32") {
+            LOG_ERROR("Token2Mel.load_prompt_bundle_dir: unsupported manifest dtype contract in %s\n",
+                      dir.c_str());
+            return false;
+        }
+    } catch (const std::exception & error) {
+        LOG_ERROR("Token2Mel.load_prompt_bundle_dir: invalid manifest.json in %s: %s\n",
+                  dir.c_str(), error.what());
         return false;
     }
 
