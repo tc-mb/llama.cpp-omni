@@ -221,6 +221,12 @@ struct vision_ctx {
     bool debug_graph = false;
     std::vector<ggml_tensor *> debug_print_tensors;
 
+    // Positional embeddings depend only on the patch grid and embedding width.
+    std::vector<float> pos_embed_cache;
+    int pos_embed_cache_w = 0;
+    int pos_embed_cache_h = 0;
+    int pos_embed_cache_dim = 0;
+
     vision_ctx(vision_context_params & ctx_params) {
         debug_graph = std::getenv("Omni_DEBUG_GRAPH") != nullptr;
         backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
@@ -1713,54 +1719,68 @@ struct image_manipulation {
         dst.ny = target_height;
         dst.buf.resize(3 * target_width * target_height);
 
-        float Cc;
-        float C[5] = {};
-        float d0, d2, d3, a0, a1, a2, a3;
-        int i, j, k, jj;
-        int x, y;
-        float dx, dy;
-        float tx, ty;
+        struct AxisSample {
+            int index[4];
+            float fraction;
+        };
+        auto make_sample = [](float coordinate, int limit) {
+            AxisSample sample{};
+            const int base = static_cast<int>(coordinate);
+            sample.index[0] = clip(base - 1, 0, limit - 1);
+            sample.index[1] = clip(base,     0, limit - 1);
+            sample.index[2] = clip(base + 1, 0, limit - 1);
+            sample.index[3] = clip(base + 2, 0, limit - 1);
+            sample.fraction = coordinate - base;
+            return sample;
+        };
 
-        tx = (float)nx / (float)target_width;
-        ty = (float)ny / (float)target_height;
+        const float tx = static_cast<float>(nx) / static_cast<float>(target_width);
+        const float ty = static_cast<float>(ny) / static_cast<float>(target_height);
+        std::vector<AxisSample> x_samples(static_cast<size_t>(target_width));
+        std::vector<AxisSample> y_samples(static_cast<size_t>(target_height));
+        for (int j = 0; j < target_width; ++j) {
+            x_samples[static_cast<size_t>(j)] = make_sample(tx * j, nx);
+        }
+        for (int i = 0; i < target_height; ++i) {
+            y_samples[static_cast<size_t>(i)] = make_sample(ty * i, ny);
+        }
 
         // Bicubic interpolation; adapted from ViT.cpp, inspired from :
         //    -> https://github.com/yglukhov/bicubic-interpolation-image-processing/blob/master/libimage.c#L36
         //    -> https://en.wikipedia.org/wiki/Bicubic_interpolation
 
-        for (i = 0; i < target_height; i++) {
-            for (j = 0; j < target_width; j++) {
-                x = (int)(tx * j);
-                y = (int)(ty * i);
-
-                dx = tx * j - x;
-                dy = ty * i - y;
-
-                for (k = 0; k < 3; k++) {
-                    for (jj = 0; jj <= 3; jj++) {
-                        d0 = img.buf[(clip(y - 1 + jj, 0, ny - 1) * nx + clip(x - 1, 0, nx - 1)) * 3 + k] - img.buf[(clip(y - 1 + jj, 0, ny - 1) * nx + clip(x, 0, nx - 1)) * 3 + k];
-                        d2 = img.buf[(clip(y - 1 + jj, 0, ny - 1) * nx + clip(x + 1, 0, nx - 1)) * 3 + k] - img.buf[(clip(y - 1 + jj, 0, ny - 1) * nx + clip(x, 0, nx - 1)) * 3 + k];
-                        d3 = img.buf[(clip(y - 1 + jj, 0, ny - 1) * nx + clip(x + 2, 0, nx - 1)) * 3 + k] - img.buf[(clip(y - 1 + jj, 0, ny - 1) * nx + clip(x, 0, nx - 1)) * 3 + k];
-                        a0 = img.buf[(clip(y - 1 + jj, 0, ny - 1) * nx + clip(x, 0, nx - 1)) * 3 + k];
-
-                        a1 = -1.0 / 3 * d0 + d2 - 1.0 / 6 * d3;
-                        a2 =  1.0 / 2 * d0 +      1.0 / 2 * d2;
-                        a3 = -1.0 / 6 * d0 -      1.0 / 2 * d2 + 1.0 / 6 * d3;
-
-                        C[jj] = a0 + a1 * dx + a2 * dx * dx + a3 * dx * dx * dx;
-
-                        d0 = C[0] - C[1];
-                        d2 = C[2] - C[1];
-                        d3 = C[3] - C[1];
-                        a0 = C[1];
-                        a1 = -1.0 / 3 * d0 + d2 - 1.0 / 6 * d3;
-                        a2 =  1.0 / 2 * d0 +      1.0 / 2 * d2;
-                        a3 = -1.0 / 6 * d0 -      1.0 / 2 * d2 + 1.0 / 6 * d3;
-                        Cc = a0 + a1 * dy + a2 * dy * dy + a3 * dy * dy * dy;
-
-                        const uint8_t Cc2 = std::min(std::max(std::round(Cc), 0.0f), 255.0f);
-                        dst.buf[(i * target_width + j) * 3 + k] = float(Cc2);
+        for (int i = 0; i < target_height; ++i) {
+            const AxisSample & ys = y_samples[static_cast<size_t>(i)];
+            for (int j = 0; j < target_width; ++j) {
+                const AxisSample & xs = x_samples[static_cast<size_t>(j)];
+                const size_t dst_base = (static_cast<size_t>(i) * target_width + j) * 3;
+                for (int c = 0; c < 3; ++c) {
+                    float rows[4] = {};
+                    for (int r = 0; r < 4; ++r) {
+                        const size_t row_base = static_cast<size_t>(ys.index[r]) * nx * 3;
+                        const float d0 = img.buf[row_base + static_cast<size_t>(xs.index[0]) * 3 + c]
+                                       - img.buf[row_base + static_cast<size_t>(xs.index[1]) * 3 + c];
+                        const float d2 = img.buf[row_base + static_cast<size_t>(xs.index[2]) * 3 + c]
+                                       - img.buf[row_base + static_cast<size_t>(xs.index[1]) * 3 + c];
+                        const float d3 = img.buf[row_base + static_cast<size_t>(xs.index[3]) * 3 + c]
+                                       - img.buf[row_base + static_cast<size_t>(xs.index[1]) * 3 + c];
+                        const float a0 = img.buf[row_base + static_cast<size_t>(xs.index[1]) * 3 + c];
+                        const float a1 = -1.0 / 3 * d0 + d2 - 1.0 / 6 * d3;
+                        const float a2 =  1.0 / 2 * d0 + 1.0 / 2 * d2;
+                        const float a3 = -1.0 / 6 * d0 - 1.0 / 2 * d2 + 1.0 / 6 * d3;
+                        const float dx = xs.fraction;
+                        rows[r] = a0 + a1 * dx + a2 * dx * dx + a3 * dx * dx * dx;
                     }
+                    const float d0 = rows[0] - rows[1];
+                    const float d2 = rows[2] - rows[1];
+                    const float d3 = rows[3] - rows[1];
+                    const float a0 = rows[1];
+                    const float a1 = -1.0 / 3 * d0 + d2 - 1.0 / 6 * d3;
+                    const float a2 =  1.0 / 2 * d0 + 1.0 / 2 * d2;
+                    const float a3 = -1.0 / 6 * d0 - 1.0 / 2 * d2 + 1.0 / 6 * d3;
+                    const float dy = ys.fraction;
+                    const float value = a0 + a1 * dy + a2 * dy * dy + a3 * dy * dy * dy;
+                    dst.buf[dst_base + c] = static_cast<uint8_t>(std::min(std::max(std::round(value), 0.0f), 255.0f));
                 }
             }
         }
@@ -2404,19 +2424,28 @@ bool vision_image_batch_encode(vision_ctx * ctx, const int n_threads, const visi
                 }
                 set_input_i32("positions", positions);
 
-                int embed_dim = vision_n_mmproj_embd(ctx);
+                const int embed_dim = vision_n_mmproj_embd(ctx);
 
-                auto pos_embed_t = get_2d_sincos_pos_embed(embed_dim, std::make_pair(pos_w, pos_h));
+                const bool pos_cache_hit = ctx->pos_embed_cache_w == pos_w
+                    && ctx->pos_embed_cache_h == pos_h
+                    && ctx->pos_embed_cache_dim == embed_dim
+                    && ctx->pos_embed_cache.size() == static_cast<size_t>(embed_dim) * pos_w * pos_h;
+                if (!pos_cache_hit) {
+                    const auto pos_embed_t = get_2d_sincos_pos_embed(embed_dim, std::make_pair(pos_w, pos_h));
 
-                // pos_embed is [embed_dim, n_pos, 1] — same for all batch elements (broadcast)
-                std::vector<float> pos_embed(embed_dim * pos_w * pos_h);
-                for(int i = 0; i < pos_w * pos_h; ++i){
-                    for(int j = 0; j < embed_dim; ++j){
-                        pos_embed[i * embed_dim + j] = pos_embed_t[i][j];
+                    // pos_embed is [embed_dim, n_pos, 1] — same for all batch elements (broadcast)
+                    ctx->pos_embed_cache.resize(static_cast<size_t>(embed_dim) * pos_w * pos_h);
+                    for (int i = 0; i < pos_w * pos_h; ++i) {
+                        for (int j = 0; j < embed_dim; ++j) {
+                            ctx->pos_embed_cache[static_cast<size_t>(i) * embed_dim + j] = pos_embed_t[i][j];
+                        }
                     }
+                    ctx->pos_embed_cache_w = pos_w;
+                    ctx->pos_embed_cache_h = pos_h;
+                    ctx->pos_embed_cache_dim = embed_dim;
                 }
 
-                set_input_f32("pos_embed", pos_embed);
+                set_input_f32("pos_embed", ctx->pos_embed_cache);
             } break;
         case MiniCPM_o_4_6:
             {
