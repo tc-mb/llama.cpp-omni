@@ -3,6 +3,7 @@
 #include "audition.h"
 #include "omni.h"
 #include "token2wav/token2wav-impl.h"
+#include "token2wav/token2wav-frontend.h"
 
 #include "llama.h"
 #include "common/common.h"
@@ -37,6 +38,7 @@
 #include <future>
 #include <unordered_map>
 #include <fstream>
+#include <filesystem>
 #include <iomanip>
 #include <chrono>
 #include <cmath>
@@ -4821,6 +4823,12 @@ void omni_free(struct omni_context * ctx_omni) {
             projector_free(ctx_omni->projector);
         }
     }
+
+    if (ctx_omni->tts_ref_audio_owned && !ctx_omni->tts_ref_audio_path.empty()) {
+        std::remove(ctx_omni->tts_ref_audio_path.c_str());
+        ctx_omni->tts_ref_audio_path.clear();
+        ctx_omni->tts_ref_audio_owned = false;
+    }
     
     // 🔧 [单双工适配] 只有在拥有模型时才释放 LLM model 和 context
     // 如果是外部传入的模型（模型复用），则不释放
@@ -8577,6 +8585,89 @@ static bool reset_python_t2w_cache(struct omni_context * ctx_omni) {
     }
     return response.find("\"status\":\"ok\"") != std::string::npos ||
            response.find("\"status\": \"ok\"") != std::string::npos;
+}
+
+bool omni_set_tts_reference_audio(struct omni_context * ctx_omni,
+                                  const std::string & tts_ref_audio_path) {
+    if (!ctx_omni) {
+        LOG_ERR("omni_set_tts_reference_audio: context is null\n");
+        return false;
+    }
+    if (tts_ref_audio_path.empty() || !ctx_omni->use_tts) {
+        return true;
+    }
+
+    std::error_code file_error;
+    const std::filesystem::file_status file_status =
+        std::filesystem::status(tts_ref_audio_path, file_error);
+    const uintmax_t file_size =
+        file_error || !std::filesystem::is_regular_file(file_status)
+            ? 0
+            : std::filesystem::file_size(tts_ref_audio_path, file_error);
+    if (file_error || !std::filesystem::is_regular_file(file_status) ||
+        file_size < 12 ||
+        file_size > omni::flow::Token2WavFrontend::kMaxReferenceWavBytes) {
+        LOG_ERR("omni_set_tts_reference_audio: reference audio is not a bounded regular WAV: %s\n",
+                tts_ref_audio_path.c_str());
+        return false;
+    }
+
+    std::lock_guard<std::mutex> voice_lock(ctx_omni->tts_voice_mtx);
+    if (!ctx_omni->token2wav_initialized || !ctx_omni->token2wav_session) {
+        LOG_ERR("omni_set_tts_reference_audio: native Token2Wav is not initialized\n");
+        return false;
+    }
+
+    const std::string speech_tokenizer_gguf =
+        ctx_omni->token2wav_model_dir + "/speech_tokenizer_v2_25hz.gguf";
+    const std::string campplus_gguf =
+        ctx_omni->token2wav_model_dir + "/campplus.gguf";
+    if (!ctx_omni->token2wav_session->set_prompt_wav(
+            tts_ref_audio_path,
+            speech_tokenizer_gguf,
+            campplus_gguf,
+            /*frontend_threads=*/1,
+            /*n_timesteps=*/5,
+            /*temperature=*/1.0f)) {
+        LOG_ERR("omni_set_tts_reference_audio: native GGUF frontend failed\n");
+        return false;
+    }
+
+    ctx_omni->tts_ref_audio_path = tts_ref_audio_path;
+    ctx_omni->token2wav_buffer = {4218, 4218, 4218};
+    return true;
+}
+
+bool omni_reset_tts_reference_audio(struct omni_context * ctx_omni) {
+    if (!ctx_omni) {
+        LOG_ERR("omni_reset_tts_reference_audio: context is null\n");
+        return false;
+    }
+    if (!ctx_omni->use_tts) {
+        return true;
+    }
+
+    std::lock_guard<std::mutex> voice_lock(ctx_omni->tts_voice_mtx);
+    if (!ctx_omni->token2wav_initialized || !ctx_omni->token2wav_session) {
+        LOG_ERR("omni_reset_tts_reference_audio: native Token2Wav is not initialized\n");
+        return false;
+    }
+
+    const std::string prompt_cache_gguf =
+        ctx_omni->token2wav_model_dir + "/prompt_cache.gguf";
+    if (!ctx_omni->token2wav_session->reset_to_prompt_cache_gguf(
+            prompt_cache_gguf, /*n_timesteps=*/5, /*temperature=*/1.0f)) {
+        LOG_ERR("omni_reset_tts_reference_audio: failed to restore default voice\n");
+        return false;
+    }
+
+    if (ctx_omni->tts_ref_audio_owned && !ctx_omni->tts_ref_audio_path.empty()) {
+        std::remove(ctx_omni->tts_ref_audio_path.c_str());
+    }
+    ctx_omni->tts_ref_audio_path.clear();
+    ctx_omni->tts_ref_audio_owned = false;
+    ctx_omni->token2wav_buffer = {4218, 4218, 4218};
+    return true;
 }
 
 // ======================= Token2Wav 线程函数 =======================

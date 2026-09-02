@@ -330,6 +330,8 @@ struct omni_context {
     int use_tts = false;
     std::string tts_bin_dir = "";
     std::string ref_audio_path = "";  // 参考音频路径（用于音色克隆）
+    std::string tts_ref_audio_path = "";  // Native Token2Wav reference WAV
+    bool tts_ref_audio_owned = false;     // Server owns and removes temporary WAV
     
     // 🔧 [高清/高刷模式] 
     // high_image: 高清模式，max_slice_nums 设置为 2，vision 可以看到更多细节
@@ -423,6 +425,7 @@ struct omni_context {
     std::unique_ptr<omni::flow::Token2WavSession> token2wav_session;
     bool token2wav_initialized = false;
     std::string token2wav_model_dir;  // Directory containing token2wav GGUF models
+    std::mutex tts_voice_mtx;
     
     // 🔧 [Python Token2Wav] 使用 Python stepaudio2 库实现的 Token2Wav
     // 设置为 true 时使用 Python 实现（精度更高），false 时使用 C++ 实现
@@ -491,6 +494,12 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
                                 const std::string & base_output_dir = "./tools/omni/output");
 
 void omni_free(struct omni_context * ctx_omni);
+// Install a session-level voice prompt from a reference WAV using the native
+// GGUF speech tokenizer and CAM++ frontend models.
+bool omni_set_tts_reference_audio(struct omni_context * ctx_omni,
+                                  const std::string & tts_ref_audio_path);
+// Restore the model-directory default Token2Wav prompt cache for context reuse.
+bool omni_reset_tts_reference_audio(struct omni_context * ctx_omni);
 // Stop/join inference threads and clear queues so the same context can serve a
 // new session, without tearing down the loaded model (unlike omni_free).
 void omni_prepare_for_reuse(struct omni_context * ctx_omni);
