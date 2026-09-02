@@ -1,4 +1,5 @@
 #include "token2wav.h"
+#include "token2wav-frontend.h"
 #include "token2wav-profile.h"
 
 #include <chrono>
@@ -60,6 +61,56 @@ bool Token2WavSession::init_from_prompt_bundle(const std::string & encoder_gguf,
     if (!t2w.start_stream_with_prompt(pb, n_timesteps, temperature)) {
         return false;
     }
+    return true;
+}
+
+bool Token2WavSession::set_prompt_wav(const std::string & ref_wav_path,
+                                      const std::string & speech_tokenizer_gguf,
+                                      const std::string & campplus_gguf,
+                                      int                 frontend_threads,
+                                      int                 n_timesteps,
+                                      float               temperature) {
+    FrontendPromptBundle native_prompt;
+    std::string error;
+    if (!Token2WavFrontend::prepare_prompt_bundle(ref_wav_path, speech_tokenizer_gguf, campplus_gguf,
+                                                  native_prompt, &error, frontend_threads)) {
+        std::fprintf(stderr,
+                     "Token2WavSession.set_prompt_wav: native frontend failed for %s: %s\n",
+                     ref_wav_path.c_str(), error.empty() ? "unknown error" : error.c_str());
+        return false;
+    }
+
+    Token2Mel::PromptBundle prompt;
+    prompt.prompt_tokens_bt = std::move(native_prompt.prompt_tokens_bt);
+    prompt.prompt_mel_btc   = std::move(native_prompt.prompt_mel_btc);
+    prompt.spk_bc            = std::move(native_prompt.spk_bc);
+    prompt.B                 = native_prompt.B;
+    prompt.T_prompt_token   = native_prompt.T_prompt_token;
+    prompt.T_prompt_mel     = native_prompt.T_prompt_mel;
+
+    if (!t2w.start_stream_with_prompt(prompt, n_timesteps, temperature)) {
+        std::fprintf(stderr,
+                     "Token2WavSession.set_prompt_wav: setup_cache failed for %s\n",
+                     ref_wav_path.c_str());
+        return false;
+    }
+
+    pending_.clear();
+    wave_tmp_.clear();
+    return true;
+}
+
+bool Token2WavSession::reset_to_prompt_cache_gguf(const std::string & prompt_cache_gguf_path,
+                                                  int                 n_timesteps,
+                                                  float               temperature) {
+    if (!t2w.start_stream_with_prompt_cache_gguf(prompt_cache_gguf_path, n_timesteps, temperature)) {
+        std::fprintf(stderr, "Token2WavSession.reset_to_prompt_cache_gguf: failed to load cache: %s\n",
+                     prompt_cache_gguf_path.c_str());
+        return false;
+    }
+
+    pending_.clear();
+    wave_tmp_.clear();
     return true;
 }
 

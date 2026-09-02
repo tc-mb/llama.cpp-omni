@@ -2277,6 +2277,20 @@ struct Token2WavSession {
                                  float               temperature         = 1.0f,
                                  const std::string & coreml_model_path  = "");
 
+    // Prepare a PromptBundle from a reference WAV with the native GGUF
+    // frontend, then install it into the existing Token2Wav stream.
+    bool set_prompt_wav(const std::string & ref_wav_path,
+                        const std::string & speech_tokenizer_gguf,
+                        const std::string & campplus_gguf,
+                        int                 frontend_threads = 1,
+                        int                 n_timesteps       = 10,
+                        float               temperature       = 1.0f);
+
+    // Restore the static voice cache without reloading model weights.
+    bool reset_to_prompt_cache_gguf(const std::string & prompt_cache_gguf_path,
+                                    int                 n_timesteps = 10,
+                                    float               temperature = 1.0f);
+
     bool feed_tokens(const int32_t * tokens, int64_t n_tokens, bool is_final, std::vector<float> & wave_bt_out);
 
     bool feed_tokens(const std::vector<int32_t> & tokens, bool is_final, std::vector<float> & wave_bt_out) {
