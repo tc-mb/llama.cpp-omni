@@ -250,4 +250,11 @@ if (LLAMA_BUILD_TESTS)
         SKIP_RETURN_CODE 77
         LABELS "main;omni;tts"
     )
+
+    set(TARGET_TTS_QUALITY_CONTRACT_TEST test-tts-quality-contract)
+    add_executable(${TARGET_TTS_QUALITY_CONTRACT_TEST} test/test-tts-quality-contract.cpp)
+    target_link_libraries(${TARGET_TTS_QUALITY_CONTRACT_TEST} PRIVATE omni)
+    target_compile_features(${TARGET_TTS_QUALITY_CONTRACT_TEST} PRIVATE cxx_std_17)
+    add_test(NAME ${TARGET_TTS_QUALITY_CONTRACT_TEST} COMMAND ${TARGET_TTS_QUALITY_CONTRACT_TEST})
+    set_tests_properties(${TARGET_TTS_QUALITY_CONTRACT_TEST} PROPERTIES LABELS "main;omni;tts")
 endif()

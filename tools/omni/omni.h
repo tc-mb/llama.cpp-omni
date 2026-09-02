@@ -2,6 +2,8 @@
 #include "llama.h"
 #include "tts-condition-graph.h"
 
+#include <algorithm>
+#include <cstdint>
 #include <thread>
 #include <memory>
 #include <vector>
@@ -147,6 +149,49 @@ struct projector_model {
     ggml_backend_buffer_type_t buf_type = nullptr;
     bool initialized = false;
 };
+
+// The GGUF converter writes head_code as contiguous [audio_token, hidden]
+// rows. GGUF metadata may expose the reversed dimensions, but the payload
+// remains row-major and must be copied without another transpose.
+inline bool omni_copy_head_code_row_major(const float * source,
+                                          int64_t       dim0,
+                                          int64_t       dim1,
+                                          int           hidden_size,
+                                          int           num_audio_tokens,
+                                          float *       destination) {
+    if (source == nullptr || destination == nullptr ||
+        hidden_size <= 0 || num_audio_tokens <= 0) {
+        return false;
+    }
+    if (!((dim0 == hidden_size && dim1 == num_audio_tokens) ||
+          (dim0 == num_audio_tokens && dim1 == hidden_size))) {
+        return false;
+    }
+    std::copy(source,
+              source + static_cast<size_t>(hidden_size) * num_audio_tokens,
+              destination);
+    return true;
+}
+
+struct OmniTextChunkPlan {
+    int prefix_tokens = 0;
+    int condition_tokens = 0;
+    int generated_tokens = 0;
+};
+
+inline OmniTextChunkPlan omni_text_chunk_plan(int chunk_size, bool has_pending_token) {
+    const int prefix_tokens = has_pending_token ? 1 : 0;
+    const int condition_tokens = std::max(0, chunk_size - prefix_tokens);
+    return {
+        prefix_tokens,
+        condition_tokens,
+        condition_tokens + 1,
+    };
+}
+
+inline int omni_duplex_tts_output_token_count_for_budget(int max_new_tokens) {
+    return max_new_tokens > 0 ? max_new_tokens - 1 : 0;
+}
 
 // ============================================================================
 // Audio output callback type
@@ -392,7 +437,7 @@ struct omni_context {
     
     // head_code: Linear layer (hidden_size=768 -> num_audio_tokens=6562)
     // Note: num_vq=1, so we only need one head_code layer
-    float * head_code_weight = nullptr;  // (768, 6562) - stored as (hidden_size, num_audio_tokens)
+    float * head_code_weight = nullptr;  // (6562, 768) - one row per audio token
     int head_code_hidden_size = 0;  // 768
     int head_code_num_audio_tokens = 0;  // 6562
     
@@ -613,7 +658,7 @@ bool prefill_with_emb_tts(struct omni_context* ctx_omni, common_params* params, 
 // - chunk_generated_tokens: 当前 chunk 内已生成的 tokens（用于 repetition penalty，与 Python generate_chunk 对齐）
 // - token_index_in_chunk: 当前 chunk 内的 token 索引（用于判断是否跳过 sampling processors）
 // - force_no_eos: 是否强制阻止 EOS token 被采样（用于 min_new_tokens 逻辑，与 Python generate_chunk 对齐）
-llama_token sample_tts_token(struct common_sampler * smpl, struct omni_context * ctx_omni, common_params* params, int * n_past_tts, const std::vector<llama_token> * all_generated_tokens = nullptr, const std::vector<llama_token> * chunk_generated_tokens = nullptr, int token_index_in_chunk = 0, bool force_no_eos = false);
+llama_token sample_tts_token(struct common_sampler * smpl, struct omni_context * ctx_omni, common_params* params, int * n_past_tts, const std::vector<llama_token> * all_generated_tokens = nullptr, const std::vector<llama_token> * chunk_generated_tokens = nullptr, int token_index_in_chunk = 0, bool force_no_eos = false, bool is_final_text_chunk = false);
 
 // Projector 函数声明（精度验证版本）
 bool projector_init(projector_model & model, const std::string & fname, bool use_cuda);
