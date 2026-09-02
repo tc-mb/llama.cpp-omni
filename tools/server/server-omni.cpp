@@ -151,6 +151,7 @@ int main(int argc, char ** argv) {
         std::string token2wav_device = data.value("token2wav_device", "gpu:0");
         std::string output_dir = data.value("output_dir", "./tools/omni/output");
         std::string voice_audio = data.value("voice_audio", "");
+        std::string tts_ref_audio = data.value("tts_ref_audio", voice_audio);
 
         // validate key files
         auto check_file = [&](const std::string & role, const std::string & path) -> bool {
@@ -197,6 +198,14 @@ int main(int argc, char ** argv) {
         // voice clone / assistant prompt
         if (data.contains("voice_clone_prompt")) octx->omni_voice_clone_prompt = data["voice_clone_prompt"];
         if (data.contains("assistant_prompt")) octx->omni_assistant_prompt = data["assistant_prompt"];
+        octx->ref_audio_path = voice_audio;
+        if (use_tts && !tts_ref_audio.empty()) {
+            if (!omni_set_tts_reference_audio(octx, tts_ref_audio)) {
+                omni_free(octx);
+                res_error(res, format_error_response("tts_voice_prepare_failed"));
+                return;
+            }
+        }
 
         {
             std::lock_guard<std::mutex> lock(state.octx_mutex);

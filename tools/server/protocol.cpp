@@ -284,8 +284,10 @@ ParsedSessionInit parse_session_init(const json & msg) {
     // voice (reference audio)
     if (p.contains("voice") && p.at("voice").is_object()) {
         const json & v = p.at("voice");
-        out.ref_audio_b64 = json_str_any(v, {"ref_audio", "ref_audio_base64"});
-        out.tts_ref_audio_b64 = json_str_any(v, {"tts_ref_audio", "tts_ref_audio_base64"});
+        out.ref_audio_b64 = strip_data_url_prefix(
+            json_str_any(v, {"ref_audio", "ref_audio_base64"}));
+        out.tts_ref_audio_b64 = strip_data_url_prefix(
+            json_str_any(v, {"tts_ref_audio", "tts_ref_audio_base64"}));
         if (out.tts_ref_audio_b64.empty() && !out.ref_audio_b64.empty()) {
             out.tts_ref_audio_b64 = out.ref_audio_b64;
         }
