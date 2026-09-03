@@ -209,6 +209,45 @@ inline OmniTextChunkPlan omni_text_chunk_plan(int chunk_size, bool has_pending_t
     };
 }
 
+struct OmniTtsWindowPlan {
+    bool   ready = false;
+    size_t process_size = 0;
+    size_t slide_amount = 0;
+    bool   is_last_window = false;
+};
+
+inline OmniTtsWindowPlan omni_tts_window_plan(size_t buffer_size, bool is_final) {
+    const OmniTtsPythonBaseConfig config = omni_tts_python_base_config();
+    const size_t chunk_size = static_cast<size_t>(config.chunk_size);
+    const size_t window_size = chunk_size + static_cast<size_t>(config.prelook_size);
+
+    if (buffer_size == 0 || (!is_final && buffer_size < window_size)) {
+        return {};
+    }
+
+    OmniTtsWindowPlan plan;
+    plan.ready = true;
+    plan.process_size = std::min(buffer_size, window_size);
+    plan.is_last_window = is_final && buffer_size <= window_size;
+
+    if (plan.is_last_window) {
+        plan.slide_amount = buffer_size;
+    } else if (buffer_size > chunk_size) {
+        plan.slide_amount = chunk_size;
+    } else if (buffer_size > static_cast<size_t>(config.prelook_size)) {
+        plan.slide_amount = buffer_size - static_cast<size_t>(config.prelook_size);
+    }
+
+    return plan;
+}
+
+inline bool omni_tts_should_defer_text_piece(bool simplex_mode,
+                                             bool need_lookahead,
+                                             int  condition_tokens_collected,
+                                             int  step_size) {
+    return simplex_mode && need_lookahead && condition_tokens_collected >= step_size;
+}
+
 inline int omni_duplex_tts_output_token_count_for_budget(int max_new_tokens) {
     return max_new_tokens > 0 ? max_new_tokens - 1 : 0;
 }
@@ -490,6 +529,13 @@ struct omni_context {
     std::unique_ptr<omni::flow::Token2WavSession> token2wav_session;
     bool token2wav_initialized = false;
     std::string token2wav_model_dir;  // Directory containing token2wav GGUF models
+    enum class TtsDefaultPromptSource {
+        NONE,
+        PROMPT_CACHE_GGUF,
+        PROMPT_BUNDLE,
+    };
+    TtsDefaultPromptSource token2wav_default_prompt_source = TtsDefaultPromptSource::NONE;
+    std::string token2wav_default_prompt_path;
     std::mutex tts_voice_mtx;
     
     // 🔧 [Python Token2Wav] 使用 Python stepaudio2 库实现的 Token2Wav

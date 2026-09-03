@@ -2298,6 +2298,11 @@ struct Token2WavSession {
                                     int                 n_timesteps = 10,
                                     float               temperature = 1.0f);
 
+    // Restore a precomputed prompt bundle without reloading model weights.
+    bool reset_to_prompt_bundle(const std::string & prompt_bundle_dir,
+                                int                 n_timesteps = 10,
+                                float               temperature = 1.0f);
+
     bool feed_tokens(const int32_t * tokens, int64_t n_tokens, bool is_final, std::vector<float> & wave_bt_out);
 
     bool feed_tokens(const std::vector<int32_t> & tokens, bool is_final, std::vector<float> & wave_bt_out) {

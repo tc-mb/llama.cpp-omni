@@ -114,12 +114,32 @@ bool Token2WavSession::reset_to_prompt_cache_gguf(const std::string & prompt_cac
     return true;
 }
 
+bool Token2WavSession::reset_to_prompt_bundle(const std::string & prompt_bundle_dir,
+                                              int                 n_timesteps,
+                                              float               temperature) {
+    Token2Mel::PromptBundle prompt;
+    if (!Token2Mel::load_prompt_bundle_dir(prompt_bundle_dir, prompt)) {
+        std::fprintf(stderr, "Token2WavSession.reset_to_prompt_bundle: failed to load bundle: %s\n",
+                     prompt_bundle_dir.c_str());
+        return false;
+    }
+    if (!t2w.start_stream_with_prompt(prompt, n_timesteps, temperature)) {
+        std::fprintf(stderr, "Token2WavSession.reset_to_prompt_bundle: failed to install bundle: %s\n",
+                     prompt_bundle_dir.c_str());
+        return false;
+    }
+
+    pending_.clear();
+    wave_tmp_.clear();
+    return true;
+}
+
 bool Token2WavSession::feed_window(const int32_t *      tokens,
                                    int64_t              n_tokens,
                                    bool                 is_final,
                                    std::vector<float> & wave_bt_out) {
-    // 推理送入token第一种（vector返回，持续写到vector中。调用方持有wave_bt_out，返回后数据还在）
-    // 在外部做好25token+下一个chunk的3个token，送入28token
+    // The caller supplies a 28-token window (25 main tokens plus 3 lookahead
+    // tokens); a final window may contain fewer tokens.
     wave_bt_out.clear();
     int64_t T_audio = 0;
     if (!t2w.push_tokens_window(tokens, n_tokens, is_final, wave_bt_out, T_audio)) {

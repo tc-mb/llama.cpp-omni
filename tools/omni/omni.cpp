@@ -4368,16 +4368,29 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
             }
 
             const OmniTtsPythonBaseConfig tts_config = omni_tts_python_base_config();
+            ctx_omni->token2wav_default_prompt_source =
+                omni_context::TtsDefaultPromptSource::NONE;
+            ctx_omni->token2wav_default_prompt_path.clear();
             init_ok = ctx_omni->token2wav_session->init_from_prompt_cache_gguf(
                     encoder_gguf, flow_matching_gguf, flow_extra_gguf, prompt_cache_gguf,
                     vocoder_gguf, device_token2mel, device_vocoder,
                     /*n_timesteps=*/-1, tts_config.token2wav_temperature, coreml_model_path);
+            if (init_ok) {
+                ctx_omni->token2wav_default_prompt_source =
+                    omni_context::TtsDefaultPromptSource::PROMPT_CACHE_GGUF;
+                ctx_omni->token2wav_default_prompt_path = prompt_cache_gguf;
+            }
             if (!init_ok && use_prompt_bundle) {
                 print_with_timestamp("Token2Wav: prompt_cache failed, fallback to prompt_bundle from %s\n", prompt_bundle_dir.c_str());
                 init_ok = ctx_omni->token2wav_session->init_from_prompt_bundle(
                         encoder_gguf, flow_matching_gguf, flow_extra_gguf, prompt_bundle_dir,
                         vocoder_gguf, device_token2mel, device_vocoder,
                         tts_config.n_timesteps, tts_config.token2wav_temperature);
+                if (init_ok) {
+                    ctx_omni->token2wav_default_prompt_source =
+                        omni_context::TtsDefaultPromptSource::PROMPT_BUNDLE;
+                    ctx_omni->token2wav_default_prompt_path = prompt_bundle_dir;
+                }
             }
             // Fallback to CPU
             if (!init_ok) {
@@ -4388,6 +4401,11 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
                         encoder_gguf, flow_matching_gguf, flow_extra_gguf, prompt_cache_gguf,
                         vocoder_gguf, "cpu", "cpu",
                         /*n_timesteps=*/-1, tts_config.token2wav_temperature);
+                if (init_ok) {
+                    ctx_omni->token2wav_default_prompt_source =
+                        omni_context::TtsDefaultPromptSource::PROMPT_CACHE_GGUF;
+                    ctx_omni->token2wav_default_prompt_path = prompt_cache_gguf;
+                }
             }
             
             if (init_ok) {
@@ -5758,7 +5776,7 @@ static bool generate_audio_tokens_local(
         return false;
     }
     print_with_timestamp("TTS Local: prefill completed, n_past_tts=%d\n", n_past_tts);
-    
+
     // 2. Reuse the persistent sampler created with the TTS model.
     struct common_sampler * tts_sampler = ctx_omni->ctx_tts_sampler;
     if (!tts_sampler) {
@@ -5782,7 +5800,7 @@ static bool generate_audio_tokens_local(
     // generation lets the TTS model stop at its EOS token.
     const int min_new_tokens =
         ctx_omni->duplex_mode && !is_end_of_turn ? 26 : 0;
-    
+
     // The turn-based path sends 25 generated audio tokens and lets
     // Token2Mel add its fixed-graph padding. Full-duplex keeps the existing
     // 28-token window so its one-second playback cadence is unchanged.
@@ -8606,11 +8624,24 @@ bool omni_reset_tts_reference_audio(struct omni_context * ctx_omni) {
         return false;
     }
 
-    const std::string prompt_cache_gguf =
-        ctx_omni->token2wav_model_dir + "/prompt_cache.gguf";
     const OmniTtsPythonBaseConfig tts_config = omni_tts_python_base_config();
-    if (!ctx_omni->token2wav_session->reset_to_prompt_cache_gguf(
-            prompt_cache_gguf, /*n_timesteps=*/-1, tts_config.token2wav_temperature)) {
+    bool restored = false;
+    if (ctx_omni->token2wav_default_prompt_source ==
+            omni_context::TtsDefaultPromptSource::PROMPT_BUNDLE &&
+        !ctx_omni->token2wav_default_prompt_path.empty()) {
+        restored = ctx_omni->token2wav_session->reset_to_prompt_bundle(
+            ctx_omni->token2wav_default_prompt_path,
+            tts_config.n_timesteps,
+            tts_config.token2wav_temperature);
+    } else {
+        const std::string prompt_cache_gguf =
+            ctx_omni->token2wav_default_prompt_path.empty()
+                ? ctx_omni->token2wav_model_dir + "/prompt_cache.gguf"
+                : ctx_omni->token2wav_default_prompt_path;
+        restored = ctx_omni->token2wav_session->reset_to_prompt_cache_gguf(
+            prompt_cache_gguf, /*n_timesteps=*/-1, tts_config.token2wav_temperature);
+    }
+    if (!restored) {
         LOG_ERR("omni_reset_tts_reference_audio: failed to restore default voice\n");
         return false;
     }
@@ -8920,14 +8951,13 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
     auto& mtx = ctx_omni->t2w_thread_info->mtx;
     auto& cv = ctx_omni->t2w_thread_info->cv;
     
-    constexpr int32_t CHUNK_SIZE = 25;
-    constexpr int32_t PRE_LOOKAHEAD = 3;
-    constexpr int32_t WINDOW_SIZE = CHUNK_SIZE + PRE_LOOKAHEAD;
+    const int32_t pre_lookahead =
+        omni_tts_python_base_config().prelook_size;
     std::vector<int32_t> token_buffer;
     auto reset_token_buffer = [&]() {
         token_buffer.clear();
         if (ctx_omni->duplex_mode) {
-            token_buffer.assign(PRE_LOOKAHEAD, 4218);
+            token_buffer.assign(pre_lookahead, 4218);
         }
     };
     reset_token_buffer();
@@ -9065,7 +9095,6 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
         }
         
         // Add new tokens to buffer
-        size_t buffer_before = token_buffer.size();
         token_buffer.insert(token_buffer.end(), new_tokens.begin(), new_tokens.end());
         const double queue_wait_ms = have_enqueue_time
             ? std::chrono::duration<double, std::milli>(dequeue_time - oldest_enqueue_time).count()
@@ -9092,29 +9121,19 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
             continue;
         }
         
-        // 处理逻辑（单工/双工分开）
-        bool need_flush = false;
-        const size_t min_process_threshold =
-            ctx_omni->duplex_mode ? WINDOW_SIZE : CHUNK_SIZE;
-        
-        if (!ctx_omni->duplex_mode) {
-            need_flush = is_final || is_chunk_end;
-        } else {
-            // 双工：只在 is_final（LISTEN→SPEAK 切换时 LLM 线程设置）时 flush。
-            // chunk_end 保持原语义"累积等下个 chunk"，避免把一轮 turn 切成多段 wav 产生播放 gap。
-            need_flush = is_final;
-        }
-        
-        // Process windows using sliding window
-        int process_count = 0;
-        while (token_buffer.size() >= min_process_threshold || (need_flush && !token_buffer.empty())) {
-            // Determine how many tokens to process
-            size_t process_size = std::min(token_buffer.size(), min_process_threshold);
-            // 🔧 is_last_window: 只有 is_final 才算轮次真正的"最后窗口"（触发 token2wav 终结 + buffer 重置）
-            // 双工 chunk_end 不能视为 last_window，否则 token2wav 会被重置、丢失跨 chunk 的状态
-            bool is_last_window = is_final && (token_buffer.size() <= min_process_threshold);
-            
-            std::vector<int32_t> window(token_buffer.begin(), token_buffer.begin() + process_size);
+        // Process only complete fixed-graph windows. is_chunk_end wakes the
+        // worker, but it is not a stream-final signal and must not force a
+        // short non-final window through the 28-token graph.
+        while (true) {
+            const OmniTtsWindowPlan window_plan =
+                omni_tts_window_plan(token_buffer.size(), is_final);
+            if (!window_plan.ready) {
+                break;
+            }
+
+            std::vector<int32_t> window(token_buffer.begin(),
+                                        token_buffer.begin() + window_plan.process_size);
+            const bool is_last_window = window_plan.is_last_window;
             
             // Time the inference
             auto t2w_start = std::chrono::high_resolution_clock::now();
@@ -9189,28 +9208,11 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
                 LOG_ERR("T2W线程: feed_window 失败\n");
             }
             
-            if (!ctx_omni->duplex_mode) {
-                if (token_buffer.size() > CHUNK_SIZE) {
-                    token_buffer.erase(token_buffer.begin(), token_buffer.begin() + CHUNK_SIZE);
-                } else {
-                    token_buffer.clear();
-                }
-            } else {
-                size_t slide_amount = 0;
-                if (is_last_window) {
-                    slide_amount = token_buffer.size();
-                } else if (token_buffer.size() > CHUNK_SIZE) {
-                    slide_amount = CHUNK_SIZE;
-                } else if (token_buffer.size() > PRE_LOOKAHEAD) {
-                    slide_amount = token_buffer.size() - PRE_LOOKAHEAD;
-                }
-                if (slide_amount > 0) {
-                    token_buffer.erase(
-                        token_buffer.begin(), token_buffer.begin() + slide_amount);
-                }
+            if (window_plan.slide_amount > 0) {
+                token_buffer.erase(
+                    token_buffer.begin(),
+                    token_buffer.begin() + window_plan.slide_amount);
             }
-            process_count++;
-            
             if (is_last_window) {
                 // 🔧 [与 Python 对齐] 只有 is_final（轮次结束）时才重置
                 // Python: if is_last_chunk: stream(..., last_chunk=True); buffer = []
@@ -10955,6 +10957,7 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
         int max_chunk_tokens = ctx_omni->duplex_mode ? ctx_omni->max_new_speak_tokens_per_chunk : 0;
         bool chunk_limit_reached = (max_chunk_tokens > 0 && current_chunk_tokens >= max_chunk_tokens);
         {
+            bool defer_response_piece = false;
             fflush(stdout);
             // Python generates one lookahead token at every non-final chunk
             // boundary. The lookahead is fed into the LLM cache, but its text
@@ -10988,6 +10991,7 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
                                 hidden_states, hidden_states + llm_n_embd);
                             pending_tts_piece = tmp;
                             has_pending_tts_token = true;
+                            defer_response_piece = true;
                             need_lookahead = false;
                         } else {
                             chunk_token_ids.push_back(sampled_token);
@@ -11122,7 +11126,9 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
 
                 // Copy tmp to a local string immediately to avoid issues with static string
                 std::string tmp_str(tmp);
-                response += tmp_str;
+                if (!defer_response_piece) {
+                    response += tmp_str;
+                }
                 free(hidden_states);
                 fflush(stdout);
             }

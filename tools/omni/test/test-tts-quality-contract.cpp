@@ -43,6 +43,35 @@ static void test_python_text_chunk_plan_reserves_one_lookahead_token() {
     assert(next.generated_tokens == 10);
 }
 
+static void test_native_t2w_window_waits_for_lookahead() {
+    const OmniTtsWindowPlan incomplete = omni_tts_window_plan(25, false);
+    assert(!incomplete.ready);
+
+    const OmniTtsWindowPlan ready = omni_tts_window_plan(50, false);
+    assert(ready.ready);
+    assert(ready.process_size == 28);
+    assert(ready.slide_amount == 25);
+    assert(!ready.is_last_window);
+
+    const OmniTtsWindowPlan final = omni_tts_window_plan(25, true);
+    assert(final.ready);
+    assert(final.process_size == 25);
+    assert(final.slide_amount == 25);
+    assert(final.is_last_window);
+}
+
+static void test_simplex_lookahead_text_is_deferred() {
+    assert(omni_tts_should_defer_text_piece(
+        /*simplex_mode=*/true, /*need_lookahead=*/true,
+        /*condition_tokens_collected=*/10, /*step_size=*/10));
+    assert(!omni_tts_should_defer_text_piece(
+        /*simplex_mode=*/false, /*need_lookahead=*/true,
+        /*condition_tokens_collected=*/10, /*step_size=*/10));
+    assert(!omni_tts_should_defer_text_piece(
+        /*simplex_mode=*/true, /*need_lookahead=*/false,
+        /*condition_tokens_collected=*/10, /*step_size=*/10));
+}
+
 static void test_python_base_token2wav_configuration() {
     const OmniTtsPythonBaseConfig config = omni_tts_python_base_config();
     assert(config.n_timesteps == 10);
@@ -62,6 +91,8 @@ int main() {
     test_head_code_uses_row_major_audio_token_rows();
     test_python_tts_budget_excludes_exhausted_loop_slot();
     test_python_text_chunk_plan_reserves_one_lookahead_token();
+    test_native_t2w_window_waits_for_lookahead();
+    test_simplex_lookahead_text_is_deferred();
     test_python_base_token2wav_configuration();
     return 0;
 }
