@@ -150,6 +150,26 @@ struct projector_model {
     bool initialized = false;
 };
 
+// Runtime values used by the Python base Token2Wav path. The native path
+// keeps these fixed so model quality does not depend on per-request defaults.
+struct OmniTtsPythonBaseConfig {
+    int   n_timesteps = 10;
+    int   chunk_size = 25;
+    int   prelook_size = 3;
+    float token2wav_temperature = 1.0f;
+    float tts_temperature = 0.8f;
+    float top_p = 0.85f;
+    int   top_k = 25;
+    int   min_tokens_to_keep = 3;
+    float repetition_penalty = 1.05f;
+    int   repetition_window = 16;
+    int   max_audio_tokens = 500;
+};
+
+inline OmniTtsPythonBaseConfig omni_tts_python_base_config() {
+    return {};
+}
+
 // The GGUF converter writes head_code as contiguous [audio_token, hidden]
 // rows. GGUF metadata may expose the reversed dimensions, but the payload
 // remains row-major and must be copied without another transpose.

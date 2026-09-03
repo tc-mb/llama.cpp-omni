@@ -9437,9 +9437,17 @@ bool Token2Mel::push_tokens(const int32_t * tokens, int64_t n_tokens, bool is_fi
         const int64_t B           = 1;
         const int64_t C           = kMelChannels;
         const int64_t T           = (int64_t) mel_chunk_bct.size() / (B * C);
-        const int64_t max_valid_T = n_tokens * 2;
+        // The fixed graph is padded to 28 tokens. Python's non-final
+        // streaming path drops the three-token right lookahead; the final
+        // window keeps all real tokens.
+        const int64_t real_tokens = is_final
+                                        ? n_tokens
+                                        : std::max<int64_t>(0, n_tokens - kPreLookahead);
+        const int64_t max_valid_T = real_tokens * 2;
         const int64_t valid_T     = std::min<int64_t>(T, max_valid_T);
-        if (valid_T < T && valid_T > 0) {
+        if (valid_T == 0) {
+            mel_chunk_bct.clear();
+        } else if (valid_T < T) {
             std::vector<float> cropped((size_t) B * (size_t) C * (size_t) valid_T);
             for (int64_t b = 0; b < B; ++b) {
                 for (int64_t c = 0; c < C; ++c) {
@@ -9556,7 +9564,8 @@ bool Token2MelSession::feed_window(const int32_t *      tokens,
                                    int64_t              n_tokens,
                                    bool                 is_final,
                                    std::vector<float> & mel_bct_out) {
-    // 窗口接口（预期是外部输入和内部消费逻辑一致，外面传几个，内部使用几个）：外部提供<=25 tokens + prelook，每次调用只推理一次并返回该次mel（已完成读入python前转置）(BCT,f32)
+    // Window interface used by the runtime: receive up to 25 generated
+    // tokens and let Token2Mel add its internal three-token padding.
     mel_bct_out.clear();
 
     return t2m.push_tokens(tokens, n_tokens, is_final, mel_bct_out);
@@ -9642,6 +9651,25 @@ void fade_in_out_b1(std::vector<float> &       wave_inout,
         wave_inout[(size_t) i] =
             wave_inout[(size_t) i] * window_2n[(size_t) i] + prev_tail[(size_t) i] * window_2n[(size_t) (i + n)];
     }
+}
+
+void trim_stream_wave_b1(std::vector<float> & wave_inout,
+                         bool                is_first,
+                         bool                is_final,
+                         int64_t             cache_len) {
+    if (is_final || cache_len <= 0) {
+        return;
+    }
+
+    const size_t trim = std::min(
+        wave_inout.size(), static_cast<size_t>(cache_len));
+    std::vector<float> trimmed;
+    if (is_first) {
+        trimmed.assign(static_cast<size_t>(cache_len), 0.0f);
+    }
+    trimmed.insert(trimmed.end(), wave_inout.begin(),
+                   wave_inout.end() - trim);
+    wave_inout.swap(trimmed);
 }
 
 }  // namespace token2wav_utils
@@ -9781,7 +9809,8 @@ bool Token2Wav::push_tokens_window(const int32_t *      tokens,
     }
     const auto t_voc1 = clock::now();
 
-    if (!voc_speech_cache_bt_.empty()) {
+    const bool is_first_stream_chunk = voc_speech_cache_bt_.empty();
+    if (!is_first_stream_chunk) {
         token2wav_utils::fade_in_out_b1(wave_bt_out, voc_speech_cache_bt_, voc_speech_window_, (int64_t) kSourceCacheLen);
     }
 
@@ -9806,10 +9835,9 @@ bool Token2Wav::push_tokens_window(const int32_t *      tokens,
         voc_speech_cache_bt_.swap(next_speech_cache);
     }
 
-    if (!is_final && (int64_t) wave_bt_out.size() > (int64_t) kSourceCacheLen) {
-        wave_bt_out.resize(wave_bt_out.size() - (size_t) kSourceCacheLen);
-        out_T_audio = (int64_t) wave_bt_out.size();
-    }
+    token2wav_utils::trim_stream_wave_b1(
+        wave_bt_out, is_first_stream_chunk, is_final, kSourceCacheLen);
+    out_T_audio = (int64_t) wave_bt_out.size();
 
     const double voc_ms   = std::chrono::duration<double, std::milli>(t_voc1 - t_voc0).count();
     const double total_ms = std::chrono::duration<double, std::milli>(clock::now() - t_total0).count();

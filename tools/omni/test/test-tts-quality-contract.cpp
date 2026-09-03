@@ -43,9 +43,25 @@ static void test_python_text_chunk_plan_reserves_one_lookahead_token() {
     assert(next.generated_tokens == 10);
 }
 
+static void test_python_base_token2wav_configuration() {
+    const OmniTtsPythonBaseConfig config = omni_tts_python_base_config();
+    assert(config.n_timesteps == 10);
+    assert(config.chunk_size == 25);
+    assert(config.prelook_size == 3);
+    assert(config.token2wav_temperature == 1.0f);
+    assert(config.tts_temperature == 0.8f);
+    assert(config.top_p == 0.85f);
+    assert(config.top_k == 25);
+    assert(config.min_tokens_to_keep == 3);
+    assert(config.repetition_penalty == 1.05f);
+    assert(config.repetition_window == 16);
+    assert(config.max_audio_tokens == 500);
+}
+
 int main() {
     test_head_code_uses_row_major_audio_token_rows();
     test_python_tts_budget_excludes_exhausted_loop_slot();
     test_python_text_chunk_plan_reserves_one_lookahead_token();
+    test_python_base_token2wav_configuration();
     return 0;
 }

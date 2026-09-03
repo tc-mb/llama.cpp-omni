@@ -2190,6 +2190,13 @@ void fade_in_out_b1(std::vector<float> &       wave_inout,
                     const std::vector<float> & window_2n,
                     int64_t                    n);
 
+// Match StepAudio2's first non-final streaming chunk handling: prepend one
+// source-cache of silence after trimming the unavailable right context.
+void trim_stream_wave_b1(std::vector<float> & wave_inout,
+                         bool                is_first,
+                         bool                is_final,
+                         int64_t             cache_len);
+
 }  // namespace token2wav_utils
 
 class Token2Wav {

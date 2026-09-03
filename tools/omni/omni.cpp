@@ -1492,12 +1492,13 @@ static void apply_python_repetition_penalty(std::vector<float> & logits,
 
 static common_params_sampling make_python_tts_sampling(
         const common_params_sampling & base, float temperature) {
+    const OmniTtsPythonBaseConfig config = omni_tts_python_base_config();
     common_params_sampling result = base;
     result.temp = temperature;
-    result.top_p = 0.85f;
-    result.top_k = 25;
+    result.top_p = config.top_p;
+    result.top_k = config.top_k;
     result.min_p = 0.0f;
-    result.min_keep = 3;
+    result.min_keep = config.min_tokens_to_keep;
     result.penalty_last_n = 0;
     result.penalty_repeat = 1.0f;
     result.penalty_freq = 0.0f;
@@ -1525,10 +1526,12 @@ static llama_token sample_tts_from_logits(
         return LLAMA_TOKEN_NULL;
     }
 
-    const float temperature = ctx_omni->tts_temperature;
+    const OmniTtsPythonBaseConfig config = omni_tts_python_base_config();
+    const float temperature = config.tts_temperature;
     if (!skip_processors) {
         apply_python_repetition_penalty(
-            logits, history, 1.05f, 16, audio_bos_token_id);
+            logits, history, config.repetition_penalty,
+            config.repetition_window, audio_bos_token_id);
     }
     if (force_no_eos && !logits.empty()) {
         logits[num_audio_tokens - 1] = -std::numeric_limits<float>::infinity();
@@ -4135,8 +4138,9 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
         
         // Build the persistent TTS sampler with the Python base order. The
         // repetition processor is applied explicitly to relative audio logits.
+        const OmniTtsPythonBaseConfig tts_config = omni_tts_python_base_config();
         common_params_sampling tts_sampling =
-            make_python_tts_sampling(params->sampling, ctx_omni->tts_temperature);
+            make_python_tts_sampling(params->sampling, tts_config.tts_temperature);
         struct common_sampler * tts_sampler = common_sampler_init(tts_model, tts_sampling);
         print_with_timestamp("TTS sampler: temp=%.2f, top_p=%.2f, top_k=%d, rep_penalty=%.2f\n",
                             tts_sampling.temp, tts_sampling.top_p, tts_sampling.top_k, 1.05f);
@@ -4363,14 +4367,17 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
                 print_with_timestamp("Token2Wav: CoreML model = %s\n", coreml_model_path.c_str());
             }
 
+            const OmniTtsPythonBaseConfig tts_config = omni_tts_python_base_config();
             init_ok = ctx_omni->token2wav_session->init_from_prompt_cache_gguf(
                     encoder_gguf, flow_matching_gguf, flow_extra_gguf, prompt_cache_gguf,
-                    vocoder_gguf, device_token2mel, device_vocoder, 5, 1.0f, coreml_model_path);
+                    vocoder_gguf, device_token2mel, device_vocoder,
+                    /*n_timesteps=*/-1, tts_config.token2wav_temperature, coreml_model_path);
             if (!init_ok && use_prompt_bundle) {
                 print_with_timestamp("Token2Wav: prompt_cache failed, fallback to prompt_bundle from %s\n", prompt_bundle_dir.c_str());
                 init_ok = ctx_omni->token2wav_session->init_from_prompt_bundle(
                         encoder_gguf, flow_matching_gguf, flow_extra_gguf, prompt_bundle_dir,
-                        vocoder_gguf, device_token2mel, device_vocoder, 5, 1.0f);
+                        vocoder_gguf, device_token2mel, device_vocoder,
+                        tts_config.n_timesteps, tts_config.token2wav_temperature);
             }
             // Fallback to CPU
             if (!init_ok) {
@@ -4379,7 +4386,8 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
                 ctx_omni->token2wav_session = std::make_unique<omni::flow::Token2WavSession>();
                 init_ok = ctx_omni->token2wav_session->init_from_prompt_cache_gguf(
                         encoder_gguf, flow_matching_gguf, flow_extra_gguf, prompt_cache_gguf,
-                        vocoder_gguf, "cpu", "cpu", 5, 1.0f);
+                        vocoder_gguf, "cpu", "cpu",
+                        /*n_timesteps=*/-1, tts_config.token2wav_temperature);
             }
             
             if (init_ok) {
@@ -5244,7 +5252,8 @@ static bool generate_audio_tokens_local_simplex(
     const int num_audio_tokens = 6562;
     // 🔧 [与 Python 对齐] Python: max_new_token=500，每个 LLM condition 生成直到 EOS
     // 然后每 25 个 tokens yield 一次
-    const int max_audio_tokens = 500;
+    const OmniTtsPythonBaseConfig config = omni_tts_python_base_config();
+    const int max_audio_tokens = config.max_audio_tokens;
     
     if (!ctx_omni->ctx_tts_llama || !ctx_omni->model_tts) {
         LOG_ERR("TTS Simplex: TTS model not loaded\n");
@@ -5339,7 +5348,7 @@ static bool generate_audio_tokens_local_simplex(
     
     // 🔧 [与 Python 对齐] 统一使用 tts_token_buffer 管理，和 Python _token_buffer 一致
     // Python chunk_size=25，每凑够 25 个才 yield
-    const int CHUNK_SIZE = 25;  // 与 Python TTSStreamingGenerator.chunk_size=25 对齐
+    const int CHUNK_SIZE = config.chunk_size;
     
     // 🔧 [与 Python 对齐] 不强制最小生成数量，让 TTS 自然决定何时结束
     const int min_new_tokens = 0;
@@ -5651,7 +5660,9 @@ static bool generate_audio_tokens_local(
     // 🔧 [单双工适配] max_audio_tokens:
     // - 双工模式: 26 (与 Python 对齐，max_token_per_chunk = 25 + 1)
     // - 单工模式: 500 (允许更长的生成，靠 EOS 结束)
-    const int max_audio_tokens = ctx_omni->duplex_mode ? 26 : 500;
+    const OmniTtsPythonBaseConfig config = omni_tts_python_base_config();
+    const int max_audio_tokens =
+        ctx_omni->duplex_mode ? config.chunk_size + 1 : config.max_audio_tokens;
     print_with_timestamp("TTS Local: mode=%s, max_audio_tokens=%d\n", 
                          ctx_omni->duplex_mode ? "duplex" : "simplex", max_audio_tokens);
     
@@ -5772,10 +5783,11 @@ static bool generate_audio_tokens_local(
     const int min_new_tokens =
         ctx_omni->duplex_mode && !is_end_of_turn ? 26 : 0;
     
-    // 🚀 流水线优化：Token2Wav需要28个tokens (25+3 lookahead)才能输出音频
-    // 首批28个tokens后推送，后续每25个tokens推送一次
-    const int STREAM_CHUNK_SIZE = 25;
-    const int FIRST_CHUNK_SIZE = 28;  // 首批推送阈值，减少首响时间
+    // The turn-based path sends 25 generated audio tokens and lets
+    // Token2Mel add its fixed-graph padding. Full-duplex keeps the existing
+    // 28-token window so its one-second playback cadence is unchanged.
+    const int STREAM_CHUNK_SIZE = config.chunk_size;
+    const int FIRST_CHUNK_SIZE = config.chunk_size + config.prelook_size;
     bool first_chunk_pushed = false;
     std::vector<int32_t> stream_buffer;
     
@@ -8562,13 +8574,14 @@ bool omni_set_tts_reference_audio(struct omni_context * ctx_omni,
         ctx_omni->token2wav_model_dir + "/speech_tokenizer_v2_25hz.gguf";
     const std::string campplus_gguf =
         ctx_omni->token2wav_model_dir + "/campplus.gguf";
+    const OmniTtsPythonBaseConfig tts_config = omni_tts_python_base_config();
     if (!ctx_omni->token2wav_session->set_prompt_wav(
             tts_ref_audio_path,
             speech_tokenizer_gguf,
             campplus_gguf,
             /*frontend_threads=*/1,
-            /*n_timesteps=*/5,
-            /*temperature=*/1.0f)) {
+            tts_config.n_timesteps,
+            tts_config.token2wav_temperature)) {
         LOG_ERR("omni_set_tts_reference_audio: native GGUF frontend failed\n");
         return false;
     }
@@ -8595,8 +8608,9 @@ bool omni_reset_tts_reference_audio(struct omni_context * ctx_omni) {
 
     const std::string prompt_cache_gguf =
         ctx_omni->token2wav_model_dir + "/prompt_cache.gguf";
+    const OmniTtsPythonBaseConfig tts_config = omni_tts_python_base_config();
     if (!ctx_omni->token2wav_session->reset_to_prompt_cache_gguf(
-            prompt_cache_gguf, /*n_timesteps=*/5, /*temperature=*/1.0f)) {
+            prompt_cache_gguf, /*n_timesteps=*/-1, tts_config.token2wav_temperature)) {
         LOG_ERR("omni_reset_tts_reference_audio: failed to restore default voice\n");
         return false;
     }
@@ -8906,14 +8920,17 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
     auto& mtx = ctx_omni->t2w_thread_info->mtx;
     auto& cv = ctx_omni->t2w_thread_info->cv;
     
-    // Token2Wav sliding window parameters
-    constexpr int32_t CHUNK_SIZE = 25;      // Main chunk size (25 tokens = 1s audio)
-    constexpr int32_t PRE_LOOKAHEAD = 3;    // Lookahead for overlap
-    constexpr int32_t WINDOW_SIZE = CHUNK_SIZE + PRE_LOOKAHEAD;  // 28
-    
-    // Buffer to accumulate tokens (for sliding window)
-    // Python: buffer = [4218] * 3  # 预先放入3个前缀静音token
-    std::vector<int32_t> token_buffer = {4218, 4218, 4218};
+    constexpr int32_t CHUNK_SIZE = 25;
+    constexpr int32_t PRE_LOOKAHEAD = 3;
+    constexpr int32_t WINDOW_SIZE = CHUNK_SIZE + PRE_LOOKAHEAD;
+    std::vector<int32_t> token_buffer;
+    auto reset_token_buffer = [&]() {
+        token_buffer.clear();
+        if (ctx_omni->duplex_mode) {
+            token_buffer.assign(PRE_LOOKAHEAD, 4218);
+        }
+    };
+    reset_token_buffer();
     
     // 🔧 [多实例支持] 使用可配置的 base_output_dir
     const std::string& base_output_dir = ctx_omni->base_output_dir;
@@ -8953,7 +8970,7 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
             }
             // 重置 break_event 后继续等待新任务
             ctx_omni->break_event = false;
-            token_buffer = {4218, 4218, 4218};  // 重置 buffer
+            reset_token_buffer();
             wav_idx = 0;  // 重置 wav index
             
             // 🔧 [修复竞态条件] 在 T2W 线程处理完打断后递增 wav_turn_base
@@ -9039,7 +9056,7 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
             // 重置轮次相关状态
             wav_idx = 0;                                                    // WAV 文件编号从 0 开始
             ctx_omni->wav_turn_base = effective_round_idx * 1000;           // 更新全局 WAV 编号基数
-            token_buffer = {4218, 4218, 4218};                              // 重置 token buffer（3个静音前缀）
+            reset_token_buffer();
             
             print_with_timestamp("T2W线程(C++): 新输出目录 %s\n", tts_wav_output_dir.c_str());
             
@@ -9077,7 +9094,8 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
         
         // 处理逻辑（单工/双工分开）
         bool need_flush = false;
-        size_t min_process_threshold = WINDOW_SIZE;
+        const size_t min_process_threshold =
+            ctx_omni->duplex_mode ? WINDOW_SIZE : CHUNK_SIZE;
         
         if (!ctx_omni->duplex_mode) {
             need_flush = is_final || is_chunk_end;
@@ -9091,10 +9109,10 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
         int process_count = 0;
         while (token_buffer.size() >= min_process_threshold || (need_flush && !token_buffer.empty())) {
             // Determine how many tokens to process
-            size_t process_size = std::min(token_buffer.size(), (size_t)WINDOW_SIZE);
+            size_t process_size = std::min(token_buffer.size(), min_process_threshold);
             // 🔧 is_last_window: 只有 is_final 才算轮次真正的"最后窗口"（触发 token2wav 终结 + buffer 重置）
             // 双工 chunk_end 不能视为 last_window，否则 token2wav 会被重置、丢失跨 chunk 的状态
-            bool is_last_window = is_final && (token_buffer.size() <= WINDOW_SIZE);
+            bool is_last_window = is_final && (token_buffer.size() <= min_process_threshold);
             
             std::vector<int32_t> window(token_buffer.begin(), token_buffer.begin() + process_size);
             
@@ -9171,38 +9189,24 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
                 LOG_ERR("T2W线程: feed_window 失败\n");
             }
             
-            // Slide window by CHUNK_SIZE (25), keep last PRE_LOOKAHEAD (3) for overlap
-            size_t buffer_before_slide = token_buffer.size();
-            
             if (!ctx_omni->duplex_mode) {
-                // 🔧 [单工模式] 保持原有逻辑，绝对不改动
-                // Slide window by CHUNK_SIZE (25), keep last PRE_LOOKAHEAD (3) for overlap
                 if (token_buffer.size() > CHUNK_SIZE) {
                     token_buffer.erase(token_buffer.begin(), token_buffer.begin() + CHUNK_SIZE);
                 } else {
                     token_buffer.clear();
                 }
             } else {
-                // 🔧 [双工模式-与 Python 对齐]
-                // Python: self.token2wav_buffer = self.token2wav_buffer[min(CHUNK_SIZE, chunk_to_process - self.pre_lookahead):]
-                size_t slide_amount;
+                size_t slide_amount = 0;
                 if (is_last_window) {
-                    // 最后一个 window，清空 buffer
                     slide_amount = token_buffer.size();
                 } else if (token_buffer.size() > CHUNK_SIZE) {
-                    // 正常情况：滑动 CHUNK_SIZE
                     slide_amount = CHUNK_SIZE;
                 } else if (token_buffer.size() > PRE_LOOKAHEAD) {
-                    // 有 chunk_eos 时，保留 pre_lookahead
                     slide_amount = token_buffer.size() - PRE_LOOKAHEAD;
-                } else {
-                    slide_amount = 0;  // 太少了，不滑动
                 }
-                
-                if (slide_amount > 0 && slide_amount <= token_buffer.size()) {
-                    token_buffer.erase(token_buffer.begin(), token_buffer.begin() + slide_amount);
-                } else if (slide_amount > token_buffer.size()) {
-                    token_buffer.clear();
+                if (slide_amount > 0) {
+                    token_buffer.erase(
+                        token_buffer.begin(), token_buffer.begin() + slide_amount);
                 }
             }
             process_count++;
@@ -9229,8 +9233,7 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
                     // 🔧 [关键] 不调用 Token2WavSession::reset()
                     // 原因：reset() 会把 stream_started_=false，导致下一轮 feed_window 失败
                     // 单工和双工模式都只重置 token_buffer，保持 Token2Wav 的 stream 状态
-                    // 重新初始化buffer（3个静音token作为前缀）
-                    token_buffer = {4218, 4218, 4218};
+                    reset_token_buffer();
                     
                     // 🔧 [修复竞态条件] 在 T2W 线程处理完 is_final 后递增 wav_turn_base
                     // 原因：确保当前轮次的所有 wav 文件使用旧的编号，然后再切换到新编号

@@ -1,3 +1,4 @@
+#include "omni.h"
 #include "token2wav-impl.h"
 
 #undef NDEBUG
@@ -76,7 +77,26 @@ static std::vector<float> generate_one_window(omni::flow::Token2WavSession & ses
     return samples;
 }
 
+static void test_first_nonfinal_stream_output_matches_python_contract() {
+    std::vector<float> first = { 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f };
+    omni::flow::token2wav_utils::trim_stream_wave_b1(
+        first, /*is_first=*/true, /*is_final=*/false, /*cache_len=*/2);
+    assert(first == std::vector<float>({ 0.0f, 0.0f, 1.0f, 2.0f, 3.0f, 4.0f }));
+
+    std::vector<float> next = { 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f };
+    omni::flow::token2wav_utils::trim_stream_wave_b1(
+        next, /*is_first=*/false, /*is_final=*/false, /*cache_len=*/2);
+    assert(next == std::vector<float>({ 1.0f, 2.0f, 3.0f, 4.0f }));
+
+    std::vector<float> final = { 1.0f, 2.0f, 3.0f };
+    omni::flow::token2wav_utils::trim_stream_wave_b1(
+        final, /*is_first=*/true, /*is_final=*/true, /*cache_len=*/2);
+    assert(final == std::vector<float>({ 1.0f, 2.0f, 3.0f }));
+}
+
 int main(int argc, char ** argv) {
+    test_first_nonfinal_stream_output_matches_python_contract();
+
     std::vector<std::string> configured_args;
     if (argc == 1) {
         const char * const env_names[] = {
@@ -111,7 +131,9 @@ int main(int argc, char ** argv) {
     const fs::path voice2              = argc == 1 ? configured_args[4] : argv[5];
     const fs::path output_dir          = argc == 1 ? configured_args[5] : argv[6];
     const std::string device            = argc >= 8 ? argv[7] : "gpu:0";
-    const int n_timesteps              = argc >= 9 ? std::stoi(argv[8]) : 5;
+    const int n_timesteps              = argc >= 9
+                                             ? std::stoi(argv[8])
+                                             : omni_tts_python_base_config().n_timesteps;
 
     fs::create_directories(output_dir);
     const std::string encoder = (model_dir / "encoder.gguf").string();
@@ -123,7 +145,7 @@ int main(int argc, char ** argv) {
     omni::flow::Token2WavSession session;
     std::fprintf(stderr, "loading Token2Wav models from %s\n", model_dir.c_str());
     if (!session.init_from_prompt_cache_gguf(
-            encoder, flow_matching, flow_extra, prompt_cache, vocoder, device, device, n_timesteps, 1.0f)) {
+            encoder, flow_matching, flow_extra, prompt_cache, vocoder, device, device, -1, 1.0f)) {
         std::fprintf(stderr, "Token2Wav model/cache initialization failed\n");
         return 3;
     }
@@ -146,7 +168,7 @@ int main(int argc, char ** argv) {
     const auto voice2_samples = generate_one_window(session, tokens);
     assert(write_wav_mono_i16(output_dir / "voice2.wav", voice2_samples, omni::flow::Token2Wav::kSampleRate));
 
-    assert(session.reset_to_prompt_cache_gguf(prompt_cache, n_timesteps, 1.0f));
+    assert(session.reset_to_prompt_cache_gguf(prompt_cache, -1, 1.0f));
     const auto default_samples = generate_one_window(session, tokens);
     assert(write_wav_mono_i16(output_dir / "default.wav", default_samples, omni::flow::Token2Wav::kSampleRate));
 
