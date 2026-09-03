@@ -19,6 +19,10 @@ add_library(omni
             vision.cpp
             vision.h
             omni-impl.h
+            token2wav/token2wav-frontend.cpp
+            token2wav/token2wav-frontend.h
+            token2wav/token2wav-frontend-gguf.cpp
+            token2wav/token2wav-frontend-gguf.h
             token2wav/token2wav-impl.cpp
             token2wav/token2wav-impl.h
             token2wav/token2wav.cpp
@@ -225,4 +229,32 @@ if(ENABLE_COREML)
     set_target_properties  (${TARGET_T2W_ANE_E2E} PROPERTIES OUTPUT_NAME llama-omni-test-t2w-ane-end2end)
     target_link_libraries  (${TARGET_T2W_ANE_E2E} PRIVATE llama-common omni Threads::Threads)
     target_compile_features(${TARGET_T2W_ANE_E2E} PRIVATE cxx_std_17)
+endif()
+
+if (LLAMA_BUILD_TESTS)
+    set(TARGET_T2W_FRONTEND_TEST test-token2wav-frontend)
+    add_executable(${TARGET_T2W_FRONTEND_TEST} test/test-token2wav-frontend.cpp)
+    target_link_libraries(${TARGET_T2W_FRONTEND_TEST} PRIVATE omni)
+    target_include_directories(${TARGET_T2W_FRONTEND_TEST} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/token2wav)
+    target_compile_features(${TARGET_T2W_FRONTEND_TEST} PRIVATE cxx_std_17)
+    add_test(NAME ${TARGET_T2W_FRONTEND_TEST} COMMAND ${TARGET_T2W_FRONTEND_TEST})
+    set_tests_properties(${TARGET_T2W_FRONTEND_TEST} PROPERTIES LABELS "main;omni;tts")
+
+    set(TARGET_T2W_SESSION_TEST test-token2wav-session)
+    add_executable(${TARGET_T2W_SESSION_TEST} test/test-token2wav-session.cpp)
+    target_link_libraries(${TARGET_T2W_SESSION_TEST} PRIVATE omni)
+    target_include_directories(${TARGET_T2W_SESSION_TEST} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/token2wav)
+    target_compile_features(${TARGET_T2W_SESSION_TEST} PRIVATE cxx_std_17)
+    add_test(NAME ${TARGET_T2W_SESSION_TEST} COMMAND ${TARGET_T2W_SESSION_TEST})
+    set_tests_properties(${TARGET_T2W_SESSION_TEST} PROPERTIES
+        SKIP_RETURN_CODE 77
+        LABELS "main;omni;tts"
+    )
+
+    set(TARGET_TTS_QUALITY_CONTRACT_TEST test-tts-quality-contract)
+    add_executable(${TARGET_TTS_QUALITY_CONTRACT_TEST} test/test-tts-quality-contract.cpp)
+    target_link_libraries(${TARGET_TTS_QUALITY_CONTRACT_TEST} PRIVATE omni)
+    target_compile_features(${TARGET_TTS_QUALITY_CONTRACT_TEST} PRIVATE cxx_std_17)
+    add_test(NAME ${TARGET_TTS_QUALITY_CONTRACT_TEST} COMMAND ${TARGET_TTS_QUALITY_CONTRACT_TEST})
+    set_tests_properties(${TARGET_TTS_QUALITY_CONTRACT_TEST} PROPERTIES LABELS "main;omni;tts")
 endif()

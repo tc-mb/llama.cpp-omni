@@ -2,6 +2,8 @@
 #include "llama.h"
 #include "tts-condition-graph.h"
 
+#include <algorithm>
+#include <cstdint>
 #include <thread>
 #include <memory>
 #include <vector>
@@ -147,6 +149,108 @@ struct projector_model {
     ggml_backend_buffer_type_t buf_type = nullptr;
     bool initialized = false;
 };
+
+// Runtime values used by the Python base Token2Wav path. The native path
+// keeps these fixed so model quality does not depend on per-request defaults.
+struct OmniTtsPythonBaseConfig {
+    int   n_timesteps = 10;
+    int   chunk_size = 25;
+    int   prelook_size = 3;
+    float token2wav_temperature = 1.0f;
+    float tts_temperature = 0.8f;
+    float top_p = 0.85f;
+    int   top_k = 25;
+    int   min_tokens_to_keep = 3;
+    float repetition_penalty = 1.05f;
+    int   repetition_window = 16;
+    int   max_audio_tokens = 500;
+};
+
+inline OmniTtsPythonBaseConfig omni_tts_python_base_config() {
+    return {};
+}
+
+// The GGUF converter writes head_code as contiguous [audio_token, hidden]
+// rows. GGUF metadata may expose the reversed dimensions, but the payload
+// remains row-major and must be copied without another transpose.
+inline bool omni_copy_head_code_row_major(const float * source,
+                                          int64_t       dim0,
+                                          int64_t       dim1,
+                                          int           hidden_size,
+                                          int           num_audio_tokens,
+                                          float *       destination) {
+    if (source == nullptr || destination == nullptr ||
+        hidden_size <= 0 || num_audio_tokens <= 0) {
+        return false;
+    }
+    if (!((dim0 == hidden_size && dim1 == num_audio_tokens) ||
+          (dim0 == num_audio_tokens && dim1 == hidden_size))) {
+        return false;
+    }
+    std::copy(source,
+              source + static_cast<size_t>(hidden_size) * num_audio_tokens,
+              destination);
+    return true;
+}
+
+struct OmniTextChunkPlan {
+    int prefix_tokens = 0;
+    int condition_tokens = 0;
+    int generated_tokens = 0;
+};
+
+inline OmniTextChunkPlan omni_text_chunk_plan(int chunk_size, bool has_pending_token) {
+    const int prefix_tokens = has_pending_token ? 1 : 0;
+    const int condition_tokens = std::max(0, chunk_size - prefix_tokens);
+    return {
+        prefix_tokens,
+        condition_tokens,
+        condition_tokens + 1,
+    };
+}
+
+struct OmniTtsWindowPlan {
+    bool   ready = false;
+    size_t process_size = 0;
+    size_t slide_amount = 0;
+    bool   is_last_window = false;
+};
+
+inline OmniTtsWindowPlan omni_tts_window_plan(size_t buffer_size, bool is_final) {
+    const OmniTtsPythonBaseConfig config = omni_tts_python_base_config();
+    const size_t chunk_size = static_cast<size_t>(config.chunk_size);
+    const size_t window_size = chunk_size + static_cast<size_t>(config.prelook_size);
+
+    if (buffer_size == 0 || (!is_final && buffer_size < window_size)) {
+        return {};
+    }
+
+    OmniTtsWindowPlan plan;
+    plan.ready = true;
+    plan.process_size = std::min(buffer_size, window_size);
+    plan.is_last_window = is_final && buffer_size <= window_size;
+
+    if (plan.is_last_window) {
+        plan.slide_amount = buffer_size;
+    } else if (buffer_size > chunk_size) {
+        plan.slide_amount = chunk_size;
+    } else if (buffer_size > static_cast<size_t>(config.prelook_size)) {
+        plan.slide_amount = buffer_size - static_cast<size_t>(config.prelook_size);
+    }
+
+    return plan;
+}
+
+inline bool omni_tts_should_defer_text_piece(bool simplex_mode,
+                                             bool need_lookahead,
+                                             int  condition_tokens_collected,
+                                             int  step_size) {
+    return simplex_mode && need_lookahead && condition_tokens_collected >= step_size;
+}
+
+inline int omni_duplex_tts_output_token_count_for_budget(int max_new_tokens) {
+    return max_new_tokens > 0 ? max_new_tokens - 1 : 0;
+}
 
 // ============================================================================
 // Audio output callback type
@@ -330,6 +434,8 @@ struct omni_context {
     int use_tts = false;
     std::string tts_bin_dir = "";
     std::string ref_audio_path = "";  // 参考音频路径（用于音色克隆）
+    std::string tts_ref_audio_path = "";  // Native Token2Wav reference WAV
+    bool tts_ref_audio_owned = false;     // Server owns and removes temporary WAV
     
     // 🔧 [高清/高刷模式] 
     // high_image: 高清模式，max_slice_nums 设置为 2，vision 可以看到更多细节
@@ -390,7 +496,7 @@ struct omni_context {
     
     // head_code: Linear layer (hidden_size=768 -> num_audio_tokens=6562)
     // Note: num_vq=1, so we only need one head_code layer
-    float * head_code_weight = nullptr;  // (768, 6562) - stored as (hidden_size, num_audio_tokens)
+    float * head_code_weight = nullptr;  // (6562, 768) - one row per audio token
     int head_code_hidden_size = 0;  // 768
     int head_code_num_audio_tokens = 0;  // 6562
     
@@ -423,6 +529,14 @@ struct omni_context {
     std::unique_ptr<omni::flow::Token2WavSession> token2wav_session;
     bool token2wav_initialized = false;
     std::string token2wav_model_dir;  // Directory containing token2wav GGUF models
+    enum class TtsDefaultPromptSource {
+        NONE,
+        PROMPT_CACHE_GGUF,
+        PROMPT_BUNDLE,
+    };
+    TtsDefaultPromptSource token2wav_default_prompt_source = TtsDefaultPromptSource::NONE;
+    std::string token2wav_default_prompt_path;
+    std::mutex tts_voice_mtx;
     
     // 🔧 [Python Token2Wav] 使用 Python stepaudio2 库实现的 Token2Wav
     // 设置为 true 时使用 Python 实现（精度更高），false 时使用 C++ 实现
@@ -491,6 +605,12 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
                                 const std::string & base_output_dir = "./tools/omni/output");
 
 void omni_free(struct omni_context * ctx_omni);
+// Install a session-level voice prompt from a reference WAV using the native
+// GGUF speech tokenizer and CAM++ frontend models.
+bool omni_set_tts_reference_audio(struct omni_context * ctx_omni,
+                                  const std::string & tts_ref_audio_path);
+// Restore the model-directory default Token2Wav prompt cache for context reuse.
+bool omni_reset_tts_reference_audio(struct omni_context * ctx_omni);
 // Stop/join inference threads and clear queues so the same context can serve a
 // new session, without tearing down the loaded model (unlike omni_free).
 void omni_prepare_for_reuse(struct omni_context * ctx_omni);
@@ -604,7 +724,7 @@ bool prefill_with_emb_tts(struct omni_context* ctx_omni, common_params* params, 
 // - chunk_generated_tokens: 当前 chunk 内已生成的 tokens（用于 repetition penalty，与 Python generate_chunk 对齐）
 // - token_index_in_chunk: 当前 chunk 内的 token 索引（用于判断是否跳过 sampling processors）
 // - force_no_eos: 是否强制阻止 EOS token 被采样（用于 min_new_tokens 逻辑，与 Python generate_chunk 对齐）
-llama_token sample_tts_token(struct common_sampler * smpl, struct omni_context * ctx_omni, common_params* params, int * n_past_tts, const std::vector<llama_token> * all_generated_tokens = nullptr, const std::vector<llama_token> * chunk_generated_tokens = nullptr, int token_index_in_chunk = 0, bool force_no_eos = false);
+llama_token sample_tts_token(struct common_sampler * smpl, struct omni_context * ctx_omni, common_params* params, int * n_past_tts, const std::vector<llama_token> * all_generated_tokens = nullptr, const std::vector<llama_token> * chunk_generated_tokens = nullptr, int token_index_in_chunk = 0, bool force_no_eos = false, bool is_final_text_chunk = false);
 
 // Projector 函数声明（精度验证版本）
 bool projector_init(projector_model & model, const std::string & fname, bool use_cuda);

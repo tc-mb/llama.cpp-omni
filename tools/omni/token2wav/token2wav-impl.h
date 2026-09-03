@@ -2190,6 +2190,13 @@ void fade_in_out_b1(std::vector<float> &       wave_inout,
                     const std::vector<float> & window_2n,
                     int64_t                    n);
 
+// Match StepAudio2's first non-final streaming chunk handling: prepend one
+// source-cache of silence after trimming the unavailable right context.
+void trim_stream_wave_b1(std::vector<float> & wave_inout,
+                         bool                is_first,
+                         bool                is_final,
+                         int64_t             cache_len);
+
 }  // namespace token2wav_utils
 
 class Token2Wav {
@@ -2276,6 +2283,25 @@ struct Token2WavSession {
                                  int                 n_timesteps         = 10,
                                  float               temperature         = 1.0f,
                                  const std::string & coreml_model_path  = "");
+
+    // Prepare a PromptBundle from a reference WAV with the native GGUF
+    // frontend, then install it into the existing Token2Wav stream.
+    bool set_prompt_wav(const std::string & ref_wav_path,
+                        const std::string & speech_tokenizer_gguf,
+                        const std::string & campplus_gguf,
+                        int                 frontend_threads = 1,
+                        int                 n_timesteps       = 10,
+                        float               temperature       = 1.0f);
+
+    // Restore the static voice cache without reloading model weights.
+    bool reset_to_prompt_cache_gguf(const std::string & prompt_cache_gguf_path,
+                                    int                 n_timesteps = 10,
+                                    float               temperature = 1.0f);
+
+    // Restore a precomputed prompt bundle without reloading model weights.
+    bool reset_to_prompt_bundle(const std::string & prompt_bundle_dir,
+                                int                 n_timesteps = 10,
+                                float               temperature = 1.0f);
 
     bool feed_tokens(const int32_t * tokens, int64_t n_tokens, bool is_final, std::vector<float> & wave_bt_out);
 
