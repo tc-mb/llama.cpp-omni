@@ -24,6 +24,7 @@
 
 # IDE / OS
 
+/.clangd
 /.cache/
 /.ccls-cache/
 /.direnv/
@@ -46,6 +47,7 @@
 /build*
 /release
 /debug
+/compile_commands.json
 /libllama.so
 /llama-*
 /vulkan-shaders-gen

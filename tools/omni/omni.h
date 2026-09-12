@@ -1,5 +1,6 @@
 #include "ggml.h"
 #include "llama.h"
+#include "omni-perf.h"
 #include "tts-condition-graph.h"
 
 #include <thread>
@@ -77,6 +78,7 @@ struct T2WOut {
     bool is_final = false;  // Whether this is the final chunk (turn end)
     bool is_chunk_end = false;  // Whether this is the end of a TTS chunk (flush buffer, but not final)
     int round_idx = -1;  // 🔧 [修复目录同步] 轮次索引，由 TTS 线程设置，T2W 线程使用此值确定输出目录
+    int perf_chunk_index = -1;  // 性能日志归属的输入 chunk，随队列数据传递避免异步错归属
     std::chrono::steady_clock::time_point enqueue_time = std::chrono::steady_clock::now();
 };
 
@@ -418,6 +420,7 @@ struct omni_context {
     
     // Timestamp for stream_decode start (used for WAV file naming)
     std::chrono::high_resolution_clock::time_point stream_decode_start_time;
+    OmniPerfState perf;
     
     // C++ Token2Wav session for audio synthesis
     std::unique_ptr<omni::flow::Token2WavSession> token2wav_session;
