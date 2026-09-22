@@ -158,7 +158,24 @@ struct projector_model {
 // ============================================================================
 using audio_output_cb_t = std::function<void(const float * samples, int n_samples, int sample_rate, bool is_final)>;
 
+// Optional synchronous diagnostics for sampled decode steps. All pointers are
+// borrowed and valid only during the callback. Observers must copy retained data
+// and must not mutate/re-enter the context or throw. Install/remove only while
+// the context is idle. n_past is a KV position, not a stable event identifier.
+enum class omni_decode_phase { raw_logits, adjusted_logits, sampled };
+struct omni_decode_observation {
+    omni_decode_phase phase;
+    int n_past;                      // position before this sampled token
+    const float * logits = nullptr;
+    int n_vocab = 0;
+    llama_token token = -1;           // populated after sampling, before evaluation
+};
+using omni_decode_observer_t = std::function<void(const omni_decode_observation &)>;
+
 struct omni_context {
+    // Disabled by default. adjusted_logits precedes the sampler chain; it is
+    // not the final top-k/top-p/temperature-adjusted sampling distribution.
+    omni_decode_observer_t decode_observer = nullptr;
     struct vision_ctx * ctx_vision = NULL;
     struct audition_ctx * ctx_audio = NULL;
     
