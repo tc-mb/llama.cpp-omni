@@ -580,3 +580,15 @@ loop every ~1000ms:
     POST /v1/stream/decode   → consume SSE → play WAV files from output_dir
     N++
 ```
+
+---
+
+## Contributing
+
+We welcome contributions. Start with the **[contributing guide](docs/contributing/README.md)**,
+which links to the community task list grouped by difficulty, plus good first issues
+and open research areas.
+
+If you want to pick something up, comment on the linked issue before writing code.
+For anything beyond a trivial fix we would rather agree on the approach first than
+review a large pull request that goes the wrong way.

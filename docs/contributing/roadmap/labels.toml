@@ -1,0 +1,274 @@
+# 标签定义 -- 单一来源
+#
+# 用途：新机器 / 新仓库 fork 之后，用这份定义把标签一次补齐。
+#     python3 scripts/roadmap/apply-labels.py            # dry-run，只打印
+#     python3 scripts/roadmap/apply-labels.py --apply    # 实际创建
+#
+# 默认只创建"缺失"的标签，不会覆盖已存在标签的颜色和描述。
+# 要强制更新已有标签，加 --update-existing。
+#
+# 背景：标签存在仓库设置里，不在 git 里，所以 fork 不会带过来。
+# 结果是 .github/ 下的模板和 close-issue.yml 引用了一批从来就不存在的标签，
+# 而 GitHub 对不存在的标签是"静默跳过、不报错"。
+# 详见 docs/contributing/roadmap/README.md 与仓库 issue 讨论。
+#
+# 字段：
+#     name        必填  标签名（必须与 .github/ 下引用完全一致，含空格与 emoji）
+#     color       必填  6 位十六进制，不带 '#'
+#     description 必填  标签描述，会显示在 GitHub UI 上
+#     group       必填  分组，便于人工核对
+#     why         必填  为什么需要这个标签。写不出 why 的标签就不要加。
+
+
+# ---------------------------------------------------------------------------
+# 第 1 组：roadmap 机制必需
+# ---------------------------------------------------------------------------
+
+[[labels]]
+name = "roadmap"
+color = "BFDADC"
+description = "Part of the community roadmap"
+group = "roadmap"
+why = "close-issue.yml 的 stale 豁免名单里有它。没有这个标签，公开的任务清单 issue 会在 44 天后被 stale bot 自动关闭。"
+
+[[labels]]
+name = "difficulty: easy"
+color = "0E8A16"
+description = "One file, no architecture knowledge needed, can be self-tested locally"
+group = "difficulty"
+why = "任务清单的四级难度刻度之一。判据见 docs/contributing/roadmap/README.md 第 5 节。"
+
+[[labels]]
+name = "difficulty: medium"
+color = "FBCA04"
+description = "Needs one submodule understood, touches 2-3 files, may need a model run to verify"
+group = "difficulty"
+why = "任务清单的四级难度刻度之一。"
+
+[[labels]]
+name = "difficulty: hard"
+color = "D93F0B"
+description = "Large but understood work: a port, a restructure, or offloading to an existing backend"
+group = "difficulty"
+why = "任务清单的四级难度刻度之一。与 expert 的区别是路径已知，只是工程量大。"
+
+[[labels]]
+name = "difficulty: expert"
+color = "8B0000"
+description = "Original development: the approach is not known yet and needs design work first"
+group = "difficulty"
+why = "任务清单的四级难度刻度之一。与 hard 的区别是没有现成答案可抄，需要先做设计、大概率要先写提案，且有走不通的风险。"
+
+
+# ---------------------------------------------------------------------------
+# 第 2 组：领域标签（本仓库已有）
+#
+# 这些标签已经存在，颜色是仓库里的实际值（多数是 GitHub 默认灰 ededed）。
+# 列在这里是为了让本文件成为标签的完整定义，apply-labels.py 会跳过它们。
+# 想让它们的颜色更易区分，改这里的 color 然后跑 --apply --update-existing。
+# 注意：改颜色是纯外观改动，不影响任何自动化行为（自动化只看名字）。
+# ---------------------------------------------------------------------------
+
+[[labels]]
+name = "server"
+color = "ededed"
+description = "HTTP server, streaming API"
+group = "domain-existing"
+why = "标签已存在。覆盖 tools/server/**，含 server-omni.cpp。labeler 与模板都在引用它。"
+
+[[labels]]
+name = "ggml"
+color = "ededed"
+description = "ggml backend and operators"
+group = "domain-existing"
+why = "标签已存在。覆盖 ggml/**。labeler 会自动打上。"
+
+[[labels]]
+name = "conversion"
+color = "ededed"
+description = "Model conversion and quantization"
+group = "domain-existing"
+why = "标签已存在。覆盖 conversion/、tools/omni/convert/、tools/omni/pyt2w/、gguf-py/。"
+
+[[labels]]
+name = "python"
+color = "ededed"
+description = "Python tooling and bindings"
+group = "domain-existing"
+why = "标签已存在。labeler 按 **/*.py 自动打上。"
+
+[[labels]]
+name = "build"
+color = "ededed"
+description = "Build system and CMake"
+group = "domain-existing"
+why = "标签已存在。labeler 按 cmake 路径自动打上。注意与 compilation 区分：build 指构建系统本身，compilation 指编译报错。"
+
+[[labels]]
+name = "documentation"
+color = "0075ca"
+description = "Improvements or additions to documentation"
+group = "domain-existing"
+why = "标签已存在。labeler 按 docs/** 与 media/** 自动打上。"
+
+[[labels]]
+name = "testing"
+color = "ededed"
+description = "Test coverage"
+group = "domain-existing"
+why = "标签已存在。labeler 按 tests/** 自动打上。"
+
+[[labels]]
+name = "examples"
+color = "ededed"
+description = "Examples"
+group = "domain-existing"
+why = "标签已存在。注意：上游 labeler 规则把 tools/** 也归到这里，导致改 tools/omni/ 的 PR 被误标为 examples，需要修正规则。"
+
+
+# ---------------------------------------------------------------------------
+# 第 3 组：领域标签（本仓库缺失，需要创建）
+#
+# 缺了它们，社区同学无法按"我想做哪一块"来筛任务 -- 而这正是任务清单的核心用途。
+# ---------------------------------------------------------------------------
+
+[[labels]]
+name = "vision"
+color = "5319E7"
+description = "Vision encoder (VPM), image slicing, image preprocessing"
+group = "domain"
+why = "覆盖 tools/omni/vision.* 与 tools/mtmd/mtmd-image.*、clip*。用 vision 而不是内部代号 VPM，因为社区会搜 vision 不会搜 VPM。"
+
+[[labels]]
+name = "audio"
+color = "1D76DB"
+description = "Audio encoder (APM), streaming audio input"
+group = "domain"
+why = "覆盖 tools/omni/audition.* 与 tools/mtmd/mtmd-audio.*。"
+
+[[labels]]
+name = "tts"
+color = "006B75"
+description = "Text-to-speech synthesis, voice cloning, prompt cache"
+group = "domain"
+why = "覆盖 tools/omni/token2wav/、tts-condition-graph.*、voxcpm2/、tools/tts/。当前用户提问最集中的领域。"
+
+[[labels]]
+name = "duplex"
+color = "6F42C1"
+description = "Full-duplex scheduling, interruption, context and session management"
+group = "domain"
+why = "全双工是本项目最核心的差异化能力，但没有对应标签，issue #88 这类任务无法被归类。"
+
+[[labels]]
+name = "model"
+color = "0969DA"
+description = "Model architecture, new module support"
+group = "domain"
+why = "覆盖 src/models/** 与 src/llama-model.cpp。上游 labeler 的 model 规则只匹配 src/models/**，且该标签在本仓库缺失。"
+
+[[labels]]
+name = "devops"
+color = "6E7781"
+description = "CI, workflows, repository automation"
+group = "domain"
+why = "覆盖 .github/ 与 ci/。上游 labeler 引用了它但本仓库没有，导致 CI 相关 PR 无法被自动归类。"
+
+[[labels]]
+name = "demo"
+color = "BFD4F2"
+description = "Python demo (OpenBMB/MiniCPM-o-Demo)"
+group = "domain"
+why = "任务清单里有若干任务改的是 demo 仓库而不是引擎本身。用独立标签把它们标出来，贡献者才不会点进去才发现仓库不对。"
+
+[[labels]]
+name = "app"
+color = "D4C5F9"
+description = "MiniCPM-V app (OpenBMB/MiniCPM-V-Apps)"
+group = "domain"
+why = "同上。App 相关的任务在另一个仓库，需要与引擎任务区分。"
+
+
+# ---------------------------------------------------------------------------
+# 第 4 组：修复失效的模板引用
+#
+# 这几个标签被 .github/ISSUE_TEMPLATE/*.yml 引用，但仓库里不存在，
+# 所以用对应模板提的 issue 一个标签都拿不到（实测 issue #114 标签为空）。
+# 注意：compilation 与 model evaluation 在上游 llama.cpp 里也不存在（404），
+# 属于上游自带的同一个 bug，不是 fork 引入的。
+# ---------------------------------------------------------------------------
+
+[[labels]]
+name = "bug-unconfirmed"
+color = "FEF2C0"
+description = "Reported bug, not yet confirmed by a maintainer"
+group = "bug-flow"
+why = "010/011/019 三个 bug 模板都引用它。用于区分\"用户报的\"和\"已确认的\"，否则 bug 队列无法分级。"
+
+[[labels]]
+name = "compilation"
+color = "D4C5F9"
+description = "Build or compilation failure"
+group = "bug-flow"
+why = "010-bug-compilation.yml 引用它。注意不要与已有的 build 标签混用：build 由 labeler 按 cmake 路径自动打，compilation 表示编译报错。"
+
+[[labels]]
+name = "model evaluation"
+color = "C5DEF5"
+description = "Model output quality, accuracy or correctness issue"
+group = "bug-flow"
+why = "011-bug-results.yml 引用它，用于把效果类问题与崩溃类问题分开。"
+
+[[labels]]
+name = "research 🔬"
+color = "43C54B"
+description = "Technical research area, not a task yet"
+group = "bug-flow"
+why = "030-research.yml 引用它，且它在 close-issue.yml 的 stale 豁免名单里。缺失导致 Research issue 会被自动关闭（issue #88 正在发生这个问题）。"
+
+[[labels]]
+name = "refactoring"
+color = "F4A25B"
+description = "Refactoring"
+group = "bug-flow"
+why = "040-refactor.yml 引用的是 'refactor'，而 close-issue.yml 豁免的是 'refactoring' -- 两个名字不一致，且都不存在。本文件统一用上游的 'refactoring'，模板需同步修改。"
+
+[[labels]]
+name = "security"
+color = "B60205"
+description = "Security issue"
+group = "bug-flow"
+why = "close-issue.yml 的 stale 豁免名单里有它。安全问题绝不能被自动关闭。"
+
+
+# ---------------------------------------------------------------------------
+# 第 5 组：贡献漏斗（这两个本仓库已有，列出仅为自文档化）
+# ---------------------------------------------------------------------------
+
+[[labels]]
+name = "good first issue"
+color = "7057FF"
+description = "Good for newcomers"
+group = "funnel"
+why = "GitHub 特殊标签，会被仓库侧栏和 github.com/explore 曝光，自建标签拿不到这个流量。难度为 easy 且对新人安全的任务应额外打上它。"
+
+[[labels]]
+name = "help wanted"
+color = "008672"
+description = "Extra attention is needed"
+group = "funnel"
+why = "标注需要人手的任务，且在 close-issue.yml 的 stale 豁免名单里。"
+
+
+# ---------------------------------------------------------------------------
+# 明确不创建的标签
+#
+# .github/labeler.yml 从上游继承了一批规则，引用了下面这些标签。它们是上游
+# llama.cpp 支持的硬件后端或方向，本项目并未声明支持。真开始支持了再建。
+#
+#   SYCL, IBM zDNN, AMD ZenDNN, OpenCL, Hexagon, WebGPU, OpenVINO   -- 硬件后端
+#   android, nix, server/ui, jinja parser, embedding                -- 上游方向
+#
+# 在这些标签不存在时，labeler 会静默跳过对应规则，PR 少一个标签而已，无害。
+# 见 docs/contributing/roadmap/README.md 第 6 节末尾关于"受众/负责人/规则"的纪律。
+# ---------------------------------------------------------------------------
