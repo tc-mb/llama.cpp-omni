@@ -311,24 +311,56 @@ def validate(tasks_doc: dict) -> list[dict]:
     return tasks
 
 
-def fetch_issue_states(repo: str, numbers: list[int]) -> dict[int, str]:
-    """Return {issue_number: state} for the given issues, using the gh CLI."""
+def fetch_issue_states(repo: str, numbers: list[int]) -> dict[int, dict]:
+    """Return per-issue live state from GitHub, keyed by issue number.
+
+    Each value is {"state": "OPEN"/"CLOSED", "assignees": [login, ...]}.
+
+    Reading assignees here is what makes claiming work without editing
+    tasks.toml: the assignment on GitHub is the source of truth, and the
+    optional 'owner' field in the file is only a fallback.
+    """
     if not numbers:
         return {}
-    states: dict[int, str] = {}
+    info: dict[int, dict] = {}
     for number in numbers:
         try:
             out = subprocess.run(
                 ["gh", "issue", "view", str(number), "--repo", repo,
-                 "--json", "state"],
+                 "--json", "state,assignees"],
                 capture_output=True, text=True, check=True,
             ).stdout
         except FileNotFoundError:
             fail("--github requires the gh CLI, which was not found on PATH")
         except subprocess.CalledProcessError as exc:
             fail(f"gh failed for issue #{number}: {exc.stderr.strip()}")
-        states[number] = json.loads(out).get("state", "OPEN")
-    return states
+        data = json.loads(out)
+        info[number] = {
+            "state": data.get("state", "OPEN"),
+            "assignees": [a["login"] for a in data.get("assignees", [])],
+        }
+    return info
+
+
+def resolve_owner(task: dict, info: dict[int, dict]) -> str | None:
+    """Pick the owner to display: GitHub assignee first, file value second.
+
+    A discrepancy means someone was assigned on GitHub after the file was last
+    written, which is the normal case. The GitHub side wins, and the difference
+    is reported so the file can be brought in line.
+    """
+    number = task.get("issue")
+    github_owner = None
+    if number is not None and number in info:
+        assignees = info[number]["assignees"]
+        if assignees:
+            github_owner = assignees[0]
+
+    file_owner = task.get("owner")
+    if github_owner and file_owner and github_owner != file_owner:
+        warn(f"warning: {task.get('id', '?')} is assigned to {github_owner} on GitHub "
+             f"but task file says {file_owner}; using the GitHub value")
+    return github_owner or file_owner
 
 
 def render(tasks: list[dict], repo: str, states: dict[int, str]) -> str:
@@ -461,11 +493,11 @@ def render(tasks: list[dict], repo: str, states: dict[int, str]) -> str:
     return "\n".join(out) + "\n"
 
 
-def render_task_line(task: dict, repo: str, states: dict[int, str],
+def render_task_line(task: dict, repo: str, states: dict[int, dict],
                      children: dict[str, list[dict]] | None = None,
                      depth: int = 0) -> str:
     number = task.get("issue")
-    if number is not None and states.get(number) == "CLOSED":
+    if number is not None and states.get(number, {}).get("state") == "CLOSED":
         box = "x"
     else:
         box = " "
@@ -484,7 +516,7 @@ def render_task_line(task: dict, repo: str, states: dict[int, str],
     parts.append(DIFFICULTY_BADGE[task["difficulty"]])
     parts.append(f"`{task['domain']}`")
 
-    owner = task.get("owner")
+    owner = resolve_owner(task, states)
     if owner:
         parts.append(f"assigned to @{owner}")
 
@@ -533,7 +565,7 @@ def main() -> int:
         warn(f"ok: {len(tasks)} tasks validated")
         return 0
 
-    states: dict[int, str] = {}
+    states: dict[int, dict] = {}
     if args.github:
         numbers = sorted({t["issue"] for t in tasks if t.get("issue")})
         try:

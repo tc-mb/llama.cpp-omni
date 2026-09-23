@@ -245,13 +245,53 @@ vLLM 的规矩值得照搬：一个标签要有**受众**、**负责人**、**�
 
 | 状态 | 谁维护 | 怎么反映到清单 |
 |------|--------|----------------|
-| 认领 | 维护者在该 issue 上设 assignee | 自动（`--github` 模式读取） |
+| 认领 | 维护者在该 issue 上设 assignee | 自动（`--github` 读取 assignee） |
 | 进行中 | PR 链接留在 issue 里 | 自动 |
 | 已完成 | 关闭该 issue | 自动渲染为 `[x]` |
 | 14 天无进展 | 维护者解除 assignee | 自动 |
 
-所以 `tasks.toml` **只在"加任务 / 删任务 / 改难度领域"时才需要改**。
-你不需要为了勾选 checkbox 去编辑任何文件。
+**`owner` 字段是回退值，不是真相源。** 渲染时的优先级是：
+
+1. **该 issue 在 GitHub 上的 assignee**（如果读了 `--github`）
+2. `tasks.toml` 里的 `owner` 字段
+
+两者不一致时以 GitHub 为准，并打印 warning。所以**认领一个任务不需要改任何文件** —— 在
+issue 上指派即可。`owner` 字段的用途是：任务还没建 issue、但你想在清单里先标记归属。
+
+### 7.1 什么情况下需要改文件
+
+| 场景 | 要改文件吗 |
+|------|-----------|
+| 有人认领了任务（issue 已存在） | ✗ 在 GitHub 上设 assignee 就行 |
+| 任务做完了 | ✗ 关闭对应的 issue 就行 |
+| 认领者跑了，解除指派 | ✗ 在 GitHub 上移除 assignee |
+| 加一个新任务 | ✓ 追加 `[[tasks]]` |
+| 删掉一个已无意义的任务 | ✓ 删条目（ID 不复用） |
+| 改难度或领域 | ✓ 改 `difficulty` / `domain` |
+| 把种子任务升格为真 issue | ✓ 补 `issue = NNN` 字段 |
+| 换一个 PR / 补 PR 链接 | ✗ 留在 issue 讨论区里 |
+
+所以 `tasks.toml` **只在"任务本身增删改"时才动**；日常的认领、完成、回收都不碰文件。
+
+### 7.2 更新清单的操作
+
+改完 `tasks.toml` 后，同一条 issue 会被**原地更新**（不会新建）：
+
+```bash
+python3 scripts/roadmap/sync-issue.py           # dry run，确认找到的是同一条 issue
+python3 scripts/roadmap/sync-issue.py --apply   # 覆盖 issue 正文
+```
+
+`sync-issue.py` 按**标题精确匹配**找已存在的 issue，找到就编辑、找不到才新建。
+所以重复运行是安全的、幂等的，不会产生重复 issue。
+
+如果只想看渲染结果、不想联网：
+
+```bash
+python3 scripts/roadmap/render.py                       # 打印到 stdout
+python3 scripts/roadmap/render.py --github              # 带上线上状态（复选框、assignee）
+python3 scripts/roadmap/render.py --out /tmp/body.md    # 写到文件
+```
 
 **重要**：往 `tasks.toml` 里加 `issue = NNN` 之前，确认该 issue 已存在并且**不是** `roadmap`
 issue 自身。

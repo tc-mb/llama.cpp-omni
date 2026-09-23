@@ -100,7 +100,7 @@ def main() -> int:
         warn(f"error: {exc}")
         return 1
 
-    states: dict[int, str] = {}
+    states: dict[int, dict] = {}
     numbers = sorted({t["issue"] for t in tasks if t.get("issue")})
     if numbers:
         try:
