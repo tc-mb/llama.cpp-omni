@@ -47,9 +47,9 @@ LABELS_FILE = ROADMAP_DIR / "labels.toml"
 
 ISSUE_TITLE = "[Roadmap] Community task list"
 
-# The community chats on the OpenBMB Discord server. Kept here rather than
-# inline so the channel can be changed in one place.
-DISCORD_URL = "https://discord.com/invite/7q3ry8Ny8K"
+# The community chats on the project's own Discord server. Kept here rather
+# than inline so the invite can be changed in one place.
+DISCORD_URL = "https://discord.com/invite/eYBZhN9SG"
 
 DIFFICULTIES = ("easy", "medium", "hard", "expert")
 

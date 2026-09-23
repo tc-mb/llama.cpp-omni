@@ -79,7 +79,7 @@ We keep a simple split: **chat is for talking, GitHub is for deciding.**
 | Where | Use it for |
 |-------|-----------|
 | **GitHub issues** | Claiming tasks, design discussion, decisions. **This is the only place that counts.** |
-| [**Discord**](https://discord.com/invite/7q3ry8Ny8K) | Real-time chat, quick questions, getting unstuck. We use the OpenBMB community server - look for the Omni channel. |
+| [**Discord**](https://discord.com/invite/eYBZhN9SG) | Real-time chat, quick questions, getting unstuck. This is the project's own server. |
 
 Chat is fast, but it is not searchable forever and newcomers cannot find it.
 **If a decision happens in chat, write the conclusion back into the issue.**
