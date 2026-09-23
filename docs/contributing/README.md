@@ -72,6 +72,23 @@ parked. If you are stuck, say so and we will help break it down.
 
 ---
 
+## Where to talk
+
+We keep a simple split: **chat is for talking, GitHub is for deciding.**
+
+| Where | Use it for |
+|-------|-----------|
+| **GitHub issues** | Claiming tasks, design discussion, decisions. **This is the only place that counts.** |
+| [**Discord**](https://discord.com/invite/7q3ry8Ny8K) | Real-time chat, quick questions, getting unstuck. We use the OpenBMB community server - look for the Omni channel. |
+
+Chat is fast, but it is not searchable forever and newcomers cannot find it.
+**If a decision happens in chat, write the conclusion back into the issue.**
+A decision that only lives in chat is lost.
+
+Please write in English in issues and on Discord, so everyone can follow.
+
+---
+
 ## Difficulty levels
 
 All four levels mean the same thing everywhere in this repo. The line between

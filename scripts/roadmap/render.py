@@ -47,6 +47,10 @@ LABELS_FILE = ROADMAP_DIR / "labels.toml"
 
 ISSUE_TITLE = "[Roadmap] Community task list"
 
+# The community chats on the OpenBMB Discord server. Kept here rather than
+# inline so the channel can be changed in one place.
+DISCORD_URL = "https://discord.com/invite/7q3ry8Ny8K"
+
 DIFFICULTIES = ("easy", "medium", "hard", "expert")
 
 DIFFICULTY_HEADING = {
@@ -411,6 +415,13 @@ def render(tasks: list[dict], repo: str, states: dict[int, str]) -> str:
     out.append(
         "If a task has no issue linked yet, comment on **this** issue and we will open one "
         "for it."
+    )
+    out.append("")
+    out.append(
+        f"Questions, or just want to chat? Join us on [Discord]({DISCORD_URL}). "
+        "Note that decisions belong in the issue, not in chat - see the "
+        f"[contributing guide](https://github.com/{repo}/blob/master/"
+        "docs/contributing/README.md#where-to-talk)."
     )
     out.append("")
 

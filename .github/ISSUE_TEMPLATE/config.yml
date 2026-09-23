@@ -1,11 +1,8 @@
 blank_issues_enabled: true
 contact_links:
-  - name: Got an idea?
-    url: https://github.com/ggml-org/llama.cpp/discussions/categories/ideas
-    about: Pop it there. It may then become an enhancement ticket.
-  - name: Got a question?
-    url: https://github.com/ggml-org/llama.cpp/discussions/categories/q-a
-    about: Ask a question there!
+  - name: Question or idea?
+    url: https://discord.com/invite/7q3ry8Ny8K
+    about: Ask in the Omni channel on the OpenBMB Discord. Ideas that get traction may become enhancement tickets.
   - name: Want to contribute?
     url: https://github.com/tc-mb/llama.cpp-omni/blob/master/docs/contributing/README.md
     about: Head to the contributing guide for the community task list, good first issues and open research areas
