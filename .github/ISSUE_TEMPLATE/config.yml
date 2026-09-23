@@ -7,5 +7,5 @@ contact_links:
     url: https://github.com/ggml-org/llama.cpp/discussions/categories/q-a
     about: Ask a question there!
   - name: Want to contribute?
-    url: https://github.com/ggml-org/llama.cpp/wiki/contribute
-    about: Head to the contribution guide page of the wiki for areas you can help with
+    url: https://github.com/tc-mb/llama.cpp-omni/blob/master/docs/contributing/README.md
+    about: Head to the contributing guide for the community task list, good first issues and open research areas
