@@ -288,7 +288,7 @@ int main(int argc, char ** argv) {
 
         // SSE streaming
         res.set_chunked_content_provider("text/event-stream",
-            [&](size_t, httplib::DataSink & sink) -> bool {
+            [&state, debug_dir, round_idx](size_t, httplib::DataSink & sink) -> bool {
                 // reset state
                 {
                     std::lock_guard<std::mutex> lock(state.octx->text_mtx);
@@ -338,7 +338,10 @@ int main(int argc, char ** argv) {
 
                 // send done
                 static const std::string ev_done = "data: [DONE]\n\n";
-                sink.write(ev_done.data(), ev_done.size());
+                if (!sink.write(ev_done.data(), ev_done.size())) {
+                    return false;
+                }
+                sink.done();
                 return true;
             });
     });
