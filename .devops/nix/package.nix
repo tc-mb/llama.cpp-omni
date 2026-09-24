@@ -3,6 +3,7 @@
   glibc,
   config,
   stdenv,
+  buildPackages,
   runCommand,
   cmake,
   ninja,
@@ -12,7 +13,6 @@
   blas,
   cudaPackages,
   autoAddDriverRunpath,
-  darwin,
   rocmPackages,
   vulkan-headers,
   vulkan-loader,
@@ -28,7 +28,7 @@
     ]
     && blas.meta.available,
   useCuda ? config.cudaSupport,
-  useMetalKit ? stdenv.isAarch64 && stdenv.isDarwin,
+  useMetalKit ? stdenv.hostPlatform.isAarch64 && stdenv.hostPlatform.isDarwin,
   # Increases the runtime closure size by ~700M
   useMpi ? false,
   useRocm ? config.rocmSupport,
@@ -76,20 +76,9 @@ let
     ln -s /usr/bin/xcrun $out/bin
   '';
 
-  # apple_sdk is supposed to choose sane defaults, no need to handle isAarch64
-  # separately
-  darwinBuildInputs =
-    with darwin.apple_sdk.frameworks;
-    [
-      Accelerate
-      CoreVideo
-      CoreGraphics
-    ]
-    ++ optionals useMetalKit [ MetalKit ];
-
   cudaBuildInputs = with cudaPackages; [
     cuda_cudart
-    cuda_cccl # <nv/target>
+    cccl # <nv/target>
     libcublas
   ];
 
@@ -130,7 +119,36 @@ effectiveStdenv.mkDerivation (finalAttrs: {
     src = lib.cleanSource ../../.;
   };
 
-  postPatch = ''
+  # Builds the webui locally, taking care not to require updating any sha256 hash.
+  #
+  # NOTE(llama.cpp-omni): use buildPackages.* so this also evaluates when
+  # cross-compiling (e.g. pkgsCross.mingwW64), where a target-platform `nodejs`
+  # does not exist. Upstream ggml-org/llama.cpp currently fails
+  # `nix eval .#packages.x86_64-linux.windows.drvPath` because of this.
+  webui = buildPackages.stdenvNoCC.mkDerivation {
+    pname = "webui";
+    version = llamaVersion;
+    src = lib.cleanSource ../../tools/ui;
+
+    nativeBuildInputs = [
+      buildPackages.nodejs
+      buildPackages.importNpmLock.linkNodeModulesHook
+    ];
+
+    # no sha256 required when using buildNodeModules
+    npmDeps = buildPackages.importNpmLock.buildNodeModules {
+      npmRoot = ../../tools/ui;
+      nodejs = buildPackages.nodejs;
+    };
+
+    installPhase = ''
+      LLAMA_UI_OUT_DIR=$out npm run build --offline
+    '';
+  };
+
+  postPatch = lib.optionalString useWebUi ''
+    cp -r ${finalAttrs.webui} tools/ui/dist
+    chmod -R u+w tools/ui/dist
   '';
 
   # With PR#6015 https://github.com/ggml-org/llama.cpp/pull/6015,
@@ -139,7 +157,7 @@ effectiveStdenv.mkDerivation (finalAttrs: {
   # `xcrun` is used find the path of the Metal compiler, which is varible
   # and not on $PATH
   # see https://github.com/ggml-org/llama.cpp/pull/6118 for discussion
-  __noChroot = effectiveStdenv.isDarwin && useMetalKit && precompileMetalShaders;
+  __noChroot = effectiveStdenv.hostPlatform.isDarwin && useMetalKit && precompileMetalShaders;
 
   nativeBuildInputs =
     [
@@ -154,11 +172,10 @@ effectiveStdenv.mkDerivation (finalAttrs: {
       autoAddDriverRunpath
     ]
     ++ optionals (effectiveStdenv.hostPlatform.isGnu && enableStatic) [ glibc.static ]
-    ++ optionals (effectiveStdenv.isDarwin && useMetalKit && precompileMetalShaders) [ xcrunHost ];
+    ++ optionals (effectiveStdenv.hostPlatform.isDarwin && useMetalKit && precompileMetalShaders) [ xcrunHost ];
 
   buildInputs =
-    optionals effectiveStdenv.isDarwin darwinBuildInputs
-    ++ optionals useCuda cudaBuildInputs
+    optionals useCuda cudaBuildInputs
     ++ optionals useMpi [ mpi ]
     ++ optionals useRocm rocmBuildInputs
     ++ optionals useBlas [ blas ]
@@ -218,7 +235,7 @@ effectiveStdenv.mkDerivation (finalAttrs: {
 
     # Configurations that are known to result in build failures. Can be
     # overridden by importing Nixpkgs with `allowBroken = true`.
-    broken = (useMetalKit && !effectiveStdenv.isDarwin);
+    broken = (useMetalKit && !effectiveStdenv.hostPlatform.isDarwin);
 
     description = "Inference of LLaMA model in pure C/C++${descriptionSuffix}";
     homepage = "https://github.com/ggml-org/llama.cpp/";

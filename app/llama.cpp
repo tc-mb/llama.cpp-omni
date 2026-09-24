@@ -9,7 +9,6 @@
 extern const char * LICENSES[];
 
 // visible
-int llama_server(int argc, char ** argv);
 int llama_cli(int argc, char ** argv);
 
 // hidden
@@ -35,7 +34,6 @@ struct command {
 };
 
 static const command cmds[] = {
-    {"serve",         "HTTP API server",                                    {"server"},   false, llama_server       },
     {"cli",           "Command-line interactive interface",                 {"client"},   false, llama_cli          },
     {"completion",    "Text completion",                                    {"complete"}, true,  llama_completion   },
     {"bench",         "Benchmark prompt processing and text generation",    {},           true,  llama_bench        },

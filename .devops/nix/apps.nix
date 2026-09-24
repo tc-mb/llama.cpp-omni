@@ -8,7 +8,6 @@
           binaries = [
             "llama-cli"
             "llama-embedding"
-            "llama-server"
             "llama-quantize"
           ];
           mkApp = name: {

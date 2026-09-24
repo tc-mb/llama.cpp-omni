@@ -109,10 +109,10 @@
           }
         );
 
+        # Nixpkgs 26.11 no longer supports x86_64-darwin.
         systems = [
           "aarch64-darwin"
           "aarch64-linux"
-          "x86_64-darwin" # x86_64-darwin isn't tested (and likely isn't relevant)
           "x86_64-linux"
         ];
 
@@ -128,7 +128,7 @@
           }:
           {
             # For standardised reproducible formatting with `nix fmt`
-            formatter = pkgs.nixfmt-rfc-style;
+            formatter = pkgs.nixfmt;
 
             # Unlike `.#packages`, legacyPackages may contain values of
             # arbitrary types (including nested attrsets) and may even throw
@@ -156,7 +156,7 @@
                 windows = config.legacyPackages.llamaPackagesWindows.llama-cpp;
                 python-scripts = config.legacyPackages.llamaPackages.python-scripts;
               }
-              // lib.optionalAttrs pkgs.stdenv.isLinux {
+              // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
                 cuda = config.legacyPackages.llamaPackagesCuda.llama-cpp;
 
                 mpi-cpu = config.packages.default.override { useMpi = true; };

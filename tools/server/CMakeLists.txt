@@ -23,7 +23,7 @@ if (BUILD_SHARED_LIBS)
     set_target_properties(${TARGET} PROPERTIES POSITION_INDEPENDENT_CODE ON)
 endif()
 
-target_include_directories(${TARGET} PRIVATE ../mtmd)
+target_include_directories(${TARGET} PUBLIC ../mtmd)
 target_include_directories(${TARGET} PRIVATE ../omni)
 target_include_directories(${TARGET} PRIVATE ../omni/voxcpm2)
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR})
