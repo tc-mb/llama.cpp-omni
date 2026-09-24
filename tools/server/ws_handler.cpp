@@ -979,9 +979,7 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
                     if (!octx->text_queue.empty()) {
                         frag = std::move(octx->text_queue.front());
                         octx->text_queue.pop_front();
-                    }
-
-                    if (octx->text_done_flag && octx->text_queue.empty()) {
+                    } else if (octx->text_done_flag) {
                         break;
                     }
                 }
@@ -1160,9 +1158,7 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
                     if (!octx->text_queue.empty()) {
                         frag = std::move(octx->text_queue.front());
                         octx->text_queue.pop_front();
-                    }
-
-                    if (octx->text_done_flag && octx->text_queue.empty()) {
+                    } else if (octx->text_done_flag) {
                         break;
                     }
                 }
