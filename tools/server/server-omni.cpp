@@ -87,6 +87,10 @@ struct omni_server_state {
 };
 
 int main(int argc, char ** argv) {
+#ifdef _WIN32
+    WSADATA wsaData;
+    WSAStartup(MAKEWORD(2, 2), &wsaData);
+#endif
     common_params params;
 
     common_init();
@@ -299,8 +303,9 @@ int main(int argc, char ** argv) {
 
                 // start decode in background thread
                 std::thread worker([&](std::string dd, int ri) {
-                    std::lock_guard<std::mutex> lock(state.octx_mutex);
-                    (void) stream_decode(state.octx, dd, ri);
+                    if (state.octx != nullptr) {
+                        (void) stream_decode(state.octx, dd, ri);
+                    }
                 }, debug_dir, round_idx);
 
                 // poll text queue
@@ -362,6 +367,17 @@ int main(int argc, char ** argv) {
         res_ok(res, {{"success", true}});
     });
 
+    // POST /v1/stream/break
+    svr.Post("/v1/stream/break", [&](const httplib::Request &, httplib::Response & res) {
+        {
+            std::lock_guard<std::mutex> lock(state.octx_mutex);
+            if (state.octx != nullptr) {
+                state.octx->break_event.store(true);
+            }
+        }
+        res_ok(res, {{"success", true}});
+    });
+
     //
     // Backend Protocol (WebSocket + HTTP unary)
     //
@@ -411,7 +427,11 @@ int main(int argc, char ** argv) {
     });
 
     // start server
-    svr.listen("0.0.0.0", params.port);
+    const char * host = params.hostname.empty() ? "0.0.0.0" : params.hostname.c_str();
+    LOG_INF("HTTP server listening on %s:%d (port=%d)...\n", host, params.port, params.port);
+    if (!svr.listen(host, params.port)) {
+        LOG_ERR("svr.listen failed on %s:%d (is_valid=%d)\n", host, params.port, (int)svr.is_valid());
+    }
 
     // cleanup
     {
@@ -422,6 +442,9 @@ int main(int argc, char ** argv) {
         }
     }
     llama_backend_free();
+#ifdef _WIN32
+    WSACleanup();
+#endif
 
     return 0;
 }
