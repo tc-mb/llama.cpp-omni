@@ -10,6 +10,7 @@
 #     3. 只追加，不重排已有条目
 #     4. title 和 title_zh 必须同时提供；note 和 note_zh 必须同时提供
 #        （校验器会强制，防止中英漂移）
+#     5. 内容只能来自维护者。新增条目前先问维护者，不要自己发明任务
 #
 # 字段说明
 #     id         必填  字符串，格式 T-NNN（至少 3 位数字，不足补零）
@@ -44,26 +45,13 @@ title = "Update and improve the README"
 title_zh = "支持修改 README 页面"
 difficulty = "easy"
 domain = "docs"
-note = "Keep it accurate and useful for newcomers: check that the documented commands still work, and fix whatever is stale."
-note_zh = "保持 README 准确、对新人有用：核对文档里的命令是否还能跑通，把过时的部分改掉。"
 
 [[tasks]]
 id = "T-002"
-title = "Add more use cases with sample inputs and expected output"
-title_zh = "添加更多用例 case"
+title = "Add more use cases and measured results"
+title_zh = "添加更多用例 case 和实测结果"
 difficulty = "easy"
 domain = "docs"
-note = "Pick a realistic scenario, run it against the shipped model, and write it up with the exact commands and the output you got."
-note_zh = "挑一个真实场景，用官方模型跑一遍，把确切命令和实际输出写成一份用例。"
-
-[[tasks]]
-id = "T-003"
-title = "Add more measured results to the docs"
-title_zh = "添加更多实测结果"
-difficulty = "easy"
-domain = "docs"
-note = "Measured numbers are only available for a couple of setups today. If you run the shipped benchmarks on your own hardware, please contribute the results and state the exact configuration."
-note_zh = "目前实测数据只覆盖少量配置。如果你在自己的硬件上跑了官方 benchmark，欢迎把结果补进来，并把配置写清楚。"
 
 [[tasks]]
 id = "T-004"
@@ -71,8 +59,8 @@ title = "Test the cpp backend demo on different platforms"
 title_zh = "测试不同平台的 cpp 后端 demo"
 difficulty = "easy"
 domain = "demo"
-note = "Cross-repo: OpenBMB/MiniCPM-o-Demo (Comni branch). This is the Python demo we provide, wired to the cpp backend. A testing task, not a fixing task - report what you find."
-note_zh = "跨仓库：OpenBMB/MiniCPM-o-Demo（Comni 分支）。就是我们提供的那个 py demo，接的是 cpp 后端。这是测试任务不是修复任务，把发现的问题报告出来即可。"
+note = "Cross-repo: OpenBMB/MiniCPM-o-Demo. The demo is the Python demo we provide."
+note_zh = "跨仓库：OpenBMB/MiniCPM-o-Demo。demo 是我们提供的 py demo。"
 
 
 # ===========================================================================
@@ -85,8 +73,8 @@ title = "Deploy the demo via the cpp backend and diagnose the audio problems"
 title_zh = "通过 cpp 部署 demo，排查音频问题"
 difficulty = "medium"
 domain = "audio"
-note = "Cross-repo: OpenBMB/MiniCPM-o-Demo (Comni branch). The audio problems are probably several distinct issues, so narrow down what actually breaks before fixing."
-note_zh = "跨仓库：OpenBMB/MiniCPM-o-Demo（Comni 分支）。音频问题可能有好几个不同原因，先定位清楚到底哪里坏了再动手。"
+note = "Cross-repo: OpenBMB/MiniCPM-o-Demo."
+note_zh = "跨仓库：OpenBMB/MiniCPM-o-Demo。"
 
 [[tasks]]
 id = "T-006"
@@ -94,8 +82,8 @@ title = "Improve the Python demo UI"
 title_zh = "优化 py demo 界面，目前不是很美观"
 difficulty = "medium"
 domain = "demo"
-note = "Cross-repo: OpenBMB/MiniCPM-o-Demo (Comni branch). Needs a concrete list of what looks wrong before starting, otherwise the scope is unbounded."
-note_zh = "跨仓库：OpenBMB/MiniCPM-o-Demo（Comni 分支）。动手前先列清楚具体哪里不好看，否则范围没法收敛。"
+note = "Cross-repo: OpenBMB/MiniCPM-o-Demo."
+note_zh = "跨仓库：OpenBMB/MiniCPM-o-Demo。"
 
 [[tasks]]
 id = "T-007"
@@ -103,8 +91,8 @@ title = "Improve the UI of the MiniCPM-V app"
 title_zh = "优化 app 界面（V 的 app）"
 difficulty = "medium"
 domain = "app"
-note = "Cross-repo: OpenBMB/MiniCPM-V-Apps. Coordinate with the app maintainers first."
-note_zh = "跨仓库：OpenBMB/MiniCPM-V-Apps。先和 app 维护者协调。"
+note = "Cross-repo: OpenBMB/MiniCPM-V-Apps."
+note_zh = "跨仓库：OpenBMB/MiniCPM-V-Apps。"
 
 [[tasks]]
 id = "T-008"
@@ -112,17 +100,17 @@ title = "Integrate omni inference into the MiniCPM-V app"
 title_zh = "将 V 的 app 整合 omni 推理"
 difficulty = "medium"
 domain = "app"
-note = "Cross-repo: OpenBMB/MiniCPM-V-Apps. Running omni on device is still heavy, so this is about talking to a local or cloud llama-omni-server rather than running the model locally."
-note_zh = "跨仓库：OpenBMB/MiniCPM-V-Apps。端上跑 omni 还有点重，所以这里指的是接入本地 api、云端 api 等方式，而不是把模型塞进端侧。"
+note = "Cross-repo: OpenBMB/MiniCPM-V-Apps. Can go through a local api or a cloud api; running omni on device is still heavy."
+note_zh = "跨仓库：OpenBMB/MiniCPM-V-Apps。可以接入本地 api、云端 api 等方式；端上跑 omni 还有点重。"
 
 [[tasks]]
 id = "T-009"
-title = "Optimize the simplex (turn-based) inference path and fold it into the demo"
+title = "Optimize the simplex (turn-based) inference and put it into the demo"
 title_zh = "将单工推理优化一下，并结合放进 demo"
 difficulty = "medium"
 domain = "duplex"
-note = "Cross-repo for the demo part: OpenBMB/MiniCPM-o-Demo (Comni branch) - the engine side is this repo. Measure where the time actually goes before optimizing."
-note_zh = "demo 那部分跨仓库（OpenBMB/MiniCPM-o-Demo，Comni 分支），引擎侧在本仓库。优化前先量清楚时间花在哪。"
+note = "The demo part is cross-repo: OpenBMB/MiniCPM-o-Demo. The engine side is this repo. Can be split into several subtasks."
+note_zh = "demo 那部分跨仓库：OpenBMB/MiniCPM-o-Demo。引擎侧在本仓库。可以拆分成多个子任务。"
 
 
 # ===========================================================================
@@ -131,12 +119,12 @@ note_zh = "demo 那部分跨仓库（OpenBMB/MiniCPM-o-Demo，Comni 分支），
 
 [[tasks]]
 id = "T-010"
-title = "Rework the app frontend - the iOS and Windows builds have poor UX and various errors"
-title_zh = "重做 app 前端（目前 iOS 和 Win 版本体验不佳，各种情况有报错）"
+title = "Rework the app frontend - the iOS and Win builds have poor UX and errors in various cases"
+title_zh = "重做 app 前端，目前 iOS 和 Win 版本使用体验不佳，各种情况有报错"
 difficulty = "hard"
 domain = "app"
-note = "Cross-repo: OpenBMB/MiniCPM-V-Apps. A frontend rewrite is a multi-week effort. The reported UX problems and the actual errors are two separate lists - separate them before starting."
-note_zh = "跨仓库：OpenBMB/MiniCPM-V-Apps。前端重做是数周级工程。体验问题和报错是两件事，开工前先分开列清楚。"
+note = "Cross-repo: OpenBMB/MiniCPM-V-Apps."
+note_zh = "跨仓库：OpenBMB/MiniCPM-V-Apps。"
 
 [[tasks]]
 id = "T-011"
@@ -144,26 +132,22 @@ title = "Sync with a new upstream llama.cpp branch and resolve the conflicts"
 title_zh = "同步上游 llama.cpp 新分支，解决冲突"
 difficulty = "hard"
 domain = "build"
-note = "The server layer has diverged structurally, so this is closer to a port than a rebase. Do not attempt it in one pull request."
-note_zh = "server 层已经结构性分叉了，所以这更接近移植而不是 rebase。不要试图在一个 PR 里做完。"
 
 [[tasks]]
 id = "T-012"
-title = "Explore the feasibility of WebGPU - can be split into smaller subtasks"
-title_zh = "探索 WebGPU 的可行性，可拆分成多个简单级别的子任务"
+title = "Explore the feasibility of WebGPU"
+title_zh = "探索 WebGPU 的可行性"
 difficulty = "hard"
 domain = "ggml"
-note = "The WebGPU backend already exists in ggml and has CI, so the open question is not whether it builds, but which parts of the omni pipeline it can carry."
-note_zh = "ggml 里 WebGPU 后端已经存在而且有 CI，所以待回答的不是「能不能编过」，而是 omni 的哪些环节能真正跑在它上面。"
+note = "Can be split into several easy subtasks."
+note_zh = "可以拆分成多个简单级别的子任务。"
 
 [[tasks]]
 id = "T-013"
-title = "Support other full-duplex streaming models"
+title = "Support other similar full-duplex streaming models"
 title_zh = "适配支持其他类似全双工流式模型"
 difficulty = "hard"
 domain = "model"
-note = "Adding an omni architecture means a new vision encoder, audio encoder, TTS head and duplex protocol together. Start from what the current architecture actually requires."
-note_zh = "新增一个 omni 架构意味着同时要接新的视觉编码器、音频编码器、TTS 头和双工协议。先从现有架构到底要求什么开始梳理。"
 
 
 # ===========================================================================
@@ -176,8 +160,6 @@ title = "Support multi-session full-duplex real-time streaming inference"
 title_zh = "支持多 session 的全双工实时流式推理"
 difficulty = "expert"
 domain = "duplex"
-note = "Original development. The server hardcodes n_parallel = 1 and documents itself as single-session, but making it multi-session means designing the whole session and KV lifecycle rather than porting a known answer. Expect to need a written proposal first."
-note_zh = "原创开发。服务端把 n_parallel 写死为 1、并明确声明自己是单会话设计；要做多会话得把整个 session 与 KV 生命周期设计出来，没有现成答案可抄。预期需要先写提案。"
 
 [[tasks]]
 id = "T-015"
@@ -185,5 +167,3 @@ title = "Better operator-level inference acceleration"
 title_zh = "更优的算子级别的推理加速"
 difficulty = "expert"
 domain = "ggml"
-note = "Original development and too broad to act on as written. Needs to be broken into concrete targets, each with a measurable baseline, before any code."
-note_zh = "原创开发，而且目前太笼统、没法直接动手。在写代码之前需要先拆成具体目标，每个目标都要有可衡量的基线。"
