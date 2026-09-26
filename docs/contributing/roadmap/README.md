@@ -45,6 +45,7 @@ tasks.toml   --(校验+渲染)-->  GitHub 置顶 issue 正文
    **如果文件里还没有任何任务，从 `T-001` 开始。**
    编号**连续递增、永不复用、永不重排**；删掉旧任务后留下的空缺不要回填。
 2. **在 `tasks.toml` 末尾追加一个 `[[tasks]]` 块**，字段见第 3 节。
+   **中英两栏要一起写**（`title` + `title_zh`，有 `note` 就配 `note_zh`）。
 3. **跑校验**：
 
    ```bash
@@ -65,9 +66,11 @@ tasks.toml   --(校验+渲染)-->  GitHub 置顶 issue 正文
 [[tasks]]
 id = "T-008"
 title = "Document the TTS voice-swap workflow end to end"
+title_zh = "把 TTS 换音色流程整理成可复现文档"
 difficulty = "medium"
 domain = "tts"
 note = "Users keep asking how to replace the C++ TTS voice. Needs a reproducible walkthrough covering prompt_cache.gguf."
+note_zh = "用户一直在问怎么替换 C++ 侧 TTS 音色。需要一份覆盖 prompt_cache.gguf 的可复现流程。"
 ```
 
 要带一个已存在的 issue 就加 `issue` 字段：
@@ -76,15 +79,18 @@ note = "Users keep asking how to replace the C++ TTS voice. Needs a reproducible
 [[tasks]]
 id = "T-009"
 title = "Investigate n_ctx sub-model scheduling for full-duplex on 24GB GPUs"
+title_zh = "调研 24GB 显存下全双工模式的 n_ctx 子模型调度"
 difficulty = "hard"
 domain = "duplex"
 issue = 88
 note = "Long-running research item. Keep the Research stage checklist in the linked issue up to date."
+note_zh = "长期研究项。记得同步更新关联 issue 里的 Research 阶段勾选。"
 ```
 
 ### 2.3 字段顺序
 
-建议固定为 `id` -> `title` -> `difficulty` -> `domain` -> `issue` -> `owner` -> `note`。
+建议固定为 `id` -> `title` -> `title_zh` -> `difficulty` -> `domain` -> `issue`
+-> `owner` -> `note` -> `note_zh`。
 顺序本身不参与校验，但固定顺序能让 diff 保持整洁、便于 review。
 
 ---
@@ -94,18 +100,21 @@ note = "Long-running research item. Keep the Research stage checklist in the lin
 | 字段 | 必填 | 类型 | 说明 |
 |------|------|------|------|
 | `id` | 是 | 字符串 | 格式 `T-NNN`（至少 3 位数字），全文件唯一，**一旦分配不可更改** |
-| `title` | 是 | 字符串 | 一句话描述，单行，不要换行符。见第 4 节的措辞规则 |
-| `difficulty` | 是 | 字符串 | 只能取 `easy` / `medium` / `hard`，定义见第 5 节 |
+| `title` | 是 | 字符串 | 英语，一句话描述，单行。见第 4 节的措辞规则 |
+| `title_zh` | 是 | 字符串 | 中文对应说法，单行。**必填**，见第 3.2 节 |
+| `difficulty` | 是 | 字符串 | 只能取 `easy` / `medium` / `hard` / `expert`，定义见第 5 节 |
 | `domain` | 是 | 字符串 | 只能取第 6 节列出的领域值 |
 | `issue` | 否 | 整数 | 已建的 GitHub issue 编号（不带 `#`）。没有就整行省略 |
 | `owner` | 否 | 字符串 | 认领者 GitHub 用户名（不带 `@`）。无人认领就整行省略 |
-| `note` | 否 | 字符串 | 补充说明：前置条件、参考文件、为什么难。单行 |
-| `umbrella` | 否 | 布尔 | `true` 表示伞形条目，下面可以挂子任务 |
+| `note` | 否 | 字符串 | 英语补充说明：前置条件、参考文件、为什么难。单行 |
+| `note_zh` | 条件必填 | 字符串 | 中文对应说明。**有 `note` 就必须有 `note_zh`** |
+| `umbrella` | 否 | 布尔 | `true` 表示伞形条目，下面可以挂子任务（当前未使用，能力保留） |
 | `parent` | 否 | 字符串 | 所属伞形条目的 ID |
 | `kind` | 否 | 字符串 | `task`（默认）/ `research`，后者渲染出 `research` 标记 |
 
-校验器会拒绝未知字段、未知枚举值、重复 ID、非法 `id` 格式，以及第 3.1 节的
-所有伞形关系违规。**如果你加了字段但校验没报错，说明校验器有 bug，请开 issue。**
+校验器会拒绝未知字段、未知枚举值、重复 ID、非法 `id` 格式、中英字段不配套，
+以及第 3.1 节的所有伞形关系违规。**如果你加了字段但校验没报错，说明校验器有
+bug，请开 issue。**
 
 ### 3.1 伞形条目与子任务
 
@@ -146,7 +155,30 @@ note = "The least entangled layers. Land this first."
 期望的用法。渲染时会额外生成一个**"Subtask by difficulty"索引**，把子任务按难度
 重新分组列出，否则挂在 hard 伞形下的 easy 子任务会从新人视野里消失。
 
-### 3.2 跨仓库任务
+### 3.2 中英双语字段
+
+`title_zh` 是**必填**的，`note_zh` 在 `note` 存在时必填。校验器会在两种情况下报错：
+
+| 情况 | 校验器行为 |
+|------|-----------|
+| 缺 `title_zh` | 报错 |
+| 有 `note` 但缺 `note_zh` | 报错 |
+| 有 `note_zh` 但缺 `note` | 报错（不允许单边） |
+| `title_zh` 里一个中文字符都没有 | **警告**（大概是误把英文粘进了中文字段） |
+
+**为什么要强制**：中英两栏只要允许单边存在，就一定会漂移 —— 改了英文忘了中文，
+或者反过来。强制成对之后，"只有一边被更新"会当场被拦住。
+
+**中文版给谁看**：中文是**维护者阅读用**的，不进公开 issue。公开 issue 一律英文。
+
+```bash
+python3 scripts/roadmap/render.py --lang zh              # 打印中文版
+python3 scripts/roadmap/render.py --lang zh --out /tmp/zh.md
+```
+
+`--lang` 默认 `en`，`sync-issue.py` 始终用英文发布。
+
+### 3.3 跨仓库任务
 
 `domain` 为 `demo` 或 `app` 的任务**不修改本仓库代码**，实际改动在
 `OpenBMB/MiniCPM-o-Demo` 或 `OpenBMB/MiniCPM-V-Apps`。
@@ -288,10 +320,13 @@ python3 scripts/roadmap/sync-issue.py --apply   # 覆盖 issue 正文
 如果只想看渲染结果、不想联网：
 
 ```bash
-python3 scripts/roadmap/render.py                       # 打印到 stdout
+python3 scripts/roadmap/render.py                       # 打印到 stdout（英文）
+python3 scripts/roadmap/render.py --lang zh             # 中文版，维护者阅读用
 python3 scripts/roadmap/render.py --github              # 带上线上状态（复选框、assignee）
 python3 scripts/roadmap/render.py --out /tmp/body.md    # 写到文件
 ```
+
+公开 issue **始终用英文**；`--lang zh` 只影响本地输出，`sync-issue.py` 不接受 `--lang`。
 
 **重要**：往 `tasks.toml` 里加 `issue = NNN` 之前，确认该 issue 已存在并且**不是** `roadmap`
 issue 自身。
@@ -349,7 +384,7 @@ python3 scripts/roadmap/sync-issue.py --apply
    先写伞形条目（umbrella = true，难度取整体难度），再写子任务（parent = 伞形 ID，
    各自独立难度）。伞形必须至少有一个子任务
 7. 按第 2.3 节的字段顺序，在 tasks.toml 末尾追加 [[tasks]] 块
-8. 把 title 和 note 翻译成英语（第 4 节）
+8. 同时写 title_zh 和 note_zh（中文用维护者原本的说法最好，不要自己意译）
 9. 运行 python3 scripts/roadmap/render.py --check
 10. 如果校验失败，按报错修正后重跑，直到通过
 11. 运行 python3 scripts/roadmap/render.py --out /tmp/roadmap-body.md
@@ -366,6 +401,9 @@ python3 scripts/roadmap/sync-issue.py --apply
 - 不要新增 `difficulty` 或 `domain` 的取值；需要新增时先改第 5/6 节并说明理由
 - 不要做多层嵌套的伞形（子任务不能再是伞形）
 - 不要在 `domain` 为 `demo` / `app` 的任务里省略实际仓库名（必须写在 note 里）
+- **不要只写一边语言**：`title_zh` 必填；有 `note` 就必须有 `note_zh`
+- **不要自己发明任务**：只把维护者明确给出的内容写进去。如果觉得缺什么，
+  先提出来问，不要直接加进文件
 
 ---
 

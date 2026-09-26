@@ -45,7 +45,7 @@ ROADMAP_DIR = REPO_ROOT / "docs" / "contributing" / "roadmap"
 TASKS_FILE = ROADMAP_DIR / "tasks.toml"
 LABELS_FILE = ROADMAP_DIR / "labels.toml"
 
-ISSUE_TITLE = "[Roadmap] Community task list"
+ISSUE_TITLE = "[Roadmap] Community task list"  # the English title; see STRINGS for other languages
 
 # The community chats on the project's own Discord server. Kept here rather
 # than inline so the invite can be changed in one place.
@@ -53,13 +53,7 @@ DISCORD_URL = "https://discord.com/invite/eYBZhN9SG"
 
 DIFFICULTIES = ("easy", "medium", "hard", "expert")
 
-DIFFICULTY_HEADING = {
-    "easy": "Easy - good for newcomers",
-    "medium": "Medium - one submodule to understand",
-    "hard": "Hard - large, but the path is known",
-    "expert": "Expert - original development, the path is not known yet",
-}
-
+# Labels are language neutral: they are what shows up on GitHub.
 DIFFICULTY_BADGE = {
     "easy": "`difficulty: easy`",
     "medium": "`difficulty: medium`",
@@ -67,17 +61,145 @@ DIFFICULTY_BADGE = {
     "expert": "`difficulty: expert`",
 }
 
-# Rendered into the issue body, in the same order as DIFFICULTIES.
-DIFFICULTY_DESCRIPTION = {
-    "easy": "One file, no architecture knowledge needed, you can verify it locally.",
-    "medium": "You need to understand one submodule. Touches 2-3 files. "
-              "May need a model run to verify.",
-    "hard": "Large but understood work: a port, a restructure, or offloading to an "
-            "existing backend. Weeks of effort, but no invention required.",
-    "expert": "Original development. The approach is not known yet, so it needs design "
-              "work and probably a written proposal before any code. Real risk of a "
-              "dead end.",
+DIFFICULTY_HEADING = {
+    "en": {
+        "easy": "Easy - good for newcomers",
+        "medium": "Medium - one submodule to understand",
+        "hard": "Hard - large, but the path is known",
+        "expert": "Expert - original development, the path is not known yet",
+    },
+    "zh": {
+        "easy": "简单 - 适合新手上手",
+        "medium": "中等 - 需要理解一个子模块",
+        "hard": "困难 - 工作量大，但路径已知",
+        "expert": "专家 - 原创开发，路径尚未确定",
+    },
 }
+
+DIFFICULTY_DESCRIPTION = {
+    "en": {
+        "easy": "One file, no architecture knowledge needed, you can verify it locally.",
+        "medium": "You need to understand one submodule. Touches 2-3 files. "
+                  "May need a model run to verify.",
+        "hard": "Large but understood work: a port, a restructure, or offloading to an "
+                "existing backend. Weeks of effort, but no invention required.",
+        "expert": "Original development. The approach is not known yet, so it needs design "
+                  "work and probably a written proposal before any code. Real risk of a "
+                  "dead end.",
+    },
+    "zh": {
+        "easy": "只碰一个文件；不需要架构知识；本地就能自测。",
+        "medium": "需要理解一个子模块；改动跨 2-3 个文件；可能要跑一次模型验证。",
+        "hard": "工作量大但路径已知：移植、重构、或搬到已有后端。需要数周投入，但不需要发明东西。",
+        "expert": "原创开发：方法尚未确定，需要先做设计、大概率要先写提案，而且有走不通的风险。",
+    },
+}
+
+# UI strings for the rendered issue body.
+STRINGS = {
+    "en": {
+        "issue_title": "[Roadmap] Community task list",
+        "generated": (
+            "> **Generated file - do not edit this description.** "
+            "It is rendered from [`docs/contributing/roadmap/tasks.toml`]"
+            "(https://github.com/{repo}/blob/master/docs/contributing/roadmap/tasks.toml) "
+            "and any manual edit here is overwritten on the next sync."
+        ),
+        "intro": "A list of things we want to get done, sorted by difficulty. "
+                 "If you want to work on something, claim it in the comments.",
+        "claim_heading": "## How to claim a task",
+        "claim_steps": [
+            "Comment on **the issue linked next to the task** saying how you plan to approach it.",
+            "A maintainer assigns it to you and the task moves to `owner` in the list below.",
+            "Open a pull request and link it in that issue.",
+        ],
+        "claim_warning": "**Please talk to us before writing code.** For anything above `easy`, "
+                         "we would rather agree on the approach first than review a large pull "
+                         "request that goes the wrong way.",
+        "claim_recycle": "**Tasks are recycled after 14 days of no progress.** If there is no "
+                         "pull request or draft pull request within 14 days of claiming, we "
+                         "release the assignment and the task goes back to the list. This is not "
+                         "a penalty - it just keeps tasks from being parked indefinitely. Tell us "
+                         "if you are stuck and we will help break it down.",
+        "no_issue_yet": "If a task has no issue linked yet, comment on **this** issue and we "
+                        "will open one for it.",
+        "discord": "Questions, or just want to chat? Join us on [Discord]({discord}). Note that "
+                   "decisions belong in the issue, not in chat - see the "
+                   "[contributing guide](https://github.com/{repo}/blob/master/"
+                   "docs/contributing/README.md#where-to-talk).",
+        "difficulty_heading": "## Difficulty",
+        "difficulty_table_head": "| Level | What it means |",
+        "level_name": {"easy": "Easy", "medium": "Medium", "hard": "Hard", "expert": "Expert"},
+        "empty": "_The list is empty right now. Tasks will appear here as they are triaged._",
+        "summary": "Currently {summary} top-level items{extra}",
+        "level_count": "**{n} {word}**",
+        "joiner": ", ",
+        "summary_subtasks": ", plus **{n}** subtasks.",
+        "summary_end": ".",
+        "level_word": {"easy": "easy", "medium": "medium", "hard": "hard", "expert": "expert"},
+        "nothing_here": "_Nothing here right now - check back after the next triage pass._",
+        "subtasks_heading": "## Subtasks by difficulty",
+        "subtasks_intro": "_The same subtasks listed above under their umbrella, regrouped by "
+                          "difficulty so the small ones are easy to find._",
+        "part_of": "part of",
+        "umbrella": "umbrella, {n} subtask(s)",
+        "no_issue": "_no issue yet_",
+        "assigned": "assigned to @{owner}",
+        "maint_summary": "Task list format for maintainers",
+        "maint_body": "Tasks live in `docs/contributing/roadmap/tasks.toml`. To add one, append "
+                      "a `[[tasks]]` block, then run:",
+        "maint_footer": "See `docs/contributing/roadmap/README.md` for the full spec.",
+    },
+    "zh": {
+        "issue_title": "[路线图] 社区任务清单",
+        "generated": (
+            "> **这是生成文件，请勿直接编辑正文。** "
+            "内容由 [`docs/contributing/roadmap/tasks.toml`]"
+            "(https://github.com/{repo}/blob/master/docs/contributing/roadmap/tasks.toml) "
+            "渲染而来，任何手工修改都会在下次同步时被覆盖。"
+        ),
+        "intro": "这里列出我们想做的事情，按难度分组。想认领某一条，在评论里说一声。",
+        "claim_heading": "## 怎么认领",
+        "claim_steps": [
+            "在任务旁边链接的 **那个 issue** 下留言，说明你打算怎么做。",
+            "维护者会指派给你，任务会带上认领人。",
+            "提交 pull request，并把链接贴到那个 issue 里。",
+        ],
+        "claim_warning": "**动手写代码前请先和我们聊一下。** 对 `easy` 以上的任务，我们更希望先对齐方案，"
+                         "而不是 review 一个方向跑偏的大 PR。",
+        "claim_recycle": "**14 天没有进展的任务会被回收。** 认领后 14 天内没有 PR 或 draft PR，"
+                         "我们会解除指派，任务回到清单里。这不是惩罚，只是避免任务被占着不动。"
+                         "卡住了随时说，我们帮你拆小。",
+        "no_issue_yet": "如果某个任务还没有对应的 issue，在 **本条** issue 下留言，我们会开一个。",
+        "discord": "有问题，或者只是想聊聊？来 [Discord]({discord})。注意：结论要写回 issue，"
+                   "不要只留在聊天里 —— 见"
+                   "[贡献指南](https://github.com/{repo}/blob/master/"
+                   "docs/contributing/README.md#where-to-talk)。",
+        "difficulty_heading": "## 难度",
+        "difficulty_table_head": "| 等级 | 含义 |",
+        "level_name": {"easy": "简单", "medium": "中等", "hard": "困难", "expert": "专家"},
+        "empty": "_清单目前是空的。任务会在梳理后出现在这里。_",
+        "summary": "当前顶层任务：{summary}{extra}",
+        "level_count": "**{n} 个{word}**",
+        "joiner": "、",
+        "summary_subtasks": "，另有 **{n}** 个子任务。",
+        "summary_end": "。",
+        "level_word": {"easy": "简单", "medium": "中等", "hard": "困难", "expert": "专家"},
+        "nothing_here": "_这里暂时没有内容，等下一次梳理后再看。_",
+        "subtasks_heading": "## 按难度重排的子任务",
+        "subtasks_intro": "_上面挂在各自伞形条目下的子任务，这里按难度重新分组，方便找到小任务。_",
+        "part_of": "属于",
+        "umbrella": "伞形条目，{n} 个子任务",
+        "no_issue": "_暂无 issue_",
+        "assigned": "已指派给 @{owner}",
+        "maint_summary": "任务清单格式（维护者用）",
+        "maint_body": "任务数据在 `docs/contributing/roadmap/tasks.toml`。新增一条就追加一个 "
+                      "`[[tasks]]` 块，然后运行：",
+        "maint_footer": "完整规范见 `docs/contributing/roadmap/README.md`。",
+    },
+}
+
+LANGS = tuple(STRINGS)
 
 # domain -> label that must exist in labels.toml
 DOMAIN_LABELS = {
@@ -97,8 +219,8 @@ DOMAIN_LABELS = {
     "app": "app",
 }
 
-REQUIRED_FIELDS = ("id", "title", "difficulty", "domain")
-OPTIONAL_FIELDS = ("issue", "owner", "note", "parent", "umbrella", "kind")
+REQUIRED_FIELDS = ("id", "title", "title_zh", "difficulty", "domain")
+OPTIONAL_FIELDS = ("issue", "owner", "note", "note_zh", "parent", "umbrella", "kind")
 ALLOWED_FIELDS = frozenset(REQUIRED_FIELDS + OPTIONAL_FIELDS)
 
 KINDS = ("task", "research")
@@ -247,6 +369,11 @@ def validate(tasks_doc: dict) -> list[dict]:
 
         if "\n" in task["title"]:
             fail(f"{where}: 'title' must be a single line")
+        if "\n" in task["title_zh"]:
+            fail(f"{where}: 'title_zh' must be a single line")
+        if not any("\u4e00" <= ch <= "\u9fff" for ch in task["title_zh"]):
+            warn(f"warning: {task_id}: 'title_zh' contains no Chinese characters. "
+                 "Did the English title get pasted into the Chinese field?")
 
         if task["difficulty"] not in DIFFICULTIES:
             fail(f"{where}: 'difficulty' must be one of {list(DIFFICULTIES)}, "
@@ -283,6 +410,19 @@ def validate(tasks_doc: dict) -> list[dict]:
                 fail(f"{where}: 'note' must be a non-empty string when present")
             if "\n" in note:
                 fail(f"{where}: 'note' must be a single line")
+
+        note_zh = task.get("note_zh")
+        if note is not None and note_zh is None:
+            fail(f"{where}: 'note' is set, so 'note_zh' is required too. "
+                 "The two must be kept in sync.")
+        if note is None and note_zh is not None:
+            fail(f"{where}: 'note_zh' is set but 'note' is not. "
+                 "Provide both or neither.")
+        if note_zh is not None:
+            if not isinstance(note_zh, str) or not note_zh.strip():
+                fail(f"{where}: 'note_zh' must be a non-empty string when present")
+            if "\n" in note_zh:
+                fail(f"{where}: 'note_zh' must be a single line")
 
         umbrella = task.get("umbrella")
         if umbrella is not None and not isinstance(umbrella, bool):
@@ -367,7 +507,9 @@ def resolve_owner(task: dict, info: dict[int, dict]) -> str | None:
     return github_owner or file_owner
 
 
-def render(tasks: list[dict], repo: str, states: dict[int, str]) -> str:
+def render(tasks: list[dict], repo: str, states: dict[int, dict],
+           lang: str = "en") -> str:
+    s = STRINGS[lang]
     top_level = [t for t in tasks if not t.get("parent")]
     children: dict[str, list[dict]] = {}
     for task in tasks:
@@ -379,117 +521,87 @@ def render(tasks: list[dict], repo: str, states: dict[int, str]) -> str:
         counts[task["difficulty"]] += 1
 
     out: list[str] = []
-    out.append(f"# {ISSUE_TITLE}")
+    out.append(f"# {s['issue_title']}")
     out.append("")
-    out.append(
-        "> **Generated file - do not edit this description.** "
-        f"It is rendered from [`docs/contributing/roadmap/tasks.toml`]"
-        f"(https://github.com/{repo}/blob/master/docs/contributing/roadmap/tasks.toml) "
-        "and any manual edit here is overwritten on the next sync."
-    )
+    out.append(s["generated"].format(repo=repo))
     out.append("")
-    out.append(
-        "A list of things we want to get done, sorted by difficulty. "
-        "If you want to work on something, claim it in the comments."
-    )
+    out.append(s["intro"])
     out.append("")
 
-    out.append("## How to claim a task")
+    out.append(s["claim_heading"])
     out.append("")
-    out.append("1. Comment on **the issue linked next to the task** saying how you plan to approach it.")
-    out.append("2. A maintainer assigns it to you and the task moves to `owner` in the list below.")
-    out.append("3. Open a pull request and link it in that issue.")
+    for index, step in enumerate(s["claim_steps"], start=1):
+        out.append(f"{index}. {step}")
     out.append("")
-    out.append(
-        "**Please talk to us before writing code.** For anything above `easy`, we would rather "
-        "agree on the approach first than review a large pull request that goes the wrong way."
-    )
+    out.append(s["claim_warning"])
     out.append("")
-    out.append(
-        "**Tasks are recycled after 14 days of no progress.** If there is no pull request or "
-        "draft pull request within 14 days of claiming, we release the assignment and the task "
-        "goes back to the list. This is not a penalty - it just keeps tasks from being parked "
-        "indefinitely. Tell us if you are stuck and we will help break it down."
-    )
+    out.append(s["claim_recycle"])
     out.append("")
-    out.append(
-        "If a task has no issue linked yet, comment on **this** issue and we will open one "
-        "for it."
-    )
+    out.append(s["no_issue_yet"])
     out.append("")
-    out.append(
-        f"Questions, or just want to chat? Join us on [Discord]({DISCORD_URL}). "
-        "Note that decisions belong in the issue, not in chat - see the "
-        f"[contributing guide](https://github.com/{repo}/blob/master/"
-        "docs/contributing/README.md#where-to-talk)."
-    )
+    out.append(s["discord"].format(discord=DISCORD_URL, repo=repo))
     out.append("")
 
-    out.append("## Difficulty")
+    out.append(s["difficulty_heading"])
     out.append("")
-    out.append("| Level | What it means |")
+    out.append(s["difficulty_table_head"])
     out.append("|-------|---------------|")
     for level in DIFFICULTIES:
-        out.append(f"| {level.capitalize()} | {DIFFICULTY_DESCRIPTION[level]} |")
+        out.append(f"| {s['level_name'][level]} | {DIFFICULTY_DESCRIPTION[lang][level]} |")
     out.append("")
 
     if not top_level:
-        out.append(
-            "_The list is empty right now. Tasks will appear here as they are triaged._"
-        )
+        out.append(s["empty"])
         out.append("")
     else:
-        summary = ", ".join(f"**{counts[level]} {level}**" for level in DIFFICULTIES)
-        out.append(
-            f"Currently {summary} top-level items"
-            + (f", plus **{len(tasks) - len(top_level)}** subtasks." if children else ".")
+        summary = s["joiner"].join(
+            s["level_count"].format(n=counts[level], word=s["level_word"][level])
+            for level in DIFFICULTIES
         )
+        extra = (s["summary_subtasks"].format(n=len(tasks) - len(top_level))
+                 if children else s["summary_end"])
+        out.append(s["summary"].format(summary=summary, extra=extra))
         out.append("")
 
     for level in DIFFICULTIES:
         grouped = [t for t in top_level if t["difficulty"] == level]
         if not grouped and not top_level:
             continue
-        out.append(f"## {DIFFICULTY_HEADING[level]} ({len(grouped)})")
+        out.append(f"## {DIFFICULTY_HEADING[lang][level]} ({len(grouped)})")
         out.append("")
         if not grouped:
-            out.append("_Nothing here right now - check back after the next triage pass._")
+            out.append(s["nothing_here"])
             out.append("")
             continue
         for task in grouped:
-            out.append(render_task_line(task, repo, states, children))
+            out.append(render_task_line(task, repo, states, children, lang=lang))
         out.append("")
 
     if children:
-        out.append("## Subtasks by difficulty")
+        out.append(s["subtasks_heading"])
         out.append("")
-        out.append(
-            "_The same subtasks listed above under their umbrella, regrouped by "
-            "difficulty so the small ones are easy to find._"
-        )
+        out.append(s["subtasks_intro"])
         out.append("")
         for level in DIFFICULTIES:
             in_level = [t for t in tasks if t.get("parent")
                         and t["difficulty"] == level]
             if not in_level:
                 continue
-            out.append(f"**{level.capitalize()}**")
+            out.append(f"**{s['level_name'][level]}**")
             out.append("")
             for task in in_level:
                 parent = task["parent"]
                 number = task.get("issue")
                 link = (f" [#{number}](https://github.com/{repo}/issues/{number})"
                         if number is not None else "")
-                out.append(f"- **{task['id']}** {task['title']}{link} - part of `{parent}`")
+                out.append(f"- **{task['id']}** {localized(task, 'title', lang)}{link}"
+                           f" - {s['part_of']} `{parent}`")
             out.append("")
 
     out.append("<details>")
-    out.append("<summary>Task list format for maintainers</summary>")
+    out.append(f"<summary>{s['maint_summary']}</summary>")
     out.append("")
-    out.append(
-        "Tasks live in `docs/contributing/roadmap/tasks.toml`. To add one, append a "
-        "`[[tasks]]` block, then run:"
-    )
+    out.append(s["maint_body"])
     out.append("")
     out.append("```bash")
     out.append("python3 scripts/roadmap/render.py --check")
@@ -497,16 +609,28 @@ def render(tasks: list[dict], repo: str, states: dict[int, str]) -> str:
     out.append("python3 scripts/roadmap/sync-issue.py --apply  # publish")
     out.append("```")
     out.append("")
-    out.append("See `docs/contributing/roadmap/README.md` for the full spec.")
+    out.append(s["maint_footer"])
     out.append("")
     out.append("</details>")
 
     return "\n".join(out) + "\n"
 
 
+def localized(task: dict, field: str, lang: str) -> str:
+    """Return the field in the requested language, falling back to English.
+
+    The validator guarantees the _zh variant exists for every task, so the
+    fallback only matters for tasks written before the field was introduced.
+    """
+    if lang == "en":
+        return task[field]
+    return task.get(f"{field}_zh") or task[field]
+
+
 def render_task_line(task: dict, repo: str, states: dict[int, dict],
                      children: dict[str, list[dict]] | None = None,
-                     depth: int = 0) -> str:
+                     depth: int = 0, lang: str = "en") -> str:
+    s = STRINGS[lang]
     number = task.get("issue")
     if number is not None and states.get(number, {}).get("state") == "CLOSED":
         box = "x"
@@ -514,7 +638,7 @@ def render_task_line(task: dict, repo: str, states: dict[int, dict],
         box = " "
 
     indent = "  " * depth
-    parts = [f"{indent}- [{box}] **{task['id']}** {task['title']}"]
+    parts = [f"{indent}- [{box}] **{task['id']}** {localized(task, 'title', lang)}"]
 
     if task.get("kind") == "research":
         parts.append("`research`")
@@ -522,28 +646,28 @@ def render_task_line(task: dict, repo: str, states: dict[int, dict],
     if number is not None:
         parts.append(f"[#{number}](https://github.com/{repo}/issues/{number})")
     elif depth == 0:
-        parts.append("_no issue yet_")
+        parts.append(s["no_issue"])
 
     parts.append(DIFFICULTY_BADGE[task["difficulty"]])
     parts.append(f"`{task['domain']}`")
 
     owner = resolve_owner(task, states)
     if owner:
-        parts.append(f"assigned to @{owner}")
+        parts.append(s["assigned"].format(owner=owner))
 
     kids = (children or {}).get(task["id"], [])
     if kids:
-        parts.append(f"_(umbrella, {len(kids)} subtask{'s' if len(kids) != 1 else ''})_")
+        parts.append(f"_({s['umbrella'].format(n=len(kids))})_")
 
     line = " - ".join(parts)
 
-    note = task.get("note")
+    note = localized(task, "note", lang) if task.get("note") else None
     if note:
         line += f"\n{indent}  <br/>_{note}_"
 
     if kids:
         for child in kids:
-            line += "\n" + render_task_line(child, repo, states, None, depth + 1)
+            line += "\n" + render_task_line(child, repo, states, None, depth + 1, lang)
 
     return line
 
@@ -559,6 +683,8 @@ def main() -> int:
                         help="read live issue state via the gh CLI so closed tasks render as done")
     parser.add_argument("--repo", default="tc-mb/llama.cpp-omni",
                         help="repository used for issue links and queries")
+    parser.add_argument("--lang", default="en", choices=LANGS,
+                        help="language of the rendered output (the public issue is always en)")
     parser.add_argument("--tasks", metavar="FILE",
                         help="override the tasks file (default: docs/contributing/roadmap/tasks.toml)")
     args = parser.parse_args()
@@ -585,11 +711,11 @@ def main() -> int:
             warn(f"error: {exc}")
             return 1
 
-    body = render(tasks, args.repo, states)
+    body = render(tasks, args.repo, states, lang=args.lang)
 
     if args.out:
         Path(args.out).write_text(body, encoding="utf-8")
-        warn(f"ok: {len(tasks)} tasks rendered to {args.out}")
+        warn(f"ok: {len(tasks)} tasks rendered ({args.lang}) to {args.out}")
     else:
         sys.stdout.write(body)
 

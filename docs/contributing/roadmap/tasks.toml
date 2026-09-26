@@ -8,11 +8,13 @@
 #     1. ID 格式 T-NNN，从 T-001 开始连续递增
 #     2. 已经分配过的 ID 永不复用、永不重排、永不修改
 #     3. 只追加，不重排已有条目
-#     4. 伞形条目（umbrella = true）必须排在它的子任务之前
+#     4. title 和 title_zh 必须同时提供；note 和 note_zh 必须同时提供
+#        （校验器会强制，防止中英漂移）
 #
 # 字段说明
 #     id         必填  字符串，格式 T-NNN（至少 3 位数字，不足补零）
 #     title      必填  字符串，英语，一句话说清"要达成什么"
+#     title_zh   必填  字符串，中文对应说法
 #     difficulty 必填  easy / medium / hard / expert
 #                       easy   = 一个文件，不需要架构知识，本地可自测
 #                       medium = 需要理解一个子模块，跨 2-3 个文件
@@ -22,7 +24,8 @@
 #                       / conversion / python / build / docs / devops / demo / app
 #     issue      可选  整数，已存在的 GitHub issue 编号（不带 #）
 #     owner      可选  字符串，认领者 GitHub 用户名（不带 @）
-#     note       可选  字符串，前置条件或补充说明
+#     note       可选  字符串，英语补充说明
+#     note_zh    必填  当 note 存在时；中文对应说明
 #     umbrella   可选  布尔，标记为伞形条目（下面可以挂子任务）
 #     parent     可选  字符串，指向所属伞形条目的 ID
 #     kind       可选  task（默认）/ research
@@ -37,31 +40,39 @@
 
 [[tasks]]
 id = "T-001"
-title = "Audit the README Quick Start against a clean clone and fix every step that no longer works"
+title = "Update and improve the README"
+title_zh = "支持修改 README 页面"
 difficulty = "easy"
 domain = "docs"
-note = "Walk the documented commands on a fresh machine and fix whatever is stale or wrong. Nothing to understand about the architecture."
+note = "Keep it accurate and useful for newcomers: check that the documented commands still work, and fix whatever is stale."
+note_zh = "保持 README 准确、对新人有用：核对文档里的命令是否还能跑通，把过时的部分改掉。"
 
 [[tasks]]
 id = "T-002"
-title = "Add more end-to-end use cases with sample inputs and expected output"
+title = "Add more use cases with sample inputs and expected output"
+title_zh = "添加更多用例 case"
 difficulty = "easy"
 domain = "docs"
 note = "Pick a realistic scenario, run it against the shipped model, and write it up with the exact commands and the output you got."
+note_zh = "挑一个真实场景，用官方模型跑一遍，把确切命令和实际输出写成一份用例。"
 
 [[tasks]]
 id = "T-003"
-title = "Add your own hardware's measured results to the benchmark tables"
+title = "Add more measured results to the docs"
+title_zh = "添加更多实测结果"
 difficulty = "easy"
 domain = "docs"
-note = "The tables currently cover RTX 4090 and M4 Max only. Run the shipped benchmark and add a row for your device, stating the exact setup."
+note = "Measured numbers are only available for a couple of setups today. If you run the shipped benchmarks on your own hardware, please contribute the results and state the exact configuration."
+note_zh = "目前实测数据只覆盖少量配置。如果你在自己的硬件上跑了官方 benchmark，欢迎把结果补进来，并把配置写清楚。"
 
 [[tasks]]
 id = "T-004"
-title = "Run the Python demo on your platform and report what breaks"
+title = "Test the cpp backend demo on different platforms"
+title_zh = "测试不同平台的 cpp 后端 demo"
 difficulty = "easy"
 domain = "demo"
-note = "Cross-repo: OpenBMB/MiniCPM-o-Demo (Comni branch). Testing task, not a fixing task. Windows and Linux coverage is thin."
+note = "Cross-repo: OpenBMB/MiniCPM-o-Demo (Comni branch). This is the Python demo we provide, wired to the cpp backend. A testing task, not a fixing task - report what you find."
+note_zh = "跨仓库：OpenBMB/MiniCPM-o-Demo（Comni 分支）。就是我们提供的那个 py demo，接的是 cpp 后端。这是测试任务不是修复任务，把发现的问题报告出来即可。"
 
 
 # ===========================================================================
@@ -70,81 +81,48 @@ note = "Cross-repo: OpenBMB/MiniCPM-o-Demo (Comni branch). Testing task, not a f
 
 [[tasks]]
 id = "T-005"
-title = "Fix layout and readability problems in the Python demo web UI"
+title = "Deploy the demo via the cpp backend and diagnose the audio problems"
+title_zh = "通过 cpp 部署 demo，排查音频问题"
 difficulty = "medium"
-domain = "demo"
-note = "Cross-repo: OpenBMB/MiniCPM-o-Demo (Comni branch). Needs a concrete list of what is wrong before starting, otherwise the scope is unbounded."
+domain = "audio"
+note = "Cross-repo: OpenBMB/MiniCPM-o-Demo (Comni branch). The audio problems are probably several distinct issues, so narrow down what actually breaks before fixing."
+note_zh = "跨仓库：OpenBMB/MiniCPM-o-Demo（Comni 分支）。音频问题可能有好几个不同原因，先定位清楚到底哪里坏了再动手。"
 
 [[tasks]]
 id = "T-006"
-title = "Fix UI problems in the MiniCPM-V app"
+title = "Improve the Python demo UI"
+title_zh = "优化 py demo 界面，目前不是很美观"
 difficulty = "medium"
-domain = "app"
-note = "Cross-repo: OpenBMB/MiniCPM-V-Apps. Coordinate with the app maintainers first."
+domain = "demo"
+note = "Cross-repo: OpenBMB/MiniCPM-o-Demo (Comni branch). Needs a concrete list of what looks wrong before starting, otherwise the scope is unbounded."
+note_zh = "跨仓库：OpenBMB/MiniCPM-o-Demo（Comni 分支）。动手前先列清楚具体哪里不好看，否则范围没法收敛。"
 
 [[tasks]]
 id = "T-007"
-title = "Fix the audio problems that show up when the demo runs against the cpp backend"
+title = "Improve the UI of the MiniCPM-V app"
+title_zh = "优化 app 界面（V 的 app）"
 difficulty = "medium"
-domain = "audio"
-umbrella = true
-note = "Umbrella. The known problems are different in nature, so they are split into subtasks. Add more subtasks as they are diagnosed."
+domain = "app"
+note = "Cross-repo: OpenBMB/MiniCPM-V-Apps. Coordinate with the app maintainers first."
+note_zh = "跨仓库：OpenBMB/MiniCPM-V-Apps。先和 app 维护者协调。"
 
 [[tasks]]
 id = "T-008"
-title = "Stop TTS playback from feeding back into the microphone prefill loop"
+title = "Integrate omni inference into the MiniCPM-V app"
+title_zh = "将 V 的 app 整合 omni 推理"
 difficulty = "medium"
-domain = "audio"
-parent = "T-007"
-note = "The README currently tells users to mute their microphone. That warning should not be necessary."
+domain = "app"
+note = "Cross-repo: OpenBMB/MiniCPM-V-Apps. Running omni on device is still heavy, so this is about talking to a local or cloud llama-omni-server rather than running the model locally."
+note_zh = "跨仓库：OpenBMB/MiniCPM-V-Apps。端上跑 omni 还有点重，所以这里指的是接入本地 api、云端 api 等方式，而不是把模型塞进端侧。"
 
 [[tasks]]
 id = "T-009"
-title = "Verify the audio format contract end to end and document it"
-difficulty = "easy"
-domain = "audio"
-parent = "T-007"
-note = "Output is documented as 24kHz WAV. Check sample rate, bit depth and channel layout at every hop and write the contract down."
-
-[[tasks]]
-id = "T-010"
-title = "Speed up the turn-based (simplex) inference path"
+title = "Optimize the simplex (turn-based) inference path and fold it into the demo"
+title_zh = "将单工推理优化一下，并结合放进 demo"
 difficulty = "medium"
 domain = "duplex"
-umbrella = true
-note = "Umbrella. This is the non-streaming path, used for single-turn request/response. Work out where the time actually goes before optimizing."
-
-[[tasks]]
-id = "T-011"
-title = "Enable prompt cache for mtmd so the turn-based path stops re-prefilling every turn"
-difficulty = "medium"
-domain = "server"
-parent = "T-010"
-note = "There is a TODO in tools/server/server.cpp saying mtmd does not support prompt cache. Confirming the real cost is the first step."
-
-[[tasks]]
-id = "T-012"
-title = "Profile the turn-based path and publish where the time goes"
-difficulty = "easy"
-domain = "duplex"
-parent = "T-010"
-note = "Needs numbers before any optimization. Reuse tools/omni/token2wav/token2wav-profile.h if it fits."
-
-[[tasks]]
-id = "T-013"
-title = "Add a client for the streaming API to the MiniCPM-V app"
-difficulty = "medium"
-domain = "app"
-umbrella = true
-note = "Cross-repo: OpenBMB/MiniCPM-V-Apps. Running omni on device is too heavy, so this is about talking to a local or remote llama-omni-server."
-
-[[tasks]]
-id = "T-014"
-title = "Document the streaming API contract for client implementers"
-difficulty = "easy"
-domain = "docs"
-parent = "T-013"
-note = "Anyone writing a client needs the request/response shapes and the ordering guarantees. The README has the endpoints but not a contract."
+note = "Cross-repo for the demo part: OpenBMB/MiniCPM-o-Demo (Comni branch) - the engine side is this repo. Measure where the time actually goes before optimizing."
+note_zh = "demo 那部分跨仓库（OpenBMB/MiniCPM-o-Demo，Comni 分支），引擎侧在本仓库。优化前先量清楚时间花在哪。"
 
 
 # ===========================================================================
@@ -152,124 +130,60 @@ note = "Anyone writing a client needs the request/response shapes and the orderi
 # ===========================================================================
 
 [[tasks]]
-id = "T-015"
-title = "Catch up the engine with upstream llama.cpp"
+id = "T-010"
+title = "Rework the app frontend - the iOS and Windows builds have poor UX and various errors"
+title_zh = "重做 app 前端（目前 iOS 和 Win 版本体验不佳，各种情况有报错）"
+difficulty = "hard"
+domain = "app"
+note = "Cross-repo: OpenBMB/MiniCPM-V-Apps. A frontend rewrite is a multi-week effort. The reported UX problems and the actual errors are two separate lists - separate them before starting."
+note_zh = "跨仓库：OpenBMB/MiniCPM-V-Apps。前端重做是数周级工程。体验问题和报错是两件事，开工前先分开列清楚。"
+
+[[tasks]]
+id = "T-011"
+title = "Sync with a new upstream llama.cpp branch and resolve the conflicts"
+title_zh = "同步上游 llama.cpp 新分支，解决冲突"
 difficulty = "hard"
 domain = "build"
-umbrella = true
-note = "Umbrella. The server layer has diverged structurally, so this is a port rather than a rebase. Do not attempt the whole thing in one pull request."
+note = "The server layer has diverged structurally, so this is closer to a port than a rebase. Do not attempt it in one pull request."
+note_zh = "server 层已经结构性分叉了，所以这更接近移植而不是 rebase。不要试图在一个 PR 里做完。"
 
 [[tasks]]
-id = "T-016"
-title = "Phase 1: catch up src/ and ggml/ with upstream"
-difficulty = "medium"
-domain = "ggml"
-parent = "T-015"
-note = "The least entangled layers. Land this first and independently so the rest has a stable base."
-
-[[tasks]]
-id = "T-017"
-title = "Phase 2: port tools/mtmd and the vision and audio encoders"
-difficulty = "hard"
-domain = "vision"
-parent = "T-015"
-note = "mtmd changes upstream frequently and the omni fork depends on it. Expect real semantic conflicts, not just textual ones."
-
-[[tasks]]
-id = "T-018"
-title = "Phase 3: restructure tools/server to match the upstream module split"
-difficulty = "hard"
-domain = "server"
-parent = "T-015"
-note = "Omni keeps the old monolithic server.cpp at ~6829 lines and layers about 3000 lines of its own files on top. Upstream split it into server-http, server-schema, server-stream and server-mcp."
-
-[[tasks]]
-id = "T-019"
-title = "Run the omni pipeline on the WebGPU backend"
+id = "T-012"
+title = "Explore the feasibility of WebGPU - can be split into smaller subtasks"
+title_zh = "探索 WebGPU 的可行性，可拆分成多个简单级别的子任务"
 difficulty = "hard"
 domain = "ggml"
-kind = "research"
-umbrella = true
-note = "The WebGPU backend already exists in ggml and has CI, so this is not a feasibility question. The open question is which parts of the omni pipeline it can actually carry."
+note = "The WebGPU backend already exists in ggml and has CI, so the open question is not whether it builds, but which parts of the omni pipeline it can carry."
+note_zh = "ggml 里 WebGPU 后端已经存在而且有 CI，所以待回答的不是「能不能编过」，而是 omni 的哪些环节能真正跑在它上面。"
 
 [[tasks]]
-id = "T-020"
-title = "Survey which operators omni needs and which the WebGPU backend implements"
-difficulty = "medium"
-domain = "ggml"
-parent = "T-019"
-kind = "research"
-note = "Do this first. The answer decides whether the rest of the umbrella is worth attempting, and how to split it."
-
-[[tasks]]
-id = "T-021"
-title = "Try the vision encoder on the WebGPU backend"
-difficulty = "hard"
-domain = "vision"
-parent = "T-019"
-kind = "research"
-note = "Most likely part of the pipeline to work, since vision is the most conventional compute. TTS vocoder and audio frontend are the risky parts."
-
-[[tasks]]
-id = "T-022"
-title = "Support additional full-duplex streaming model architectures"
+id = "T-013"
+title = "Support other full-duplex streaming models"
+title_zh = "适配支持其他类似全双工流式模型"
 difficulty = "hard"
 domain = "model"
-umbrella = true
-note = "Umbrella. Adding an omni architecture means a new vision encoder, audio encoder, TTS head and duplex protocol together."
+note = "Adding an omni architecture means a new vision encoder, audio encoder, TTS head and duplex protocol together. Start from what the current architecture actually requires."
+note_zh = "新增一个 omni 架构意味着同时要接新的视觉编码器、音频编码器、TTS 头和双工协议。先从现有架构到底要求什么开始梳理。"
+
+
+# ===========================================================================
+# Expert
+# ===========================================================================
 
 [[tasks]]
-id = "T-023"
-title = "Document the requirements a model has to meet to be duplex-capable"
-difficulty = "medium"
-domain = "docs"
-parent = "T-022"
-note = "Write this before adding a second model. It is also the answer to most questions about which models could be supported."
-
-[[tasks]]
-id = "T-024"
-title = "Support multiple concurrent full-duplex sessions"
+id = "T-014"
+title = "Support multi-session full-duplex real-time streaming inference"
+title_zh = "支持多 session 的全双工实时流式推理"
 difficulty = "expert"
 domain = "duplex"
-note = "Original development. The server hardcodes n_parallel = 1 and documents itself as single-session, but making it multi-session means designing the whole session and KV lifecycle rather than porting an existing answer. Expect to need a written proposal first. Prior capacity analysis on O4.5 and O5 exists in the Comni notes."
+note = "Original development. The server hardcodes n_parallel = 1 and documents itself as single-session, but making it multi-session means designing the whole session and KV lifecycle rather than porting a known answer. Expect to need a written proposal first."
+note_zh = "原创开发。服务端把 n_parallel 写死为 1、并明确声明自己是单会话设计；要做多会话得把整个 session 与 KV 生命周期设计出来，没有现成答案可抄。预期需要先写提案。"
 
 [[tasks]]
-id = "T-025"
-title = "Operator-level inference acceleration"
+id = "T-015"
+title = "Better operator-level inference acceleration"
+title_zh = "更优的算子级别的推理加速"
 difficulty = "expert"
 domain = "ggml"
-kind = "research"
-umbrella = true
-note = "Umbrella. Too broad as a single task. Concrete targets are added as subtasks, each with a measurable baseline."
-
-[[tasks]]
-id = "T-026"
-title = "Move the HiFiGAN vocoder off the CPU on Metal"
-difficulty = "hard"
-domain = "tts"
-parent = "T-025"
-note = "Documented at about 220ms per chunk on CPU on M4 Max, which is the largest single stage in the TTS budget there."
-
-[[tasks]]
-id = "T-027"
-title = "Speed up the Token2Mel stage on Metal"
-difficulty = "medium"
-domain = "tts"
-parent = "T-025"
-note = "Documented at about 235ms per chunk on M4 Max. Already on Metal, so this is optimization rather than offload."
-
-[[tasks]]
-id = "T-028"
-title = "Rework the MiniCPM-V app frontend"
-difficulty = "hard"
-domain = "app"
-umbrella = true
-note = "Cross-repo: OpenBMB/MiniCPM-V-Apps. A frontend rewrite is a multi-week effort, not a medium task. Coordinate with the app maintainers."
-
-[[tasks]]
-id = "T-029"
-title = "Collect and triage the current iOS and Windows app errors"
-difficulty = "easy"
-domain = "app"
-parent = "T-028"
-note = "Do this before any rewrite. The reported experience problems and the actual errors are two different lists and should be separated."
+note = "Original development and too broad to act on as written. Needs to be broken into concrete targets, each with a measurable baseline, before any code."
+note_zh = "原创开发，而且目前太笼统、没法直接动手。在写代码之前需要先拆成具体目标，每个目标都要有可衡量的基线。"
