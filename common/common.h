@@ -585,6 +585,12 @@ struct common_params {
     std::string voxcpm2_acoustic     = ""; // VoxCPM2 Acoustic GGUF path
     int         voxcpm2_n_gpu_layers = -1; // GPU layers for VoxCPM2 (-1 = all)
 
+    // Qwen3-ForcedAligner
+    std::string aligner_lm           = ""; // aligner backbone GGUF path
+    std::string aligner_audio        = ""; // aligner audio tower GGUF path
+    int         aligner_n_gpu_layers = -1; // GPU layers for the aligner (-1 = all)
+    int         aligner_n_ctx        = 4096; // aligner context size (~5 minutes of audio)
+
     // Apple Neural Engine (CoreML) support
     std::string vision_coreml_model_path     = ""; // path to CoreML .mlmodelc for vision ANE
     std::string token2wav_coreml_model_path  = ""; // path to CoreML model (.mlmodelc/.mlpackage) for token2wav DiT

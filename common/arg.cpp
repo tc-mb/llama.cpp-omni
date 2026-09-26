@@ -2663,6 +2663,34 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_VOXCPM2_N_GPU_LAYERS"));
     add_opt(common_arg(
+        {"--aligner-lm"}, "FNAME",
+        "Qwen3-ForcedAligner backbone GGUF path (default: unused)",
+        [](common_params & params, const std::string & value) {
+            params.aligner_lm = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_ALIGNER_LM"));
+    add_opt(common_arg(
+        {"--aligner-audio"}, "FNAME",
+        "Qwen3-ForcedAligner audio tower GGUF path (default: unused)",
+        [](common_params & params, const std::string & value) {
+            params.aligner_audio = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_ALIGNER_AUDIO"));
+    add_opt(common_arg(
+        {"--aligner-n-gpu-layers"}, "N",
+        "number of layers to offload to GPU for the aligner (default: -1, all)",
+        [](common_params & params, int value) {
+            params.aligner_n_gpu_layers = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_ALIGNER_N_GPU_LAYERS"));
+    add_opt(common_arg(
+        {"--aligner-ctx-size"}, "N",
+        "aligner context size (default: 4096, about 5 minutes of audio)",
+        [](common_params & params, int value) {
+            params.aligner_n_ctx = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_ALIGNER_CTX_SIZE"));
+    add_opt(common_arg(
         {"-hft", "--hf-token"}, "TOKEN",
         "Hugging Face access token (default: value from HF_TOKEN environment variable)",
         [](common_params & params, const std::string & value) {
