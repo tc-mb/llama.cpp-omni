@@ -1,0 +1,21 @@
+name: Omni performance report tests
+
+on:
+  push:
+    branches: [master]
+    paths: ['tools/omni/perf/**', '.github/workflows/omni-perf-tests.yml']
+  pull_request:
+    paths: ['tools/omni/perf/**', '.github/workflows/omni-perf-tests.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  perf-report:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - run: python -m unittest discover -s tools/omni/perf -p 'test_*.py' -v
