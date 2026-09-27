@@ -133,12 +133,32 @@ MiniCPM-o-4_5-gguf/
 
 ### Build
 
+#### Standard (CUDA / Metal / CPU)
 ```bash
 # Configure
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 
 # Build
 cmake --build build --target llama-omni-server --target llama-omni-cli -j
+```
+
+#### Windows Native with AMD ROCm / HIP (RX 6000 / 7000 / 8000)
+For complete instructions, refer to the [Windows ROCm Full Duplex Guide](docs/WINDOWS_ROCM_FULL_DUPLEX_GUIDE.md).
+```powershell
+# Extract AMD ROCm SDK (e.g. https://repo.amd.com/rocm/tarball-multi-arch/therock-dist-windows-gfx103X-all-7.14.0.tar.gz)
+$env:ROCM_PATH = "C:\path\to\rocm-sdk" # e.g. gfx103X-7.14.0
+$env:HIP_PATH  = "$env:ROCM_PATH"
+$env:PATH      = "$env:ROCM_PATH\bin;$env:ROCM_PATH\lib\llvm\bin;" + $env:PATH
+
+cmake -B build_hip -G "Ninja" `
+  -DCMAKE_BUILD_TYPE=Release `
+  -DGGML_HIP=ON `
+  -DAMDGPU_TARGETS="gfx1030" `
+  -DCMAKE_C_COMPILER="$env:ROCM_PATH/lib/llvm/bin/clang.exe" `
+  -DCMAKE_CXX_COMPILER="$env:ROCM_PATH/lib/llvm/bin/clang++.exe" `
+  -DCMAKE_RC_COMPILER="C:/Program Files (x86)/Windows Kits/10/bin/10.0.26100.0/x64/rc.exe"
+
+ninja -C build_hip llama-omni-server -j 8
 ```
 
 > CMake will auto-detect and enable Metal (macOS) or CUDA (Linux with NVIDIA GPU).
