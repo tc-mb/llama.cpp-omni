@@ -606,9 +606,8 @@ bool mtmd_image_preprocessor_llava_uhd::preprocess(const clip_image_u8 & img, cl
 
 mtmd_image_preprocessor_llava_uhd::slice_instructions mtmd_image_preprocessor_llava_uhd::get_slice_instructions(const clip_image_size & original_size) {
     mtmd_image_preprocessor_llava_uhd::slice_instructions res;
-    // align slices by patch_size * n_merge so an integer number of merger output tokens fits per slice
-    const int n_merge         = hparams.n_merge > 0 ? hparams.n_merge : 1;
-    const int patch_size      = hparams.patch_size * n_merge;
+    // align by the model's merge factor
+    const int patch_size      = get_slice_align();
     const int slice_size      = hparams.image_size;
     const int original_width  = original_size.width;
     const int original_height = original_size.height;
@@ -667,7 +666,9 @@ mtmd_image_preprocessor_llava_uhd::slice_instructions mtmd_image_preprocessor_ll
     res.overview_size = best_size;
 
     {
-        const int max_slice_nums = hparams.custom_image_max_slice_nums > 0 ? hparams.custom_image_max_slice_nums : 9; // TODO: this is only used by minicpmv, maybe remove it
+        // slice cap: user override wins, then the value carried in the GGUF, then the default
+        const int max_slice_nums = hparams.custom_image_max_slice_nums > 0 ? hparams.custom_image_max_slice_nums
+                                 : (hparams.max_slice_nums > 0 ? hparams.max_slice_nums : 9);
         const float log_ratio = log((float)original_width / original_height);
         const float ratio = (float)original_width * original_height / (slice_size * slice_size);
         const int multiple = fmin(ceil(ratio), max_slice_nums);
@@ -752,6 +753,21 @@ std::vector<clip_image_u8_ptr> mtmd_image_preprocessor_llava_uhd::slice_image(co
     return output;
 }
 
+mtmd_image_preprocessor_llava_uhd::slice_instructions mtmd_image_preprocessor_minicpmv::get_slice_instructions(const clip_image_size & original_size) {
+    // the reference returns the overview only for small images; the generic llava-uhd
+    // path would slice as soon as one side exceeds the scale resolution
+    const int   slice_size = hparams.image_size;
+    const float ratio      = (float) original_size.width * original_size.height / (slice_size * slice_size);
+    if (ratio <= 1.0f) {
+        mtmd_image_preprocessor_llava_uhd::slice_instructions inst;
+        inst.overview_size = get_best_resize(original_size, slice_size, get_slice_align(), true);
+        inst.refined_size  = clip_image_size{0, 0};
+        inst.grid_size     = clip_image_size{0, 0};
+        return inst;
+    }
+    return mtmd_image_preprocessor_llava_uhd::get_slice_instructions(original_size);
+}
+
 clip_image_size mtmd_image_preprocessor_llava_uhd::get_best_resize(const clip_image_size & original_size, int scale_resolution, int patch_size, bool allow_upscale) {
     int width  = original_size.width;
     int height = original_size.height;
@@ -801,7 +817,7 @@ clip_image_size mtmd_image_preprocessor_llava_uhd::select_best_resolution(const 
 }
 
 int mtmd_image_preprocessor_llava_uhd::ensure_divide(int length, int patch_size) {
-    return std::max(static_cast<int>(std::round(static_cast<float>(length) / patch_size) * patch_size), patch_size);
+    return std::max(align_round(static_cast<double>(length) / patch_size) * patch_size, patch_size);
 }
 
 clip_image_size mtmd_image_preprocessor_llava_uhd::get_refine_size(const clip_image_size & original_size, const clip_image_size & grid, int scale_resolution, int patch_size, bool allow_upscale) {

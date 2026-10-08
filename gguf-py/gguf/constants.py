@@ -313,6 +313,7 @@ class Keys:
         BLOCK_COUNT           = "clip.vision.block_count"
         IMAGE_MEAN            = "clip.vision.image_mean"
         IMAGE_STD             = "clip.vision.image_std"
+        MAX_SLICE_NUMS        = "clip.vision.max_slice_nums" # llava-uhd slice cap (MiniCPM-V)
         SPATIAL_MERGE_SIZE    = "clip.vision.spatial_merge_size"
         USE_GELU              = "clip.use_gelu"
         USE_SILU              = "clip.use_silu"
@@ -4356,6 +4357,7 @@ class VisionProjectorType:
     NEMOTRON_V2_VL = "nemotron_v2_vl"
     HUNYUANVL      = "hunyuanvl"
     MINICPMV4_6    = "minicpmv4_6"
+    MINICPMV4_7    = "minicpmv4_7"
     GRANITE_SPEECH = "granite_speech"  # audio
     MIMOVL         = "mimovl"
 

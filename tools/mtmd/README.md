@@ -50,6 +50,7 @@ For the following models, you can use `convert_hf_to_gguf.py` with `--mmproj` fl
 - [Mistral Small 3.1 24B](https://huggingface.co/mistralai/Mistral-Small-3.1-24B-Instruct-2503)
 - InternVL 2.5 and InternVL 3 from [OpenGVLab](https://huggingface.co/OpenGVLab) (note: we don't support conversion of `InternVL3-*-hf` model, only non-HF version is supported ; `InternLM2Model` **text** model is not supported)
 - [MiniCPM-V 4.6](https://huggingface.co/openbmb/MiniCPM-V-4_6) ; See the guide [here](../../docs/multimodal/minicpmv4.6.md) - requires the standard `transformers` v5.7.0+ checkpoint
+- [MiniCPM-V 4.7](https://huggingface.co/openbmb/MiniCPM-V-4.7) ; See the guide [here](../../docs/multimodal/minicpmv4.7.md)
 
 For older models, please refer to the relevant guide for instructions on how to obtain or create them:
 
