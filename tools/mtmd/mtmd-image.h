@@ -62,7 +62,18 @@ struct mtmd_image_preprocessor_llava_uhd : mtmd_image_preprocessor {
 
     std::vector<clip_image_u8_ptr> slice_image(const clip_image_u8 & img, const slice_instructions & inst, bool overview_first = true);
 
-private:
+protected:
+    // align slices to a multiple of the merger factor (integer merger tokens per slice)
+    virtual int get_slice_align() const {
+        const int merge = hparams.n_merge > 0 ? hparams.n_merge : 1;
+        return hparams.patch_size * merge;
+    }
+
+    // rounding for snapping a length to a multiple of the align size
+    virtual int align_round(double v) const {
+        return static_cast<int>(std::round(v));
+    }
+
     clip_image_size get_best_resize(const clip_image_size & original_size, int scale_resolution, int patch_size, bool allow_upscale = false);
 
     clip_image_size resize_maintain_aspect_ratio(const clip_image_size & orig, const clip_image_size & target_max);
@@ -86,6 +97,33 @@ private:
     int ensure_divide(int length, int patch_size);
     clip_image_size get_refine_size(const clip_image_size & original_size, const clip_image_size & grid, int scale_resolution, int patch_size, bool allow_upscale = false);
     clip_image_size get_best_grid(const int max_slice_nums, const int multiple, const float log_ratio);
+};
+
+// custom llava-uhd slicing logic for MiniCPM-V (4.6 / 4.7)
+struct mtmd_image_preprocessor_minicpmv : mtmd_image_preprocessor_llava_uhd {
+    using mtmd_image_preprocessor_llava_uhd::mtmd_image_preprocessor_llava_uhd;
+    slice_instructions get_slice_instructions(const clip_image_size & original_size) override;
+
+protected:
+    // the reference always aligns to patch_size * 4, independent of downsample_mode:
+    // even 4x keeps the 2x2 vit_merger slot so the patch grid stays divisible by 4
+    int get_slice_align() const override {
+        return hparams.patch_size * 4;
+    }
+
+    // Python's round() breaks ties to even, unlike std::round
+    int align_round(double v) const override {
+        const double fl = std::floor(v);
+        const double diff = v - fl;
+        if (diff > 0.5) {
+            return static_cast<int>(fl) + 1;
+        }
+        if (diff < 0.5) {
+            return static_cast<int>(fl);
+        }
+        const int lo = static_cast<int>(fl);
+        return (lo % 2 == 0) ? lo : lo + 1;
+    }
 };
 
 // downscale or upscale the input image to fixed size

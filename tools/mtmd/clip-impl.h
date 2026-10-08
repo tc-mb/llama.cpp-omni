@@ -52,6 +52,7 @@
 
 #define KEY_MM_PATCH_MERGE_TYPE    "clip.vision.mm_patch_merge_type"
 #define KEY_IMAGE_GRID_PINPOINTS   "clip.vision.image_grid_pinpoints"
+#define KEY_MAX_SLICE_NUMS         "clip.vision.max_slice_nums"
 #define KEY_WIN_ATTN_PATTERN       "clip.vision.n_wa_pattern"
 #define KEY_WIN_ATTN_LAYER_INDEXES "clip.vision.wa_layer_indexes"
 #define KEY_WA_PATTERN_MODE        "clip.vision.wa_pattern_mode"
@@ -345,6 +346,7 @@ enum projector_type {
     PROJECTOR_TYPE_NEMOTRON_V2_VL,
     PROJECTOR_TYPE_HUNYUANVL,
     PROJECTOR_TYPE_MINICPMV4_6,
+    PROJECTOR_TYPE_MINICPMV4_7,
     PROJECTOR_TYPE_GRANITE_SPEECH,
     PROJECTOR_TYPE_MIMOVL,
     PROJECTOR_TYPE_UNKNOWN,
@@ -394,6 +396,7 @@ static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
     { PROJECTOR_TYPE_NEMOTRON_V2_VL, "nemotron_v2_vl"},
     { PROJECTOR_TYPE_HUNYUANVL,  "hunyuanvl"},
     { PROJECTOR_TYPE_MINICPMV4_6, "minicpmv4_6"},
+    { PROJECTOR_TYPE_MINICPMV4_7, "minicpmv4_7"},
     { PROJECTOR_TYPE_GRANITE_SPEECH, "granite_speech"},
     { PROJECTOR_TYPE_MIMOVL,     "mimovl"},
 };

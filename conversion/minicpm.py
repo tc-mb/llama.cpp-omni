@@ -182,3 +182,94 @@ class MiniCPMV4_6VisionModel(MmprojModel):
             return None
 
         return super().filter_tensors(item)
+
+
+# MiniCPM-V 4.7 shares the v4.6 stack: the same Qwen3.5 text tower (MoE variant when the
+# checkpoint says so) and the same SigLIP + vit_merger + merger vision tower.
+
+@ModelBase.register("MiniCPMV4_7ForConditionalGeneration")
+class MiniCPMV4_7TextModel(Qwen3_5TextModel):
+    model_arch = gguf.MODEL_ARCH.QWEN35
+
+    def __init__(self, dir_model, ftype, fname_out, *, hparams: dict | None = None, **kwargs):
+        if hparams is None:
+            hparams = ModelBase.load_hparams(dir_model, is_mistral_format=False)
+        text_config = hparams.get("text_config", {})
+        if text_config.get("model_type") == "qwen3_5_moe_text":
+            self.model_arch = gguf.MODEL_ARCH.QWEN35MOE
+        else:
+            self.model_arch = gguf.MODEL_ARCH.QWEN35
+        super().__init__(dir_model, ftype, fname_out, hparams=hparams, **kwargs)
+
+    @classmethod
+    def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
+        name, gen = item
+
+        # vision merger -> belongs to the mmproj file
+        if name.startswith("model.merger."):
+            return None
+        # MTP tensors are not used at inference yet; align with Qwen3Next behaviour
+        if name.startswith("mtp"):
+            return None
+
+        return super().filter_tensors(item)
+
+
+@ModelBase.register("MiniCPMV4_7ForConditionalGeneration")
+class MiniCPMV4_7VisionModel(MmprojModel):
+    # MiniCPMV4_7ImageProcessorPil default; 4.7 checkpoints may omit scale_resolution
+    default_scale_resolution = 448
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # 4.7 moved downsample_mode to the model config, but an explicit preprocessor
+        # value still wins so that a copy of the model dir can export the 4x variant
+        self.downsample_mode = self.preprocessor_config.get(
+            "downsample_mode", self.global_config.get("downsample_mode", "16x"))
+        if self.downsample_mode not in {"4x", "16x"}:
+            raise ValueError(f"Unsupported downsample mode: {self.downsample_mode}")
+        if self.downsample_mode == "4x":
+            self.model_tensors = {
+                name: tensor for name, tensor in self.model_tensors.items()
+                if ".vit_merger." not in name
+            }
+
+        if self.hparams_vision is not None:
+            # like 4.6, `vision_config.image_size` is the SigLIP bucket grid, not the
+            # per-slice resolution; report scale_resolution so clip.cpp slices correctly
+            scale_resolution = self.preprocessor_config.get(
+                "scale_resolution", self.default_scale_resolution)
+            self.hparams_vision["image_size"] = int(scale_resolution)
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        assert self.hparams_vision is not None
+
+        self.gguf_writer.add_clip_projector_type(gguf.VisionProjectorType.MINICPMV4_7)
+
+        # ViT merger 2x2 + final merger 2x2 = 4x; the 4x export drops the ViT merger
+        self.gguf_writer.add_vision_projector_scale_factor(
+            2 if self.downsample_mode == "4x" else 4)
+
+        # slice cap read by the reference image processor, so it travels with the model
+        max_slice_nums = self.preprocessor_config.get("max_slice_nums")
+        if max_slice_nums is not None:
+            self.gguf_writer.add_vision_max_slice_nums(int(max_slice_nums))
+
+        # borrow wa_layer_indexes for vit_merger insertion point
+        insert_layer_id = int(self.global_config.get(
+            "insert_layer_id", self.hparams_vision.get("insert_layer_id", 6)))
+        self.gguf_writer.add_vision_wa_layer_indexes([insert_layer_id])
+
+        self.gguf_writer.add_vision_use_gelu(True)
+        self.gguf_writer.add_vision_attention_layernorm_eps(
+            self.hparams_vision.get("layer_norm_eps", 1e-6))
+
+    @classmethod
+    def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
+        name, gen = item
+
+        if name.startswith(("lm_head.", "mtp")):
+            return None
+
+        return super().filter_tensors(item)
