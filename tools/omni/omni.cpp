@@ -1324,6 +1324,12 @@ static const char * llama_loop(struct omni_context * ctx_omni, common_params *pa
 // 🔧 [双工模式] 支持 forbidden_token_ids，禁止采样 <|tts_pad|> 等 token
 static const char * sample_with_hidden_and_token(struct common_sampler * smpl, struct omni_context * ctx_omni, common_params* params, int * n_past, float *& hidden_states, llama_token & token_id) {
     float * logits = llama_get_logits_ith(ctx_omni->ctx_llama, -1);
+    const int observation_pos = *n_past;
+    const int observation_vocab = ctx_omni->decode_observer
+        ? llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_omni->ctx_llama))) : 0;
+    if (ctx_omni->decode_observer && logits) {
+        ctx_omni->decode_observer({omni_decode_phase::raw_logits, observation_pos, logits, observation_vocab});
+    }
     
     // 🔧 [双工模式] 在采样前调整 logits
     if (ctx_omni->duplex_mode) {
@@ -1376,6 +1382,9 @@ static const char * sample_with_hidden_and_token(struct common_sampler * smpl, s
         }
     }
     
+    if (ctx_omni->decode_observer && logits) {
+        ctx_omni->decode_observer({omni_decode_phase::adjusted_logits, observation_pos, logits, observation_vocab});
+    }
     const llama_token id = common_sampler_sample(smpl, ctx_omni->ctx_llama, -1);
     token_id = id;  // 保存token ID
     common_sampler_accept(smpl, id, true);
@@ -1384,6 +1393,10 @@ static const char * sample_with_hidden_and_token(struct common_sampler * smpl, s
         ret = "</s>";
     } else {
         ret = common_token_to_piece(ctx_omni->ctx_llama, id);
+    }
+    if (ctx_omni->decode_observer) {
+        // Sampling does not imply successful evaluation or audible output.
+        ctx_omni->decode_observer({omni_decode_phase::sampled, observation_pos, nullptr, 0, id});
     }
     eval_id_with_hidden(ctx_omni, params, id, n_past, hidden_states);
     return ret.c_str();
