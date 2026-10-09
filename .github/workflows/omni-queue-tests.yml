@@ -1,0 +1,21 @@
+name: Omni queue boundaries
+
+on:
+  push:
+    branches: [master]
+    paths: ['tools/omni/omni.cpp', 'tools/omni/omni.h', 'tools/omni/test/test_t2w_queue.py', '.github/workflows/omni-queue-tests.yml']
+  pull_request:
+    paths: ['tools/omni/omni.cpp', 'tools/omni/omni.h', 'tools/omni/test/test_t2w_queue.py', '.github/workflows/omni-queue-tests.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  queue-boundaries:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - run: python -m unittest discover -s tools/omni/test -p 'test_t2w_queue.py' -v
