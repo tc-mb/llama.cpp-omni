@@ -23,6 +23,13 @@ enum llama_swa_type {
     LLAMA_SWA_TYPE_SYMMETRIC = 3,
 };
 
+// M-RoPE: which input position slot feeds each RoPE section
+enum llama_rope_section_order {
+    LLAMA_ROPE_SECTION_ORDER_UNSPECIFIED = -1,
+    LLAMA_ROPE_SECTION_ORDER_TYXZ        = 0, // default, slot i feeds section i
+    LLAMA_ROPE_SECTION_ORDER_ZYXT        = 1, // MiniCPM-V 4.7: time last
+};
+
 struct llama_hparams_posnet {
     uint32_t n_embd;
     uint32_t n_layer;
@@ -129,6 +136,10 @@ struct llama_hparams {
     float    yarn_beta_slow   =  1.0f;
 
     std::array<int, 4> rope_sections;
+
+    // M-RoPE: which input position slot feeds each RoPE section. Canvas M-RoPE (MiniCPM-V 4.7)
+    // needs ZYXT: the image canvas time travels in slot z so slot t stays the KV cache position.
+    enum llama_rope_section_order rope_section_order = LLAMA_ROPE_SECTION_ORDER_TYXZ;
 
     // Sliding Window Attention (SWA)
     llama_swa_type swa_type = LLAMA_SWA_TYPE_NONE;

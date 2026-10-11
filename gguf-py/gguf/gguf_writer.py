@@ -25,6 +25,7 @@ from .constants import (
     GGUFValueType,
     Keys,
     RopeScalingType,
+    RopeSectionOrder,
     PoolingType,
     TokenType,
     ExpertGatingFuncType,
@@ -966,6 +967,9 @@ class GGUFWriter:
 
     def add_rope_dimension_sections(self, dims: Sequence[int]) -> None:
         self.add_array(Keys.Rope.DIMENSION_SECTIONS.format(arch=self.arch), dims)
+
+    def add_rope_section_order(self, value: RopeSectionOrder) -> None:
+        self.add_string(Keys.Rope.SECTION_ORDER.format(arch=self.arch), value.value)
 
     def add_rope_freq_base(self, value: float) -> None:
         self.add_float32(Keys.Rope.FREQ_BASE.format(arch=self.arch), value)
