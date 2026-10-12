@@ -8,7 +8,7 @@ MiniCPM-V 4.7 35B-A3B addresses this with **LES (Lookahead Expert Scheduling)**,
 
 ## Core optimizations in LES
 
-- **Lookahead expert scheduling.** Cross-layer routing prediction loads the experts the next layer is likely to need ahead of time. Experts that the actual router selected and that are already loaded are computed first, while the remaining required experts are loaded in parallel, cutting load waits. Prediction is used only for prefetch and scheduling; computation still follows the model's own token-level routing, and any required expert missed by the prediction is loaded and used as usual. No additional training is needed.
+- **Expert prefetch and compute scheduling.** Cross-layer routing prediction loads the experts the next layer is likely to need ahead of time. Experts that the actual router selected and that are already loaded are computed first, while the remaining required experts are loaded in parallel, cutting load waits. Prediction is used only for prefetch and scheduling; computation still follows the model's own token-level routing, and any required expert missed by the prediction is loaded and used as usual. No additional training is needed.
 
 - **Weight access optimization.** Expert loading is optimized along two axes, quantization and storage layout. Precise layer-wise mixed-precision quantization reduces weight storage and transfer cost while preserving model capability. Repacking the expert weights into contiguous storage reduces scattered reads and improves sequential read efficiency on flash. Together they lower what expert loading demands of on-device storage and bandwidth.
 
