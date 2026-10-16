@@ -15,6 +15,7 @@
 #include <queue>
 #include <condition_variable>
 #include <fstream>
+#include <memory>
 #include <string>
 
 #include "httplib.h"
@@ -114,8 +115,20 @@ int main(int argc, char ** argv) {
     }
 
     // HTTP server setup
+    //
+    // An SSLServer constructed with empty cert/key paths never becomes valid,
+    // and Server::bind_internal() returns -1 before it creates a socket, so the
+    // server then fails to bind on every host and port with no errno to report.
+    // Only reach for SSL when both files were given, like server.cpp does.
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
-    httplib::SSLServer svr(params.ssl_file_cert.c_str(), params.ssl_file_key.c_str());
+    std::unique_ptr<httplib::Server> svr_holder;
+    if (!params.ssl_file_cert.empty() && !params.ssl_file_key.empty()) {
+        LOG_INF("Running with SSL: cert = %s, key = %s\n", params.ssl_file_cert.c_str(), params.ssl_file_key.c_str());
+        svr_holder.reset(new httplib::SSLServer(params.ssl_file_cert.c_str(), params.ssl_file_key.c_str()));
+    } else {
+        svr_holder.reset(new httplib::Server());
+    }
+    httplib::Server & svr = *svr_holder;
 #else
     httplib::Server svr;
 #endif
