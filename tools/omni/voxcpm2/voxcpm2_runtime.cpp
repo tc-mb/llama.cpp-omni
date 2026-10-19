@@ -2010,6 +2010,169 @@ bool VoxCPM2Runtime::generate_with_continuation_streaming(const std::string &   
     return decode_streaming_from_ready_state(params, callback);
 }
 
+bool VoxCPM2Runtime::build_ultimate_clone_prefill(const std::vector<int32_t> & text_token_ids,
+                                                  const std::vector<float> &   reference_feat,
+                                                  const std::vector<float> &   prompt_feat,
+                                                  bool                         append_audio_start,
+                                                  VoxCPM2PrefillInputs &       inputs) {
+    // Python VoxCPM2Model._generate() lays out the combined condition as:
+    // [ref_start, reference_audio, ref_end, text(prompt + target),
+    //  audio_start, prompt_audio].
+    inputs = {};
+
+    if (text_token_ids.empty()) {
+        return fail("text tokenization produced no tokens");
+    }
+
+    const int    patch_elems = feat_dim() * patch_size();
+    const size_t stride      = static_cast<size_t>(patch_elems);
+    if (patch_elems <= 0) {
+        return fail("invalid feat_dim or patch_size");
+    }
+    if (reference_feat.empty() || (reference_feat.size() % stride) != 0) {
+        return fail("reference features must contain whole VoxCPM2 latent patches");
+    }
+    if (prompt_feat.empty() || (prompt_feat.size() % stride) != 0) {
+        return fail("prompt features must contain whole VoxCPM2 latent patches");
+    }
+
+    const int reference_frames = static_cast<int>(reference_feat.size() / stride);
+    const int prompt_frames    = static_cast<int>(prompt_feat.size() / stride);
+    if (reference_frames <= 0 || prompt_frames <= 0) {
+        return fail("reference and prompt features must not be empty");
+    }
+
+    std::vector<int32_t> text_segment = text_token_ids;
+    if (append_audio_start && (text_segment.empty() || text_segment.back() != kAudioStartToken)) {
+        text_segment.push_back(kAudioStartToken);
+    }
+
+    const int text_positions = static_cast<int>(text_segment.size());
+    const int seq_len = reference_frames + 2 + text_positions + prompt_frames;
+    inputs.token_ids.reserve(static_cast<size_t>(seq_len));
+    inputs.text_mask.reserve(static_cast<size_t>(seq_len));
+    inputs.feat_mask.reserve(static_cast<size_t>(seq_len));
+    inputs.audio_feat.reserve(static_cast<size_t>(seq_len) * stride);
+
+    const auto append_zero_patch = [&]() {
+        inputs.audio_feat.insert(inputs.audio_feat.end(), stride, 0.0f);
+    };
+
+    // Reference prefix: reference audio is isolated by the 103/104 markers.
+    inputs.token_ids.push_back(kRefAudioStartToken);
+    inputs.text_mask.push_back(1);
+    inputs.feat_mask.push_back(0);
+    append_zero_patch();
+
+    for (int i = 0; i < reference_frames; ++i) {
+        inputs.token_ids.push_back(0);
+        inputs.text_mask.push_back(0);
+        inputs.feat_mask.push_back(1);
+        const size_t offset = static_cast<size_t>(i) * stride;
+        inputs.audio_feat.insert(inputs.audio_feat.end(), reference_feat.begin() + static_cast<std::ptrdiff_t>(offset),
+                                 reference_feat.begin() + static_cast<std::ptrdiff_t>(offset + stride));
+    }
+
+    inputs.token_ids.push_back(kRefAudioEndToken);
+    inputs.text_mask.push_back(1);
+    inputs.feat_mask.push_back(0);
+    append_zero_patch();
+
+    // Text and audio-start positions carry text embeddings and zero features.
+    for (const int32_t token : text_segment) {
+        inputs.token_ids.push_back(token);
+        inputs.text_mask.push_back(1);
+        inputs.feat_mask.push_back(0);
+        append_zero_patch();
+    }
+
+    // Prompt audio is the final region, so prefill() uses its last patch as the
+    // first CFM condition for continuation.
+    for (int i = 0; i < prompt_frames; ++i) {
+        inputs.token_ids.push_back(0);
+        inputs.text_mask.push_back(0);
+        inputs.feat_mask.push_back(1);
+        const size_t offset = static_cast<size_t>(i) * stride;
+        inputs.audio_feat.insert(inputs.audio_feat.end(), prompt_feat.begin() + static_cast<std::ptrdiff_t>(offset),
+                                 prompt_feat.begin() + static_cast<std::ptrdiff_t>(offset + stride));
+    }
+
+    LOG_INF("Ultimate clone prefill: ref_frames=%d prompt_frames=%d text_positions=%d total_positions=%d\n",
+            reference_frames, prompt_frames, text_positions, seq_len);
+    return true;
+}
+
+// The three functions below all take reference_wav then prompt_wav. Both are
+// const std::vector<float> &, so swapping them compiles and links silently —
+// keep the order in sync with the declarations in voxcpm2_runtime.h.
+bool VoxCPM2Runtime::prepare_ultimate_clone_state(const std::string &           target_text,
+                                                  const std::string &           prompt_text,
+                                                  const std::vector<float> &    reference_wav,
+                                                  const std::vector<float> &    prompt_wav,
+                                                  const VoxCPM2GenerateParams & params) {
+    clear_error();
+    const std::string    joined_text = prompt_text + target_text;
+    std::vector<int32_t> token_ids   = tokenize_text(joined_text, false, true);
+    if (token_ids.empty()) {
+        if (last_error_msg.empty()) {
+            fail("text tokenization produced no tokens");
+        }
+        return false;
+    }
+
+    std::vector<float> reference_feat = encode_reference_audio(reference_wav, params.reference_sample_rate);
+    if (reference_feat.empty()) {
+        return false;
+    }
+    // The two WAVs are independent files and need not share a sample rate;
+    // resampling the prompt at the reference's rate would shift its pitch and
+    // duration. Fall back to reference_sample_rate only when unset.
+    const int prompt_sr =
+        params.prompt_sample_rate > 0 ? params.prompt_sample_rate : params.reference_sample_rate;
+    std::vector<float> prompt_feat = encode_reference_audio(prompt_wav, prompt_sr);
+    if (prompt_feat.empty()) {
+        return false;
+    }
+
+    VoxCPM2PrefillInputs inputs;
+    if (!build_ultimate_clone_prefill(token_ids, reference_feat, prompt_feat, params.append_audio_start, inputs)) {
+        return false;
+    }
+
+    if (params.seed != 0) {
+        rng.seed(params.seed);
+    }
+    return prefill(inputs);
+}
+
+std::vector<float> VoxCPM2Runtime::generate_ultimate_clone(const std::string &           target_text,
+                                                           const std::string &           prompt_text,
+                                                           const std::vector<float> &    reference_wav,
+                                                           const std::vector<float> &    prompt_wav,
+                                                           const VoxCPM2GenerateParams & params) {
+    if (!prepare_ultimate_clone_state(target_text, prompt_text, reference_wav, prompt_wav, params)) {
+        return {};
+    }
+    decode_loop(params, nullptr);
+    if (!last_error_msg.empty()) {
+        return {};
+    }
+
+    return decode_to_waveform(params.target_sr);
+}
+
+bool VoxCPM2Runtime::generate_ultimate_clone_streaming(const std::string &               target_text,
+                                                       const std::string &               prompt_text,
+                                                       const std::vector<float> &        reference_wav,
+                                                       const std::vector<float> &        prompt_wav,
+                                                       const VoxCPM2AudioChunkCallback & callback,
+                                                       const VoxCPM2GenerateParams &     params) {
+    if (!prepare_ultimate_clone_state(target_text, prompt_text, reference_wav, prompt_wav, params)) {
+        return false;
+    }
+    return decode_streaming_from_ready_state(params, callback);
+}
+
 void VoxCPM2Runtime::free() {
     cached_front_half.free_graph();
     reset_state();
