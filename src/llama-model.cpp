@@ -223,6 +223,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
         case LLM_ARCH_MINICPM:
         case LLM_ARCH_MINICPM4:
             return new llama_model_minicpm(params);
+        case LLM_ARCH_MINICPM5MOE:
+            return new llama_model_minicpm5moe(params);
         case LLM_ARCH_GRANITE_HYBRID:
             return new llama_model_granite_hybrid(params);
         case LLM_ARCH_CHAMELEON:
@@ -1279,8 +1281,8 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     }
 
     if (pimpl->moe_experts) {
-        if (arch != LLM_ARCH_QWEN35MOE) {
-            throw std::runtime_error("MoE experts currently supports only qwen35moe");
+        if (arch != LLM_ARCH_QWEN35MOE && arch != LLM_ARCH_MINICPM5MOE) {
+            throw std::runtime_error("MoE experts currently supports only qwen35moe and minicpm5moe");
         }
         if (pimpl->moe_experts->expert_count() != (int32_t) hparams.n_expert ||
             pimpl->moe_experts->expert_used_count() != (int32_t) hparams.n_expert_used) {
@@ -2796,6 +2798,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_EXAONE_MOE:
         case LLM_ARCH_MINICPM3:
         case LLM_ARCH_MINICPM4:
+        case LLM_ARCH_MINICPM5MOE:
         case LLM_ARCH_BAILINGMOE2:
         case LLM_ARCH_DOTS1:
         case LLM_ARCH_HUNYUAN_MOE:
