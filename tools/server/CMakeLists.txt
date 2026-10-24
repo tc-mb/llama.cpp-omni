@@ -57,6 +57,16 @@ target_compile_features(${TARGET_OMNI} PRIVATE cxx_std_17)
 target_include_directories(${TARGET_OMNI} PRIVATE ${CMAKE_SOURCE_DIR})
 target_include_directories(${TARGET_OMNI} PRIVATE ${CMAKE_SOURCE_DIR}/vendor/cpp-httplib)
 target_include_directories(${TARGET_OMNI} PRIVATE ${CMAKE_SOURCE_DIR}/vendor)
+target_compile_definitions(${TARGET_OMNI} PRIVATE OMNI_ASSET_DIR="${CMAKE_SOURCE_DIR}/tools/omni/assets")
+
+if (LLAMA_BUILD_TESTS)
+    add_executable(test-ws-context-cleanup test-ws-context-cleanup.cpp)
+    target_include_directories(test-ws-context-cleanup PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(test-ws-context-cleanup PRIVATE OMNI_ASSET_DIR="${CMAKE_SOURCE_DIR}/tools/omni/assets")
+    target_compile_features(test-ws-context-cleanup PRIVATE cxx_std_17)
+    add_test(NAME test-ws-context-cleanup COMMAND test-ws-context-cleanup)
+    set_tests_properties(test-ws-context-cleanup PROPERTIES LABELS "main;omni")
+endif()
 
 # llama-tts-server executable (standalone VoxCPM2 TTS HTTP API)
 

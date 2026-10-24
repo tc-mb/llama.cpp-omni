@@ -171,9 +171,25 @@ static void stop_reusable_octx_threads(omni_context * octx) {
 // Wipe per-session state on a reused context: stop threads, reset counters/flags,
 // clear LLM/TTS/whisper KV caches, so the next session starts clean on the same
 // loaded model. Used by the shared-octx reuse path in create_session_octx.
-static void reset_octx_for_session(omni_context * octx, const ParsedSessionInit & init,
+static bool reset_octx_for_session(omni_context * octx, const ParsedSessionInit & init,
                                    const std::string & output_dir) {
     stop_reusable_octx_threads(octx);
+
+    // A reused context must not carry a dynamic voice into a session that did
+    // not provide a new reference audio. Restore the static cache before
+    // deleting the old temporary WAV so a failed reset cannot silently leave
+    // the session using the previous voice.
+    if (init.use_tts && init.tts_ref_audio_b64.empty()) {
+        if (!omni_reset_tts_reference_audio(octx)) {
+            LOG_ERR("reset_octx_for_session: failed to restore default TTS voice\n");
+            return false;
+        }
+    } else if (octx->tts_ref_audio_owned && !octx->tts_ref_audio_path.empty()) {
+        fs::remove(octx->tts_ref_audio_path);
+    }
+    octx->tts_ref_audio_path.clear();
+    octx->tts_ref_audio_owned = false;
+    octx->ref_audio_path.clear();
 
     const bool duplex_mode = (init.mode == "full_duplex");
     octx->async = true;
@@ -226,6 +242,7 @@ static void reset_octx_for_session(omni_context * octx, const ParsedSessionInit 
     if (!init.system_prompt.empty()) {
         octx->omni_assistant_prompt = init.system_prompt;
     }
+    return true;
 }
 
 // Apply the optional opaque init.config (sampling/decoding knobs, §6) onto the
@@ -533,7 +550,10 @@ static omni_context * create_session_octx(common_params & params, const ParsedSe
     // Reuse the server-owned context if it matches this session's mode (avoids
     // reloading the model); otherwise tear it down and build a fresh one.
     if (shared_octx && shared_octx->duplex_mode == duplex_mode && shared_octx->use_tts == use_tts) {
-        reset_octx_for_session(shared_octx, init, output_dir);
+        if (!reset_octx_for_session(shared_octx, init, output_dir)) {
+            LOG_ERR("create_session_octx: failed to reset reused context\n");
+            return nullptr;
+        }
         apply_session_config(p, shared_octx, init);
         LOG_INF("create_session_octx: reused shared octx, duplex=%d, output_dir=%s\n",
                 duplex_mode, output_dir.c_str());
@@ -584,13 +604,19 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
     int msg_counter = 0;
     std::vector<std::string> retained_media_files;
 
+    bool session_activated = false;
+
     // Helper: fail-fast — send session.closed and close WS
-    auto fail_fast = [&](const std::string & session_id, const std::string & reason) {
+    auto fail_fast = [&](const std::string & session_id,
+                         const std::string & reason,
+                         omni_context * pending_octx = nullptr) {
         if (!session_id.empty()) {
             std::string ev = make_session_closed(session_id, reason).dump();
             ws.send(ev);
         }
         session_mgr.close(session_id);
+        release_unactivated_octx_if_owned(
+            pending_octx, shared_octx, octx_mutex, session_activated, omni_free);
         for (const auto & path : retained_media_files) {
             fs::remove(path);
         }
@@ -644,53 +670,107 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
     std::string session_output_dir = (fs::path(temp_dir) / session_id).string();
 
     omni_context * octx = nullptr;
+    omni_context * shared_octx_before_init = nullptr;
     {
         std::lock_guard<std::mutex> lock(octx_mutex);
+        shared_octx_before_init = shared_octx;
         octx = create_session_octx(params_base, parsed_init, model, ctx, shared_octx, session_output_dir);
     }
     if (!octx) {
+        release_failed_shared_octx_if_owned(
+            shared_octx_before_init, shared_octx, octx_mutex, omni_free);
         fail_fast(session_id, "omni_init_failed");
         return;
+    }
+
+    if (parsed_init.use_tts &&
+        parsed_init.ref_audio_b64.empty() &&
+        parsed_init.tts_ref_audio_b64.empty() &&
+        octx->use_python_token2wav) {
+        if (!omni_set_tts_reference_audio(
+                octx, omni_default_ref_audio_path())) {
+            fail_fast(session_id, "tts_voice_prepare_failed", octx);
+            return;
+        }
+    }
+
+    std::string voice_wav;
+    std::string tts_voice_wav;
+    if (!parsed_init.ref_audio_b64.empty()) {
+        voice_wav = TempMediaFiles::write_audio_wav(parsed_init.ref_audio_b64, temp_dir, msg_counter++);
+        if (voice_wav.empty()) {
+            fail_fast(session_id, "voice_audio_decode_failed", octx);
+            return;
+        }
+        octx->ref_audio_path = voice_wav;
+    }
+    if (should_materialize_tts_ref_audio(
+            parsed_init.use_tts, parsed_init.tts_ref_audio_b64)) {
+        const bool reuse_ref_audio = !voice_wav.empty() &&
+                                     parsed_init.tts_ref_audio_b64 == parsed_init.ref_audio_b64;
+        tts_voice_wav = reuse_ref_audio
+                            ? voice_wav
+                            : TempMediaFiles::write_audio_wav(
+                                  parsed_init.tts_ref_audio_b64, temp_dir, msg_counter++);
+        if (tts_voice_wav.empty()) {
+            if (!voice_wav.empty()) fs::remove(voice_wav);
+            fail_fast(session_id, "tts_voice_audio_decode_failed", octx);
+            return;
+        }
+        octx->tts_ref_audio_path = tts_voice_wav;
+        octx->tts_ref_audio_owned = true;
+        if (parsed_init.use_tts && !omni_set_tts_reference_audio(octx, tts_voice_wav)) {
+            if (!voice_wav.empty()) fs::remove(voice_wav);
+            if (tts_voice_wav != voice_wav) fs::remove(tts_voice_wav);
+            octx->tts_ref_audio_path.clear();
+            octx->tts_ref_audio_owned = false;
+            fail_fast(session_id, "tts_voice_prepare_failed", octx);
+            return;
+        }
     }
 
     // Full-duplex requires index=0 prefill before the first frame. This
     // initializes the system prompt and starts the duplex encoder/LLM pipeline.
     if (parsed_init.mode == "full_duplex" || !parsed_init.ref_audio_b64.empty()) {
-        std::string voice_wav;
-        if (!parsed_init.ref_audio_b64.empty()) {
-            voice_wav = TempMediaFiles::write_audio_wav(parsed_init.ref_audio_b64, temp_dir, msg_counter++);
+        bool voice_prefill_ok = false;
+        {
+            std::lock_guard<std::mutex> lock(octx_mutex);
+            voice_prefill_ok = stream_prefill(octx, voice_wav, /*img*/"", /*index*/0);
+            if (voice_prefill_ok && octx->llm_thread_info) {
+                octx->llm_thread_info->start = std::chrono::steady_clock::now();
+            }
         }
-        if (!parsed_init.ref_audio_b64.empty() && voice_wav.empty()) {
-            fail_fast(session_id, "voice_audio_decode_failed");
-            return;
-        }
-        std::lock_guard<std::mutex> lock(octx_mutex);
-        if (!stream_prefill(octx, voice_wav, /*img*/"", /*index*/0)) {
+        if (!voice_prefill_ok) {
             LOG_ERR("WS /backend: voice prefill failed\n");
             if (!voice_wav.empty()) fs::remove(voice_wav);
-            fail_fast(session_id, "voice_prefill_failed");
+            fail_fast(session_id, "voice_prefill_failed", octx);
             return;
         }
-        if (!voice_wav.empty()) fs::remove(voice_wav);
-        if (octx->llm_thread_info) {
-            octx->llm_thread_info->start = std::chrono::steady_clock::now();
+        if (should_remove_prefill_audio(
+                voice_wav, octx->tts_ref_audio_path, octx->tts_ref_audio_owned)) {
+            fs::remove(voice_wav);
         }
     }
 
     // Activate session
+    bool activation_ok = false;
     {
         std::lock_guard<std::mutex> lock(octx_mutex);
-        if (!session_mgr.activate(session_id, octx, /*owns_octx*/false)) {
-            LOG_ERR("WS /backend: session activate failed for %s\n", session_id.c_str());
-            fail_fast(session_id, "activate_failed");
-            return;
+        activation_ok = session_mgr.activate(session_id, octx, /*owns_octx*/false);
+        if (activation_ok) {
+            session_activated = true;
+            session_mgr.set_close_callback(session_id, [&ws, session_id]() {
+                // Preserve protocol ordering for older runtimes: emit session.closed
+                // before the transport close wakes a blocked ws.read().
+                ws.send(make_session_closed(session_id, "client_closed").dump());
+                ws.close(httplib::ws::CloseStatus::Normal, "client_closed");
+            });
         }
-        session_mgr.set_close_callback(session_id, [&ws, session_id]() {
-            // Preserve protocol ordering for older runtimes: emit session.closed
-            // before the transport close wakes a blocked ws.read().
-            ws.send(make_session_closed(session_id, "client_closed").dump());
-            ws.close(httplib::ws::CloseStatus::Normal, "client_closed");
-        });
+    }
+    if (!activation_ok) {
+        LOG_ERR("WS /backend: session activate failed for %s\n", session_id.c_str());
+        fail_fast(session_id, "activate_failed", octx);
+        return;
     }
 
     // Send session.created
