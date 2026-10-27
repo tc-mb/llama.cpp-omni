@@ -126,6 +126,18 @@ protected:
     }
 };
 
+// MiniCPM-OCR 1.0 ships 4x only, so slices align to patch_size * 2 (28) rather
+// than the patch_size * 4 slot the 4.6/4.7 stack keeps for its ViT merger.
+struct mtmd_image_preprocessor_minicpm_ocr_1_0 : mtmd_image_preprocessor_minicpmv {
+    using mtmd_image_preprocessor_minicpmv::mtmd_image_preprocessor_minicpmv;
+
+protected:
+    int get_slice_align() const override {
+        const int merge = hparams.n_merge > 0 ? hparams.n_merge : 2;
+        return hparams.patch_size * merge;
+    }
+};
+
 // downscale or upscale the input image to fixed size
 struct mtmd_image_preprocessor_fixed_size : mtmd_image_preprocessor {
     mtmd_image_preprocessor_fixed_size(const clip_ctx * ctx) : mtmd_image_preprocessor(ctx) {}

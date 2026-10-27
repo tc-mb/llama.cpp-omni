@@ -229,6 +229,8 @@ class MiniCPMV4_7TextModel(Qwen3_5TextModel):
 class MiniCPMV4_7VisionModel(MmprojModel):
     # MiniCPMV4_7ImageProcessorPil default; 4.7 checkpoints may omit scale_resolution
     default_scale_resolution = 448
+    # overridden by variants that reuse this stack with a different projector
+    projector_type = gguf.VisionProjectorType.MINICPMV4_7
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -255,7 +257,7 @@ class MiniCPMV4_7VisionModel(MmprojModel):
         super().set_gguf_parameters()
         assert self.hparams_vision is not None
 
-        self.gguf_writer.add_clip_projector_type(gguf.VisionProjectorType.MINICPMV4_7)
+        self.gguf_writer.add_clip_projector_type(self.projector_type)
 
         # ViT merger 2x2 + final merger 2x2 = 4x; the 4x export drops the ViT merger
         self.gguf_writer.add_vision_projector_scale_factor(
@@ -283,3 +285,17 @@ class MiniCPMV4_7VisionModel(MmprojModel):
             return None
 
         return super().filter_tensors(item)
+
+
+# MiniCPM-OCR 1.0: qwen35 text tower + 27-layer SigLIP vision tower, 4x only.
+# Text side matches 4.6 (no rope section order); the vision side reuses the 4.7
+# class because that one already drops vit_merger and writes scale_factor 2 for 4x.
+
+@ModelBase.register("MiniCPMOcrForConditionalGeneration")
+class MiniCPMOCR1_0TextModel(MiniCPMV4_6TextModel):
+    model_arch = gguf.MODEL_ARCH.QWEN35
+
+
+@ModelBase.register("MiniCPMOcrForConditionalGeneration")
+class MiniCPMOCR1_0VisionModel(MiniCPMV4_7VisionModel):
+    projector_type = gguf.VisionProjectorType.MINICPM_OCR_1_0
