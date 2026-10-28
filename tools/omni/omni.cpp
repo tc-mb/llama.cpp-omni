@@ -8679,7 +8679,7 @@ void t2w_thread_func_python(struct omni_context * ctx_omni, common_params *param
             continue;
         }
         
-        // Get all available tokens from queue
+        // Collect tokens up to and including the first turn-final marker
         std::vector<llama_token> new_tokens;
         bool is_final = false;
         bool is_chunk_end = false;
@@ -8696,6 +8696,11 @@ void t2w_thread_func_python(struct omni_context * ctx_omni, common_params *param
                 received_round_idx = t2w_out->round_idx;
             }
             delete t2w_out;
+            // Flush and reset this turn before consuming any later turn.
+            // A queued final marker belongs to the tokens before it only.
+            if (is_final) {
+                break;
+            }
         }
         
         lock.unlock();
@@ -8972,7 +8977,7 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
             continue;
         }
         
-        // Get all available tokens from queue
+        // Collect tokens up to and including the first turn-final marker
         std::vector<llama_token> new_tokens;
         bool is_final = false;
         bool is_chunk_end = false;  // 标记 TTS chunk 结束
@@ -8996,6 +9001,11 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
                 received_round_idx = t2w_out->round_idx;
             }
             delete t2w_out;
+            // Flush and reset this turn before consuming any later turn.
+            // A queued final marker belongs to the tokens before it only.
+            if (is_final) {
+                break;
+            }
         }
         
         lock.unlock();
