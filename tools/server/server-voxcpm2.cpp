@@ -10,6 +10,7 @@
 #include <mutex>
 #include <thread>
 #include <fstream>
+#include <memory>
 #include <string>
 #include <cstring>
 #include <atomic>
@@ -200,17 +201,36 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // Reject invalid TLS configuration before initializing models or backends.
+    const bool use_tls = !params.ssl_file_cert.empty();
+    if (use_tls != !params.ssl_file_key.empty()) {
+        LOG_ERR("TLS requires both --ssl-cert-file and --ssl-key-file\n");
+        return 1;
+    }
+    std::unique_ptr<httplib::Server> server;
+#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+    if (use_tls) {
+        server = std::make_unique<httplib::SSLServer>(params.ssl_file_cert.c_str(), params.ssl_file_key.c_str());
+    } else {
+        server = std::make_unique<httplib::Server>();
+    }
+#else
+    if (use_tls) {
+        LOG_ERR("TLS requested but this server was built without TLS support\n");
+        return 1;
+    }
+    server = std::make_unique<httplib::Server>();
+#endif
+    if (!server->is_valid()) {
+        LOG_ERR("Failed to initialize TLS: check --ssl-cert-file and --ssl-key-file\n");
+        return 1;
+    }
+    auto & svr = *server;
+
     llama_backend_init();
     llama_numa_init(params.numa);
 
     LOG_INF("VoxCPM2 TTS HTTP server starting...\n");
-
-    // HTTP server setup
-#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
-    httplib::SSLServer svr(params.ssl_file_cert.c_str(), params.ssl_file_key.c_str());
-#else
-    httplib::Server svr;
-#endif
 
     voxcpm2_server_state state;
 
@@ -549,14 +569,20 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    std::thread http_thread([&]() { svr.listen_after_bind(); });
+    std::atomic<bool> running{true};
+    bool listen_ok = false;
+    std::thread http_thread([&]() {
+        listen_ok = svr.listen_after_bind();
+        running.store(false);
+    });
     svr.wait_until_ready();
 
-    LOG_INF("VoxCPM2 TTS server is listening on http://%s:%d\n", params.hostname.c_str(), params.port);
+    if (svr.is_running()) {
+        LOG_INF("VoxCPM2 TTS server is listening on %s://%s:%d\n", use_tls ? "https" : "http", params.hostname.c_str(), params.port);
+    }
 
     // ── Signal handling ───────────────────────────────────────────────────
 
-    std::atomic<bool> running{true};
     shutdown_handler = [&](int) {
         running.store(false);
         svr.stop();
@@ -586,6 +612,9 @@ int main(int argc, char ** argv) {
     if (http_thread.joinable()) {
         http_thread.join();
     }
+    if (!listen_ok) {
+        LOG_ERR("HTTP server stopped with a listening error\n");
+    }
 
     if (state.runtime) {
         state.runtime->free();
@@ -593,5 +622,5 @@ int main(int argc, char ** argv) {
     }
 
     llama_backend_free();
-    return 0;
+    return listen_ok ? 0 : 1;
 }

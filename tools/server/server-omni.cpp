@@ -15,6 +15,7 @@
 #include <queue>
 #include <condition_variable>
 #include <fstream>
+#include <memory>
 #include <string>
 
 #include "httplib.h"
@@ -88,6 +89,8 @@ struct omni_server_state {
 
 int main(int argc, char ** argv) {
     common_params params;
+    // Omni listens on all interfaces unless overridden by the environment or CLI.
+    params.hostname = "0.0.0.0";
 
     common_init();
 
@@ -103,6 +106,32 @@ int main(int argc, char ** argv) {
         params.n_parallel = 1;
     }
 
+    // TLS support at build time does not require HTTPS at runtime.
+    const bool use_tls = !params.ssl_file_cert.empty();
+    if (use_tls != !params.ssl_file_key.empty()) {
+        LOG_ERR("TLS requires both --ssl-cert-file and --ssl-key-file\n");
+        return 1;
+    }
+    std::unique_ptr<httplib::Server> server;
+#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+    if (use_tls) {
+        server = std::make_unique<httplib::SSLServer>(params.ssl_file_cert.c_str(), params.ssl_file_key.c_str());
+    } else {
+        server = std::make_unique<httplib::Server>();
+    }
+#else
+    if (use_tls) {
+        LOG_ERR("TLS requested but this server was built without TLS support\n");
+        return 1;
+    }
+    server = std::make_unique<httplib::Server>();
+#endif
+    if (!server->is_valid()) {
+        LOG_ERR("Failed to initialize TLS: check --ssl-cert-file and --ssl-key-file\n");
+        return 1;
+    }
+    auto & svr = *server;
+
     llama_backend_init();
     llama_numa_init(params.numa);
 
@@ -112,13 +141,6 @@ int main(int argc, char ** argv) {
     if (!params.vpm_model.empty() || !params.apm_model.empty() || !params.tts_model.empty()) {
         LOG_INF("Using explicit omni model paths from args\n");
     }
-
-    // HTTP server setup
-#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
-    httplib::SSLServer svr(params.ssl_file_cert.c_str(), params.ssl_file_key.c_str());
-#else
-    httplib::Server svr;
-#endif
 
     omni_server_state state;
 
@@ -411,7 +433,10 @@ int main(int argc, char ** argv) {
     });
 
     // start server
-    svr.listen("0.0.0.0", params.port);
+    const bool listen_ok = svr.listen(params.hostname, params.port);
+    if (!listen_ok) {
+        LOG_ERR("Failed to listen on %s://%s:%d\n", use_tls ? "https" : "http", params.hostname.c_str(), params.port);
+    }
 
     // cleanup
     {
@@ -423,5 +448,5 @@ int main(int argc, char ** argv) {
     }
     llama_backend_free();
 
-    return 0;
+    return listen_ok ? 0 : 1;
 }

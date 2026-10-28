@@ -146,14 +146,21 @@ MiniCPM-o-4_5-gguf/
 ### Build
 
 ```bash
-# Configure
+# Configure for Linux (CPU) or macOS (Metal)
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 
 # Build
 cmake --build build --target llama-omni-server --target llama-omni-cli -j
 ```
 
-> CMake will auto-detect and enable Metal (macOS) or CUDA (Linux with NVIDIA GPU).
+For NVIDIA GPU acceleration on Linux, install the [CUDA toolkit](https://developer.nvidia.com/cuda-toolkit)
+and use this configure command instead, then run the build command above:
+
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON
+```
+
+> Metal is enabled by default on macOS. CUDA must be explicitly enabled with `-DGGML_CUDA=ON` on Linux.
 
 ### Usage
 
@@ -255,6 +262,7 @@ If you already have the GGUF weights from [Prerequisites](#prerequisites):
 
 ```bash
 # 1. Build the C++ engine
+# Linux + NVIDIA: install the CUDA toolkit and add -DGGML_CUDA=ON to the cmake command below.
 git clone https://github.com/tc-mb/llama.cpp-omni.git
 cd llama.cpp-omni && git checkout feat/web-demo \
     && cmake -B build -DCMAKE_BUILD_TYPE=Release \
@@ -314,7 +322,11 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --target llama-omni-server --target llama-omni-cli -j
 ```
 
-CMake auto-detects CUDA (Linux + NVIDIA) and Metal (macOS). After the build, `build/bin/llama-omni-server` is the binary `worker.py` will spawn — you do **not** need to start `llama-omni-server` yourself.
+Metal is enabled by default on macOS. On Linux, the command above builds the CPU backend;
+for NVIDIA GPU acceleration, install the CUDA toolkit and add `-DGGML_CUDA=ON` to the
+configure command. CUDA is not enabled automatically.
+
+After the build, `build/bin/llama-omni-server` is the binary `worker.py` will spawn — you do **not** need to start `llama-omni-server` yourself.
 
 **2. Install Python dependencies**
 
