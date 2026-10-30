@@ -3,6 +3,8 @@
 #include "audition.h"
 #include "omni.h"
 #include "token2wav/token2wav-impl.h"
+#include "token2wav/token2wav-pipeline.h"
+#include "token2wav/token2wav-profile.h"
 
 #include "llama.h"
 #include "common/common.h"
@@ -4632,7 +4634,9 @@ bool omni_tts_queues_empty(struct omni_context * ctx_omni) {
     }
     if (ctx_omni->t2w_thread_info) {
         std::lock_guard<std::mutex> lock(ctx_omni->t2w_thread_info->mtx);
-        t2w_empty = ctx_omni->t2w_thread_info->queue.empty();
+        t2w_empty = ctx_omni->t2w_thread_info->queue.empty() &&
+                    !ctx_omni->t2w_thread_info->cpp_processing.load() &&
+                    ctx_omni->t2w_thread_info->pending_vocoder.load(std::memory_order_acquire) == 0;
     }
     return tts_empty && t2w_empty;
 }
@@ -8927,9 +8931,124 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
     int wav_idx = 0;
     const int sample_rate = omni::flow::Token2Wav::kSampleRate;
     
-    while (t2w_thread_running) {
+    auto write_audio = [&](const std::vector<float> & chunk_wav, bool is_last_window,
+                           double t2w_ms, double queue_wait_ms,
+                           const std::string & output_dir, int turn_base) {
+        if (chunk_wav.empty()) {
+            return;
+        }
+
+        // Audio output callback (for WS protocol)
+        if (ctx_omni->audio_output_cb) {
+            ctx_omni->audio_output_cb(chunk_wav.data(), static_cast<int>(chunk_wav.size()),
+                                      sample_rate, is_last_window);
+        }
+
+        // Write WAV file
+        std::string wav_path = output_dir + "/wav_" + std::to_string(turn_base + wav_idx) + ".wav";
+
+        const int16_t num_channels = 1;
+        const int16_t bits_per_sample = 16;
+        const int16_t block_align = num_channels * (bits_per_sample / 8);
+        const int32_t byte_rate = sample_rate * block_align;
+
+        std::vector<int16_t> pcm(chunk_wav.size());
+        for (size_t i = 0; i < chunk_wav.size(); ++i) {
+            float x = chunk_wav[i];
+            if (!std::isfinite(x)) x = 0.0f;
+            x = std::max(-1.0f, std::min(1.0f, x));
+            pcm[i] = (int16_t)(x * 32767.0f);
+        }
+
+        uint32_t data_bytes = (uint32_t)(pcm.size() * sizeof(int16_t));
+        uint32_t riff_size = 36u + data_bytes;
+
+        FILE* f_wav = fopen(wav_path.c_str(), "wb");
+        if (f_wav) {
+            fwrite("RIFF", 1, 4, f_wav);
+            fwrite(&riff_size, 4, 1, f_wav);
+            fwrite("WAVE", 1, 4, f_wav);
+            fwrite("fmt ", 1, 4, f_wav);
+            uint32_t fmt_size = 16;
+            uint16_t audio_format = 1;
+            fwrite(&fmt_size, 4, 1, f_wav);
+            fwrite(&audio_format, 2, 1, f_wav);
+            fwrite(&num_channels, 2, 1, f_wav);
+            fwrite(&sample_rate, 4, 1, f_wav);
+            fwrite(&byte_rate, 4, 1, f_wav);
+            fwrite(&block_align, 2, 1, f_wav);
+            fwrite(&bits_per_sample, 2, 1, f_wav);
+            fwrite("data", 1, 4, f_wav);
+            fwrite(&data_bytes, 4, 1, f_wav);
+            fwrite(pcm.data(), 1, data_bytes, f_wav);
+            fclose(f_wav);
+
+            float audio_duration = chunk_wav.size() / (float)sample_rate;
+            float rtf = (float)(t2w_ms / 1000.0) / audio_duration;
+
+            auto wav_complete_time = std::chrono::high_resolution_clock::now();
+            auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                wav_complete_time - ctx_omni->stream_decode_start_time).count();
+
+            if (wav_idx == 0) {
+                print_with_timestamp("🎉 首响时间 (First Audio Response): %lldms\n", (long long)elapsed_ms);
+            }
+            print_with_timestamp("T2W线程: wav_%d.wav | %.2fs audio | %.1fms inference | RTF=%.2f | t=%lldms | queue_wait=%.1fms\n",
+                                turn_base + wav_idx, audio_duration, t2w_ms, rtf, (long long)elapsed_ms, queue_wait_ms);
+            wav_idx++;
+        }
+    };
+
+    bool pipeline_failed = false;
+    std::unique_ptr<omni::flow::VocoderPipeline> pipeline;
+    const char * overlap = std::getenv("OMNI_T2W_PIPELINE_OVERLAP");
+    if (overlap && std::strcmp(overlap, "1") == 0 && ctx_omni->token2wav_session) {
+        auto * t2w = &ctx_omni->token2wav_session->t2w;
+        if (t2w->pipeline_vocoder_supported()) {
+            size_t capacity = 2;
+            const char * value = std::getenv("OMNI_MEL_QUEUE_CAPACITY");
+            if (value) {
+                char * end = nullptr;
+                const long parsed = std::strtol(value, &end, 10);
+                if (end != value && *end == '\0' && parsed >= 1 && parsed <= 16) {
+                    capacity = (size_t) parsed;
+                }
+            }
+            pipeline.reset(new omni::flow::VocoderPipeline(
+                capacity, ctx_omni->t2w_thread_info->pending_vocoder,
+                [&, t2w](const omni::flow::MelTask & task) {
+                    if (ctx_omni->break_event.load()) {
+                        return true;
+                    }
+                    std::vector<float> wave;
+                    int64_t samples = 0;
+                    const auto start = std::chrono::steady_clock::now();
+                    if (!t2w->push_mel_to_wave(task.mel_bct, task.is_final, wave, samples)) {
+                        return false;
+                    }
+                    const double voc_ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - start).count();
+                    omni::flow::profile::record_ms("pipeline.vocoder", voc_ms);
+                    omni::flow::profile::record_audio_samples(samples, sample_rate);
+                    if (!ctx_omni->break_event.load()) {
+                        write_audio(wave, task.is_final, task.flow_ms + voc_ms, task.queue_wait_ms,
+                                    task.output_dir, task.turn_base);
+                    }
+                    return true;
+                }));
+            print_with_timestamp("T2W: Flow/Vocoder overlap enabled (CPU vocoder, capacity=%zu)\n", capacity);
+        } else {
+            LOG_WRN("T2W: pipeline overlap requires a CPU vocoder; using serial inference\n");
+        }
+    }
+
+    while (t2w_thread_running && !pipeline_failed) {
         // 🔧 [P0-打断检测] 检测 break_event 并清空队列
         if (ctx_omni->break_event.load()) {
+            if (pipeline && !pipeline->cancel()) {
+                pipeline_failed = true;
+                break;
+            }
             std::lock_guard<std::mutex> lock(mtx);
             while (!queue.empty()) {
                 T2WOut *t2w_out = queue.front();
@@ -8972,6 +9091,12 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
             continue;
         }
         
+        struct processing_guard {
+            std::atomic<bool> & flag;
+            explicit processing_guard(std::atomic<bool> & value) : flag(value) { flag.store(true); }
+            ~processing_guard() { flag.store(false); }
+        } processing(ctx_omni->t2w_thread_info->cpp_processing);
+
         // Get all available tokens from queue
         std::vector<llama_token> new_tokens;
         bool is_final = false;
@@ -9010,6 +9135,10 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
         int effective_round_idx = (received_round_idx >= 0) ? received_round_idx : ctx_omni->simplex_round_idx;
         
         if (!ctx_omni->duplex_mode && effective_round_idx != last_round_idx) {
+            if (pipeline && !pipeline->drain()) {
+                pipeline_failed = true;
+                break;
+            }
             print_with_timestamp("T2W线程(C++): 轮次切换 (%d -> %d)，更新输出目录\n",
                                 last_round_idx, effective_round_idx);
             
@@ -9086,74 +9215,40 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
             // Time the inference
             auto t2w_start = std::chrono::high_resolution_clock::now();
             
-            std::vector<float> chunk_wav;
-            if (ctx_omni->token2wav_session->feed_window(window, is_last_window, chunk_wav)) {
-                auto t2w_end = std::chrono::high_resolution_clock::now();
-                double t2w_ms = std::chrono::duration<double, std::milli>(t2w_end - t2w_start).count();
-                
-                if (!chunk_wav.empty()) {
-                    // Audio output callback (for WS protocol)
-                    if (ctx_omni->audio_output_cb) {
-                        ctx_omni->audio_output_cb(chunk_wav.data(), static_cast<int>(chunk_wav.size()),
-                                                  sample_rate, is_last_window);
-                    }
-
-                    // Write WAV file
-                    std::string wav_path = tts_wav_output_dir + "/wav_" + std::to_string(ctx_omni->wav_turn_base + wav_idx) + ".wav";
-                    
-                    const int16_t num_channels = 1;
-                    const int16_t bits_per_sample = 16;
-                    const int16_t block_align = num_channels * (bits_per_sample / 8);
-                    const int32_t byte_rate = sample_rate * block_align;
-                    
-                    std::vector<int16_t> pcm(chunk_wav.size());
-                    for (size_t i = 0; i < chunk_wav.size(); ++i) {
-                        float x = chunk_wav[i];
-                        if (!std::isfinite(x)) x = 0.0f;
-                        x = std::max(-1.0f, std::min(1.0f, x));
-                        pcm[i] = (int16_t)(x * 32767.0f);
-                    }
-                    
-                    uint32_t data_bytes = (uint32_t)(pcm.size() * sizeof(int16_t));
-                    uint32_t riff_size = 36u + data_bytes;
-                    
-                    FILE* f_wav = fopen(wav_path.c_str(), "wb");
-                    if (f_wav) {
-                        fwrite("RIFF", 1, 4, f_wav);
-                        fwrite(&riff_size, 4, 1, f_wav);
-                        fwrite("WAVE", 1, 4, f_wav);
-                        fwrite("fmt ", 1, 4, f_wav);
-                        uint32_t fmt_size = 16;
-                        uint16_t audio_format = 1;
-                        fwrite(&fmt_size, 4, 1, f_wav);
-                        fwrite(&audio_format, 2, 1, f_wav);
-                        fwrite(&num_channels, 2, 1, f_wav);
-                        fwrite(&sample_rate, 4, 1, f_wav);
-                        fwrite(&byte_rate, 4, 1, f_wav);
-                        fwrite(&block_align, 2, 1, f_wav);
-                        fwrite(&bits_per_sample, 2, 1, f_wav);
-                        fwrite("data", 1, 4, f_wav);
-                        fwrite(&data_bytes, 4, 1, f_wav);
-                        fwrite(pcm.data(), 1, data_bytes, f_wav);
-                        fclose(f_wav);
-                        
-                        float audio_duration = chunk_wav.size() / (float)sample_rate;
-                        float rtf = (float)(t2w_ms / 1000.0) / audio_duration;
-                        
-                        auto wav_complete_time = std::chrono::high_resolution_clock::now();
-                        auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                            wav_complete_time - ctx_omni->stream_decode_start_time).count();
-                        
-                        if (wav_idx == 0) {
-                            print_with_timestamp("🎉 首响时间 (First Audio Response): %lldms\n", (long long)elapsed_ms);
-                        }
-                        print_with_timestamp("T2W线程: wav_%d.wav | %.2fs audio | %.1fms inference | RTF=%.2f | t=%lldms | queue_wait=%.1fms\n",
-                                            ctx_omni->wav_turn_base + wav_idx, audio_duration, t2w_ms, rtf, (long long)elapsed_ms, queue_wait_ms);
-                        wav_idx++;
-                    }
+            if (pipeline) {
+                if (ctx_omni->break_event.load()) {
+                    break;
+                }
+                omni::flow::MelTask task;
+                task.is_final = is_last_window;
+                task.queue_wait_ms = queue_wait_ms;
+                task.output_dir = tts_wav_output_dir;
+                task.turn_base = ctx_omni->wav_turn_base;
+                if (!ctx_omni->token2wav_session->t2w.push_tokens_mel_only(
+                        window.data(), (int64_t) window.size(), is_last_window, task.mel_bct)) {
+                    LOG_ERR("T2W: pipeline Flow inference failed\n");
+                    pipeline_failed = true;
+                    break;
+                }
+                task.flow_ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::high_resolution_clock::now() - t2w_start).count();
+                omni::flow::profile::record_ms("pipeline.token2mel", task.flow_ms);
+                if (!pipeline->push(std::move(task))) {
+                    LOG_ERR("T2W: pipeline Vocoder inference or output failed\n");
+                    pipeline_failed = true;
+                    break;
                 }
             } else {
-                LOG_ERR("T2W线程: feed_window 失败\n");
+                std::vector<float> chunk_wav;
+                if (ctx_omni->token2wav_session->feed_window(window, is_last_window, chunk_wav)) {
+                    auto t2w_end = std::chrono::high_resolution_clock::now();
+                    double t2w_ms = std::chrono::duration<double, std::milli>(t2w_end - t2w_start).count();
+
+                    write_audio(chunk_wav, is_last_window, t2w_ms, queue_wait_ms,
+                                tts_wav_output_dir, ctx_omni->wav_turn_base);
+                } else {
+                    LOG_ERR("T2W线程: feed_window 失败\n");
+                }
             }
             
             // Slide window by CHUNK_SIZE (25), keep last PRE_LOOKAHEAD (3) for overlap
@@ -9193,6 +9288,12 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
             process_count++;
             
             if (is_last_window) {
+                // Audio callbacks, WAV files and the final marker must complete
+                // before the producer changes directories or turn counters.
+                if (pipeline && !pipeline->drain()) {
+                    pipeline_failed = true;
+                    break;
+                }
                 // 🔧 [与 Python 对齐] 只有 is_final（轮次结束）时才重置
                 // Python: if is_last_chunk: stream(..., last_chunk=True); buffer = []
                 // 普通 chunk 结束时，剩余 tokens 保留在 buffer 中等待下一个 chunk
@@ -9242,6 +9343,14 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
         
     }
     
+    if (pipeline && !pipeline->drain()) {
+        pipeline_failed = true;
+    }
+    // Join before write_audio's captured turn state goes out of scope.
+    pipeline.reset();
+    if (pipeline_failed) {
+        LOG_ERR("T2W: pipeline stopped after inference/output failure\n");
+    }
     print_with_timestamp("T2W(C++) 线程: 停止\n");
     fflush(stdout);
 }

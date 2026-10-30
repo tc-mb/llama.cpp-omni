@@ -228,6 +228,32 @@ when there are many slices.
 Programmatically the same switch is exposed via `common_params.vpm_batch_encode`
 (applied in `omni_init`) and `vision_set_batch_encode(ctx_vision, true)`.
 
+### Flow / Vocoder overlap (experimental)
+
+For the native C++ Token2Wav worker, `OMNI_T2W_PIPELINE_OVERLAP=1` keeps Flow
+inference on the T2W thread and sends mel chunks to a single CPU Vocoder worker.
+This permits Flow for the next window to overlap Vocoder and audio delivery for
+the previous window. The switch is off by default; non-CPU Vocoders use the
+serial path. Python Token2Wav is unaffected.
+
+```bash
+OMNI_T2W_PIPELINE_OVERLAP=1 OMNI_VOC_DEVICE=cpu ./build/bin/llama-omni-cli ...
+```
+
+`OMNI_MEL_QUEUE_CAPACITY` controls the waiting mel queue (default 2, accepted
+range 1–16); it excludes the active Vocoder task. A full queue blocks Flow.
+Turn-final markers and output-directory changes wait for queued audio delivery.
+Interrupt handling drops queued mel and waits for the active task; it does not
+rewind the model's streaming state. The consumer joins before the T2W worker
+exits, so session reuse/destruction cannot outlive its callbacks.
+
+`OMNI_T2W_PROFILE=1` reports separate `pipeline.token2mel` and `pipeline.vocoder`
+stage timings. The per-WAV inference figure is their sum and is not pipeline
+wall time or a measured speedup. Check PCM parity, first audio, output gaps,
+and end-to-end RTF on the target device before enabling this experimentally.
+The weight-free `test-t2w-pipeline` exercises the production handoff queue and
+lifecycle barriers; it does not run model inference.
+
 ### Output
 
 Generated audio files are saved to `tools/omni/output/`:
