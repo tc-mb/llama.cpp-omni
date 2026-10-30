@@ -9933,6 +9933,10 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
                     chunk_limit_reached = true;
                 }
             }
+            // eval_tokens_with_hidden 每个 token 都 malloc 一份 n_embd 的 hidden state，
+            // 拷进 chunk_hidden_states 之后要释放
+            free(hidden_states);
+            hidden_states = nullptr;
 
             if (tmp == nullptr) {
                 LOG_ERR("Duplex decode: llama_loop returned nullptr\n");
@@ -10972,25 +10976,11 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
                         // 🔧 [调试] 打印被过滤的 token
                     }
                 }
-                
-                // if (hidden_states != nullptr) {
-                //     int n_embd = llama_n_embd(llama_get_model(ctx_omni->ctx_llama));
-                //     // 打印第一个 embedding 的前5个数字
-                //     printf("First embedding (first 5): ");
-                //     for (int i = 0; i < 5 && i < n_embd; i++) {
-                //         printf("%.6f ", hidden_states[i]);
-                //     }
-                //     printf("\n");
-                //     // 打印最后一个 embedding 的后5个数字 (这里只有1个token，所以第一个和最后一个是同一个)
-                //     printf("Last embedding (last 5): ");
-                //     for (int i = n_embd - 5; i < n_embd; i++) {
-                //         if (i >= 0) {
-                //             printf("%.6f ", hidden_states[i]);
-                //         }
-                //     }
-                //     printf("\n");
-                //     free(hidden_states);
-                // }
+
+                // eval_tokens_with_hidden 每个 token 都 malloc 一份 n_embd 的 hidden state，
+                // 拷进 chunk_hidden_states 之后要释放
+                free(hidden_states);
+                hidden_states = nullptr;
                 if (!llm_first_token_logged) {
                     llm_first_token_logged = true;
                 }
