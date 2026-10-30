@@ -228,6 +228,20 @@ when there are many slices.
 Programmatically the same switch is exposed via `common_params.vpm_batch_encode`
 (applied in `omni_init`) and `vision_set_batch_encode(ctx_vision, true)`.
 
+### Vision patch projection (experimental)
+
+Set `OMNI_VPM_PATCHMM=1` to pack RGB pixels directly into patches on the host and
+project them with `ggml_mul_mat`. This replaces the HWC-to-CHW input conversion and
+the device-side convolution/im2col path for the non-overlapping patch embedding.
+The switch is off by default. It applies only to single-image passes with
+patch-aligned dimensions and contiguous F16/F32 RGB patch weights; other cases,
+including batched vision encoding, use the existing convolution path.
+
+Run `./build/bin/test-vision-patch-mm` for a weight-free CPU comparison against the
+convolution path. An optional backend name (for example `CANN0`, when built and
+available) selects another backend. Output accuracy and end-to-end performance
+should be checked on the target backend before deployment.
+
 ### Output
 
 Generated audio files are saved to `tools/omni/output/`:
