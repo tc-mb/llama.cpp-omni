@@ -9,6 +9,7 @@
 #include "sampling.h"
 #include "session.h"
 #include "ws_handler.h"
+#include "utf8_stream.h"
 
 #include <atomic>
 #include <memory>
@@ -50,8 +51,11 @@ static void res_error(httplib::Response & res, const json & err) {
     res.set_content(err.dump(), "application/json");
 }
 
+// This runs inside cpp-httplib's content provider, where an exception from
+// dump() is not caught and terminates the process. Replace invalid UTF-8
+// instead of throwing; callers already pass complete code points.
 static bool server_sent_event(httplib::DataSink & sink, const json & ev) {
-    std::string str = "data: " + ev.dump() + "\n\n";
+    std::string str = "data: " + ev.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
     return sink.write(str.data(), str.size());
 }
 
@@ -337,6 +341,10 @@ int main(int argc, char ** argv) {
                     (void) stream_decode(state.octx, dd, ri);
                 }, debug_dir, round_idx);
 
+                // a token piece can end mid-character: hold the tail until the
+                // next piece completes it (an unfinished one at the end is dropped)
+                std::string utf8_pending;
+
                 // poll text queue
                 while (true) {
                     std::unique_lock<std::mutex> lk(state.octx->text_mtx);
@@ -355,7 +363,12 @@ int main(int argc, char ** argv) {
                         } else if (frag == "__END_OF_TURN__") {
                             ev = {{"content", ""}, {"stop", true}, {"is_listen", false}, {"end_of_turn", true}};
                         } else {
-                            ev = {{"content", frag}, {"stop", false}, {"is_listen", false}, {"end_of_turn", false}};
+                            const std::string text = sanitize_utf8_stream(utf8_pending, frag);
+                            if (text.empty()) {
+                                lk.lock();
+                                continue;
+                            }
+                            ev = {{"content", text}, {"stop", false}, {"is_listen", false}, {"end_of_turn", false}};
                         }
 
                         if (!server_sent_event(sink, ev)) {
