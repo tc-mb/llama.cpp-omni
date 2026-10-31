@@ -2277,6 +2277,17 @@ struct Token2WavSession {
                                  float               temperature         = 1.0f,
                                  const std::string & coreml_model_path  = "");
 
+    // Replace the voice prompt without reloading Token2Wav model weights.
+    // Stage one calls this before the TTS worker starts for a session.
+    bool set_prompt_bundle(const std::string & prompt_bundle_dir,
+                           int                 n_timesteps = 10,
+                           float               temperature = 1.0f);
+
+    // Restore the static voice cache without reloading model weights.
+    bool reset_to_prompt_cache_gguf(const std::string & prompt_cache_gguf_path,
+                                    int                 n_timesteps = 10,
+                                    float               temperature = 1.0f);
+
     bool feed_tokens(const int32_t * tokens, int64_t n_tokens, bool is_final, std::vector<float> & wave_bt_out);
 
     bool feed_tokens(const std::vector<int32_t> & tokens, bool is_final, std::vector<float> & wave_bt_out) {
