@@ -3859,8 +3859,7 @@ bool sliding_window_enforce(struct omni_context * ctx_omni) {
 //
 // omni main
 //
-std::condition_variable g_decode_cv;
-bool prefill_done = true;
+std::condition_variable g_decode_cv;  // 配合 llm_thread_info->mtx，状态在 ctx_omni->prefill_epoch_*
 std::mutex speek_mtx;
 std::condition_variable speek_cv;
 bool last_speek_done_flag = false;
@@ -4969,10 +4968,7 @@ void llm_thread_func(omni_context* ctx_omni, common_params* params){
             //   1. 新会话开始（通过 reset API）
             //   2. 滑动窗口触发（context 满了）
             print_with_timestamp("LLM thread: prefill continuing, n_past=%d (no KV cache clear)\n", ctx_omni->n_past);
-            
-            // 标记前缀填充未完成，防止解码线程过早开始
-            prefill_done = false;
-            
+
             // 步骤1：批量取出队列中的所有嵌入数据
             // 这样可以一次性处理多个嵌入，提高效率
             std::vector<omni_embeds*> llm_embeds;
@@ -5122,10 +5118,15 @@ void llm_thread_func(omni_context* ctx_omni, common_params* params){
         // 1. 所有嵌入数据都已处理完成（队列为空）
         // 2. 解码线程设置了 need_speek = true，表示需要开始生成文本
 
+        // 分支1 在批量取完队列后释放了锁；这里的判断和状态更新必须在锁内，
+        // 否则 queue.empty() 和 stream_decode 之间是裸竞态。
+        if (!lock.owns_lock()) {
+            lock.lock();
+        }
         if (queue.empty() && ctx_omni->need_speek){
-            // 标记前缀填充完成
-            prefill_done = true;
-            
+            // 标记前缀填充完成：把 done 推到当前请求号
+            ctx_omni->prefill_epoch_done = ctx_omni->prefill_epoch_request;
+
             // 如果使用TTS，重置speek_done标志，允许TTS线程开始工作
             if (ctx_omni->use_tts && !ctx_omni->duplex_mode) {
                 ctx_omni->speek_done = false;
@@ -7062,7 +7063,7 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
             
             // 🔧 [诊断] 打印取出数据后的关键状态
             print_with_timestamp("TTS: after queue pop - speek_done=%d, llm_finish=%d, llm_text.empty=%d, token_ids.size=%zu\n",
-                                ctx_omni->speek_done, llm_finish, llm_text.empty(), current_chunk_token_ids.size());
+                                ctx_omni->speek_done ? 1 : 0, llm_finish, llm_text.empty(), current_chunk_token_ids.size());
             
             // If speek_done is true but we received llm_finish=true, handle state transition
             if (ctx_omni->speek_done && llm_finish) {
@@ -9932,6 +9933,10 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
                     chunk_limit_reached = true;
                 }
             }
+            // eval_tokens_with_hidden 每个 token 都 malloc 一份 n_embd 的 hidden state，
+            // 拷进 chunk_hidden_states 之后要释放
+            free(hidden_states);
+            hidden_states = nullptr;
 
             if (tmp == nullptr) {
                 LOG_ERR("Duplex decode: llama_loop returned nullptr\n");
@@ -10748,13 +10753,25 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
             print_with_timestamp("stream_decode: create t2w thread\n");
         }
         
-        ctx_omni->need_speek = true;
-        //ctx_omni->llm_thread.join();
-        ctx_omni->llm_thread_info->cv.notify_all();
-        print_with_timestamp("wait prefill done\n");
-        std::unique_lock<std::mutex> lock(ctx_omni->llm_thread_info->mtx);
-        g_decode_cv.wait(lock, []{ return prefill_done; });
-        prefill_done = false;
+        // 持锁登记请求号并置 need_speek，再等 llm 线程把 done 推到这个请求号，
+        // 确保本轮排队的 prefill 全部排空后才在同一个 llama_context 上解码。
+        // llm 线程只由 async prefill 启动；同步 prefill（llama-omni-cli 等先用
+        // async=false 喂完输入再切回 async 调 decode）时没有线程，也没有排队的
+        // prefill，不需要等。
+        if (ctx_omni->llm_thread.joinable()) {
+            uint64_t my_prefill_epoch;
+            {
+                std::unique_lock<std::mutex> lock(ctx_omni->llm_thread_info->mtx);
+                my_prefill_epoch = ++ctx_omni->prefill_epoch_request;
+                ctx_omni->need_speek = true;
+            }
+            ctx_omni->llm_thread_info->cv.notify_all();
+            print_with_timestamp("wait prefill done\n");
+            {
+                std::unique_lock<std::mutex> lock(ctx_omni->llm_thread_info->mtx);
+                g_decode_cv.wait(lock, [&]{ return ctx_omni->prefill_epoch_done >= my_prefill_epoch; });
+            }
+        }
     }
 
     // 🔧 [unit 记账] 现在 prefill 已经写完 KV、unit_history 里也已经
@@ -10959,25 +10976,11 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
                         // 🔧 [调试] 打印被过滤的 token
                     }
                 }
-                
-                // if (hidden_states != nullptr) {
-                //     int n_embd = llama_n_embd(llama_get_model(ctx_omni->ctx_llama));
-                //     // 打印第一个 embedding 的前5个数字
-                //     printf("First embedding (first 5): ");
-                //     for (int i = 0; i < 5 && i < n_embd; i++) {
-                //         printf("%.6f ", hidden_states[i]);
-                //     }
-                //     printf("\n");
-                //     // 打印最后一个 embedding 的后5个数字 (这里只有1个token，所以第一个和最后一个是同一个)
-                //     printf("Last embedding (last 5): ");
-                //     for (int i = n_embd - 5; i < n_embd; i++) {
-                //         if (i >= 0) {
-                //             printf("%.6f ", hidden_states[i]);
-                //         }
-                //     }
-                //     printf("\n");
-                //     free(hidden_states);
-                // }
+
+                // eval_tokens_with_hidden 每个 token 都 malloc 一份 n_embd 的 hidden state，
+                // 拷进 chunk_hidden_states 之后要释放
+                free(hidden_states);
+                hidden_states = nullptr;
                 if (!llm_first_token_logged) {
                     llm_first_token_logged = true;
                 }

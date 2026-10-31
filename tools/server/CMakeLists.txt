@@ -45,6 +45,7 @@ add_executable(${TARGET_OMNI}
     protocol.cpp
     ws_handler.h
     ws_handler.cpp
+    utf8_stream.h
 )
 install(TARGETS ${TARGET_OMNI} RUNTIME)
 
