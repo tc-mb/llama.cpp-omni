@@ -205,7 +205,7 @@ a caller can size an expert cache before committing to a ~15 GiB load.
 ## 7. Tooling
 
 ```
-tools/moe/convert_les_gguf.py pack   --model <in.gguf> --out <out.gguf>
+tools/moe/convert_les_gguf.py pack   --model <in.gguf> --out <out.gguf> [--thinking off|on]
 tools/moe/convert_les_gguf.py verify --model <in.gguf> --packed <out.gguf>
 tools/moe/convert_les_gguf.py probe  --packed <out.gguf>
 ```
@@ -223,6 +223,18 @@ disk, so a conversion host needs roughly twice the output size free.
 
 Because the repack only moves bytes, it is also the right tool for a model that was already
 quantised upstream: re-running `llama-quantize` would change the bytes, which is not a repack.
+
+`--thinking` bakes the assistant turn's mode into the chat template, defaulting to `off`:
+
+| value | generation prompt |
+| --- | --- |
+| `off` (default) | `<\|im_start\|>assistant\n<think>\n\n</think>\n\n` — the model answers directly |
+| `on` | `<\|im_start\|>assistant\n<think>\n` — the model thinks first |
+
+This is a conversion-time choice rather than a runtime switch because `common_chat_templates`
+defaults `enable_thinking` to **true**: a template that merely honours that variable thinks by
+default, which is the failure this model hits in llama.cpp. Baking the prefix keeps the produced
+file's behaviour independent of a runtime default.
 
 ## 8. Compatibility
 
