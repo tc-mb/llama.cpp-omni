@@ -126,7 +126,7 @@ static bool try_parse_ftype(const std::string & ftype_str_in, llama_ftype & ftyp
 static void usage(const char * executable) {
     printf("usage: %s [--help] [--allow-requantize] [--leave-output-tensor] [--pure] [--imatrix] [--include-weights]\n", executable);
     printf("       [--exclude-weights] [--output-tensor-type] [--token-embedding-type] [--tensor-type] [--tensor-type-file]\n");
-    printf("       [--prune-layers] [--keep-split] [--override-kv] [--dry-run]\n");
+    printf("       [--prune-layers] [--keep-split] [--override-kv] [--dry-run] [--les-experts]\n");
     printf("       model-f32.gguf [model-quant.gguf] type [nthreads]\n\n");
     printf("  --allow-requantize\n");
     printf("                                      allow requantizing tensors that have already been quantized\n");
@@ -166,6 +166,11 @@ static void usage(const char * executable) {
     printf("  --dry-run\n");
     printf("                                      calculate and show the final quantization size without performing quantization\n");
     printf("                                      example: llama-quantize --dry-run model-f32.gguf Q4_K\n\n");
+    printf("  --les-experts\n");
+    printf("                                      write the routed MoE experts as LES regions: one I8\n");
+    printf("                                      carrier per layer, layout in les.moe.*. This is the\n");
+    printf("                                      layout the on-device streaming reader expects, and it\n");
+    printf("                                      keeps each expert's gate|up|down byte-contiguous\n\n");
     printf("note: --include-weights and --exclude-weights cannot be used together\n\n");
     printf("-----------------------------------------------------------------------------\n");
     printf(" allowed quantization types\n");
@@ -545,6 +550,8 @@ int llama_quantize(int argc, char ** argv) {
             if (arg_idx == argc-1 || !string_parse_kv_override(argv[++arg_idx], kv_overrides)) {
                 usage(argv[0]);
             }
+        } else if (strcmp(argv[arg_idx], "--les-experts") == 0) {
+            params.les_experts = true;
         } else if (strcmp(argv[arg_idx], "--dry-run") == 0) {
             params.dry_run = true;
         } else if (strcmp(argv[arg_idx], "--allow-requantize") == 0) {

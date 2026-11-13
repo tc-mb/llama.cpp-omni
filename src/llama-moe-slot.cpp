@@ -648,6 +648,9 @@ struct llama_moe_slot_runtime::impl {
             // 层间互相覆盖（曾经的实际 bug）。
             userdata[il] = { nullptr, (int) il };
             n_enabled++;
+            if (first_moe_layer < 0) {
+                first_moe_layer = (int) il;
+            }
             last_moe_layer = (int) il;
             if (state.pack_ok) {
                 n_pack_ok++;
@@ -1935,6 +1938,7 @@ struct llama_moe_slot_runtime::impl {
     /// 只需不撕裂，不依赖可见顺序。
     std::atomic<bool> want_nocache{false};
     int last_moe_layer = -1;
+    int first_moe_layer = -1;
     uint64_t n_prefill_ubatch = 0;
     uint64_t n_decode_step = 0;
     ubatch_acc cur;
@@ -2317,14 +2321,22 @@ void llama_moe_slot_runtime::process(
 
     const int32_t n_rows = (int32_t) expert_ids->ne[1];
 
-    const bool decode = n_rows == 1;
+    // 阶段判据用 **ubatch 级** 的 token 数，不能用本层的行数。
+    //
+    // 最后层经过 `inp_out_ids` 收集后行数可能降到 1（只算要输出的那几行），
+    // 用 n_rows 就会把 prefill 的最后一层误判成 decode：窗口路径被打开、
+    // 触发中途的阶段切换清缓存，最后层按窗口张量算 —— prefill 结果随之改变。
+    // `cur.n_tokens` 在本次 ubatch 的第一个 MoE 层写入，对后续各层都成立。
+    const int32_t n_tokens_ub = pimpl->cur.n_layers > 0 ? pimpl->cur.n_tokens : n_rows;
+
+    const bool decode = n_tokens_ub == 1;
     // 窗口也覆盖投机验证这类**小批次**（批宽 = n_max+1）：它们与单 token decode 走
     // 同一条 mul_mv_id 路径、同一套每层 `.dec` 张量，跨轮复用同一批专家。
     // 大批次（prefill）不走 —— 它拿的是 prefill 共享视图，只能用 [0, prefill_cap) 那段。
     //
     // 上限由 window_max_rows 按缓存区容量夹紧（见 resolve_decode_window），
     // 「并集装不下」的风险在那里就被消掉，不会落到这里的运行期。
-    const bool window_mode = pimpl->decode_window > 0 && n_rows <= pimpl->window_max_rows;
+    const bool window_mode = pimpl->decode_window > 0 && n_tokens_ub <= pimpl->window_max_rows;
     const bool lookahead_step = pimpl->lookahead.enabled && decode;
 
     // auto 模式下按阶段切 experts 的缓存策略：prefill 绕过、decode 不绕过。
@@ -2333,7 +2345,7 @@ void llama_moe_slot_runtime::process(
     // decode 阶段照样存在，用它会连 decode 一起绕过缓存。本判据与 llama-context 的
     // moe_decode_phase 同源。默认（非 auto）下这段不生效。
     if (llama_moe_slot_runtime::impl::nocache_mode() < 0) {
-        const bool want = n_rows > pimpl->window_max_rows;
+        const bool want = n_tokens_ub > pimpl->window_max_rows;
         if (pimpl->want_nocache.load(std::memory_order_relaxed) != want) {
             pimpl->want_nocache.store(want, std::memory_order_relaxed);
             pimpl->apply_experts_nocache(want);
@@ -2666,7 +2678,10 @@ void llama_moe_slot_runtime::process(
     const int n_miss = (int) pending.size();
     const int n_hit = n_unique - n_miss;
 
-    if (layer == 0) {
+    // ubatch 级的记账与阶段判定都以**第一个 MoE 层**为起点，不是 layer 0：
+    // 有些架构（如 minicpm5moe）前面的层是 dense FFN，process() 根本不会被调到，
+    // 用 layer 0 判会让累加器永远不重置，读到上一个 ubatch 的陈旧 token 数。
+    if (layer == pimpl->first_moe_layer) {
         if (pimpl->cur.n_layers > 0) {
             pimpl->flush_ubatch(pimpl->cur.n_tokens <= 1 ? "decode" : "prefill",
                 pimpl->cur.n_tokens <= 1 ? pimpl->n_decode_step : pimpl->n_prefill_ubatch);

@@ -206,6 +206,75 @@ struct tensor_metadata {
 };
 
 //
+// LES routed-expert regions
+//
+// The streaming expert reader requires one expert per preadv, i.e. an expert's
+// gate|up|down bytes contiguous. A plain GGUF stores them family-major, so the expert
+// bytes are staged per layer and written as one I8 carrier tensor, with the layout
+// recorded in `les.moe.*` metadata.
+//
+
+namespace {
+
+constexpr const char * LES_GATE    = "ffn_gate_exps";
+constexpr const char * LES_UP      = "ffn_up_exps";
+constexpr const char * LES_DOWN    = "ffn_down_exps";
+constexpr const char * LES_GATE_UP = "ffn_gate_up_exps";
+
+// Order inside one expert. Fixed so the same weights always produce the same bytes,
+// regardless of how the source file ordered its tensors.
+int les_family_order(const std::string & family) {
+    if (family == LES_GATE)    return 0;
+    if (family == LES_UP)      return 1;
+    if (family == LES_DOWN)    return 2;
+    if (family == LES_GATE_UP) return 3;
+    return -1;
+}
+
+// `blk.7.ffn_up_exps.weight` -> layer 7, family "ffn_up_exps". False for anything else.
+bool les_parse_expert_name(const char * name, int32_t & layer, std::string & family) {
+    const std::string s = name ? name : "";
+    if (s.rfind("blk.", 0) != 0) {
+        return false;
+    }
+    const size_t first = s.find('.', 4);
+    if (first == std::string::npos) {
+        return false;
+    }
+    const std::string layer_text = s.substr(4, first - 4);
+    if (layer_text.empty() || layer_text.find_first_not_of("0123456789") != std::string::npos) {
+        return false;
+    }
+    if (s.size() < 7 || s.compare(s.size() - 7, 7, ".weight") != 0) {
+        return false;
+    }
+    const std::string body = s.substr(first + 1, s.size() - 7 - first - 1);
+    if (les_family_order(body) < 0) {
+        return false;
+    }
+    layer  = std::stoi(layer_text);
+    family = body;
+    return true;
+}
+
+// One layer's region while it is being filled, one expert family at a time.
+struct les_region {
+    std::vector<uint8_t> data;
+    size_t               stride   = 0;
+    int32_t              n_expert = 0;
+    int                  filled   = 0;
+    int                  expected = 0;
+};
+
+struct les_family_slot {
+    ggml_type type       = GGML_TYPE_COUNT;
+    size_t    offset     = 0;   // inside one expert
+    size_t    per_expert = 0;   // bytes of one expert in this family
+};
+
+} // namespace
+
+//
 // dequantization
 //
 
@@ -920,7 +989,10 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         }
     }
 
-    const size_t align = GGUF_DEFAULT_ALIGNMENT;
+    // LES packs one expert per preadv, so an expert's bytes must be page aligned: the
+    // stride is a multiple of 4096 for the quantisations in use, and a page-aligned region
+    // base keeps every expert read on page boundaries.
+    const size_t align = params->les_experts ? 4096 : GGUF_DEFAULT_ALIGNMENT;
     gguf_context_ptr ctx_out { gguf_init_empty() };
 
     std::vector<int> prune_list = {};
@@ -934,6 +1006,20 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     gguf_set_kv     (ctx_out.get(), ml.metadata);
     gguf_set_val_u32(ctx_out.get(), "general.quantization_version", GGML_QNT_VERSION); // TODO: use LLM_KV
     gguf_set_val_u32(ctx_out.get(), "general.file_type", ftype); // TODO: use LLM_KV
+
+    // Set the alignment through the context, not only as a key: `gguf_add_tensor` lays out
+    // offsets from `ctx->alignment`, and an empty context starts at the default. Writing the
+    // key alone would record one alignment while computing offsets with another, and the
+    // file would fail to load with "tensor X has offset N, expected M".
+    if (params->les_experts) {
+        if (params->keep_split) {
+            throw std::runtime_error("--les-experts writes a single file; it cannot be combined with --keep-split");
+        }
+        if (params->dry_run) {
+            throw std::runtime_error("--les-experts is a write mode; it cannot be combined with --dry-run");
+        }
+    }
+    gguf_set_alignment(ctx_out.get(), align);
 
     // Remove split metadata
     gguf_remove_key(ctx_out.get(), ml.llm_kv(LLM_KV_SPLIT_NO).c_str());
@@ -1014,6 +1100,11 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     // flag for --dry-run
     bool will_require_imatrix = false;
 
+    // LES: per layer, the families that will be interleaved into one carrier tensor.
+    std::map<int32_t, std::map<std::string, les_family_slot>> les_plan;
+    std::map<int32_t, les_region> les_regions;
+    ggml_context * les_meta = nullptr;   // holds the carrier tensor metadata
+
     //
     // preliminary iteration over all weights
     //
@@ -1026,7 +1117,16 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         if (!ctx_outs[i_split]) {
             ctx_outs[i_split].reset(gguf_init_empty());
         }
-        gguf_add_tensor(ctx_outs[i_split].get(), tensor);
+
+        // LES: routed expert tensors do not go into the output under their own names.
+        // They are collected per layer and written as one carrier tensor instead.
+        int32_t     les_layer  = -1;
+        std::string les_family;
+        const bool  is_les_expert = params->les_experts &&
+                les_parse_expert_name(tensor->name, les_layer, les_family);
+        if (!is_les_expert) {
+            gguf_add_tensor(ctx_outs[i_split].get(), tensor);
+        }
 
         metadata[i].allows_quantization = tensor_allows_quantization(params, model->arch, tensor);
 
@@ -1034,6 +1134,26 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             metadata[i].target_type = llama_tensor_get_type(qs, params, tensor, default_type, metadata[i]);
         } else {
             metadata[i].target_type = tensor->type;
+        }
+
+        if (is_les_expert) {
+            if (tensor->ne[2] <= 0 || tensor->ne[3] != 1) {
+                throw std::runtime_error(format(
+                        "--les-experts: '%s' is not a 3-D expert stack", tensor->name));
+            }
+            const ggml_type out_type = metadata[i].target_type;
+            const size_t per_expert = ggml_row_size(out_type, tensor->ne[0]) * (size_t) tensor->ne[1];
+            if (per_expert % 32 != 0) {
+                throw std::runtime_error(format(
+                        "--les-experts: '%s' is %zu bytes per expert, not a multiple of 32",
+                        tensor->name, per_expert));
+            }
+            auto & families = les_plan[les_layer];
+            if (families.count(les_family)) {
+                throw std::runtime_error(format(
+                        "--les-experts: duplicate tensor '%s'", tensor->name));
+            }
+            families[les_family] = { out_type, 0, per_expert };
         }
 
         metadata[i].requires_imatrix = tensor_requires_imatrix(tensor->name, metadata[i].target_type, ftype);
@@ -1103,6 +1223,129 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         ::zeros(fout, meta_size);
     };
 
+    //
+    // LES: build the per-layer regions and register their carrier tensors
+    //
+    // Must run before the output stream is opened: the metadata size is computed from
+    // `ctx_outs`, so the carrier tensors have to be in it by then.
+    //
+    if (params->les_experts) {
+        if (les_plan.empty()) {
+            throw std::runtime_error(
+                    "--les-experts was requested but the model has no routed expert tensors");
+        }
+
+        ggml_init_params meta_params = {
+            /*.mem_size   =*/ ggml_tensor_overhead() * (size_t) (les_plan.size() + 8),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        les_meta = ggml_init(meta_params);
+
+        // n_expert_used is a decode-time property of the model, but the layout declares it
+        // per layer; a missing key makes the loader fall back to n_expert, which then trips
+        // the "expert counts do not match model metadata" check.
+        int64_t n_expert_used = 0;
+        {
+            const int key = gguf_find_key(ml.metadata, ml.llm_kv(LLM_KV_EXPERT_USED_COUNT).c_str());
+            if (key >= 0) {
+                n_expert_used = (int64_t) gguf_get_val_u32(ml.metadata, key);
+            }
+        }
+
+        std::string layout = "{\"layout\":\"expert_major_packed\",\"layers\":[";
+        bool first_layer = true;
+
+        for (auto & plan_it : les_plan) {
+            const int32_t layer = plan_it.first;
+            auto & families = plan_it.second;
+
+            // Family order gate | up | down fixes the intra-expert layout.
+            std::vector<std::pair<std::string, les_family_slot>> ordered;
+            ordered.reserve(families.size());
+            for (const auto & kv : families) {
+                ordered.emplace_back(kv.first, kv.second);
+            }
+            std::sort(ordered.begin(), ordered.end(),
+                      [](const auto & a, const auto & b) {
+                          return les_family_order(a.first) < les_family_order(b.first);
+                      });
+
+            size_t stride = 0;
+            for (auto & kv : ordered) {
+                kv.second.offset = stride;
+                stride += kv.second.per_expert;
+                families[kv.first] = kv.second;
+            }
+            if (stride % align != 0) {
+                throw std::runtime_error(format(
+                        "--les-experts: layer %d has expert_stride %zu, not a multiple of %zu",
+                        layer, stride, align));
+            }
+
+            int64_t n_expert = 0;
+            for (size_t i = 0; i < tensors.size(); ++i) {
+                int32_t l = -1; std::string f;
+                if (les_parse_expert_name(tensors[i]->tensor->name, l, f) && l == layer) {
+                    n_expert = tensors[i]->tensor->ne[2];
+                    break;
+                }
+            }
+            if (n_expert <= 0) {
+                throw std::runtime_error(format("--les-experts: layer %d has no experts", layer));
+            }
+
+            auto & region = les_regions[layer];
+            region.stride   = stride;
+            region.n_expert = (int32_t) n_expert;
+            region.expected = (int) families.size();
+            region.data.assign((size_t) n_expert * stride, 0);
+
+            const std::string carrier_name = format("blk.%d.moe_exps_packed.weight", layer);
+            ggml_tensor * carrier = ggml_new_tensor_4d(les_meta, GGML_TYPE_I8,
+                    (int64_t) stride, 1, 1, n_expert);
+            ggml_set_name(carrier, carrier_name.c_str());
+            gguf_add_tensor(ctx_outs[0].get(), carrier);
+
+            if (!first_layer) {
+                layout += ",";
+            }
+            first_layer = false;
+
+            std::string families_json;
+            bool first_family = true;
+            for (const char * name : { LES_GATE, LES_UP, LES_DOWN, LES_GATE_UP }) {
+                const auto fam = families.find(name);
+                if (fam == families.end()) {
+                    continue;
+                }
+                if (!first_family) {
+                    families_json += ",";
+                }
+                first_family = false;
+                families_json += format(
+                        "{\"tensor_family\":\"%s\",\"type\":\"%s\","
+                        "\"offset_in_expert\":%zu,\"bytes_per_expert\":%zu}",
+                        name, ggml_type_name(fam->second.type),
+                        fam->second.offset, fam->second.per_expert);
+            }
+
+            layout += format(
+                    "{\"layer\":%d,\"n_expert\":%lld,\"n_expert_used\":%lld,\"groups\":["
+                    "{\"expert_begin\":0,\"expert_count\":%lld,\"expert_stride\":%zu,"
+                    "\"tensor_name\":\"%s\",\"tensors\":[%s]}]}",
+                    layer, (long long) n_expert, (long long) n_expert_used,
+                    (long long) n_expert, stride, carrier_name.c_str(), families_json.c_str());
+        }
+        layout += "]}";
+
+        gguf_set_val_u32(ctx_outs[0].get(), "les.moe.version", 1);
+        gguf_set_val_str(ctx_outs[0].get(), "les.moe.layout", layout.c_str());
+
+        LLAMA_LOG_INFO("%s: LES: %zu expert regions, %zu bytes of layout metadata\\n",
+                __func__, les_regions.size(), layout.size());
+    }
+
     // no output file for --dry-run
     if (!params->dry_run) {
         new_ofstream(0);
@@ -1120,6 +1363,12 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         if (!params->dry_run && (weight.idx != cur_split && params->keep_split)) {
             close_ofstream();
             new_ofstream(weight.idx);
+        }
+
+        int32_t     les_layer  = -1;
+        std::string les_family;
+        if (params->les_experts) {
+            les_parse_expert_name(tensor->name, les_layer, les_family);
         }
 
         const size_t tensor_size = ggml_nbytes(tensor);
@@ -1249,21 +1498,56 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                 LLAMA_LOG_INFO("size = %8.2f MiB -> %8.2f MiB\n", tensor_size/1024.0/1024.0, new_size/1024.0/1024.0);
             }
             total_size_org += tensor_size;
-            total_size_new += new_size;
+            if (!(params->les_experts && les_layer >= 0)) {
+                total_size_new += new_size;
+            }
 
             // update the gguf meta data as we go
-            gguf_set_tensor_type(ctx_outs[cur_split].get(), metadata[i].name.c_str(), new_type);
-            GGML_ASSERT(gguf_get_tensor_size(ctx_outs[cur_split].get(), gguf_find_tensor(ctx_outs[cur_split].get(), metadata[i].name.c_str())) == new_size);
-            gguf_set_tensor_data(ctx_outs[cur_split].get(), metadata[i].name.c_str(), new_data);
+            // LES: expert tensors were not added under their own names (they merged into the
+            // carrier), so touching their metadata would assert.
+            if (!(params->les_experts && les_layer >= 0)) {
+                gguf_set_tensor_type(ctx_outs[cur_split].get(), metadata[i].name.c_str(), new_type);
+                GGML_ASSERT(gguf_get_tensor_size(ctx_outs[cur_split].get(), gguf_find_tensor(ctx_outs[cur_split].get(), metadata[i].name.c_str())) == new_size);
+                gguf_set_tensor_data(ctx_outs[cur_split].get(), metadata[i].name.c_str(), new_data);
+            }
 
-            // write tensor data + padding
-            fout.write((const char *) new_data, new_size);
-            zeros(fout, GGML_PAD(new_size, align) - new_size);
+            if (params->les_experts && les_layer >= 0) {
+                // Expert e of this family lands at e*stride + offset inside the layer's region.
+                auto & region = les_regions.at(les_layer);
+                const auto & slot = les_plan.at(les_layer).at(les_family);
+                if (new_size != slot.per_expert * (size_t) region.n_expert) {
+                    throw std::runtime_error(format(
+                            "--les-experts: '%s' produced %zu bytes, expected %zu",
+                            tensor->name, (size_t) new_size,
+                            slot.per_expert * (size_t) region.n_expert));
+                }
+                const auto * src = (const uint8_t *) new_data;
+                for (int32_t e = 0; e < region.n_expert; ++e) {
+                    memcpy(region.data.data() + (size_t) e * region.stride + slot.offset,
+                           src + (size_t) e * slot.per_expert, slot.per_expert);
+                }
+                if (++region.filled == region.expected) {
+                    const size_t region_size = region.data.size();
+                    fout.write((const char *) region.data.data(), region_size);
+                    zeros(fout, GGML_PAD(region_size, align) - region_size);
+                    total_size_new += region_size;
+                    std::vector<uint8_t>().swap(region.data);
+                }
+            } else {
+                // write tensor data + padding
+                fout.write((const char *) new_data, new_size);
+                zeros(fout, GGML_PAD(new_size, align) - new_size);
+            }
         } // no --dry-run
     } // main loop
 
     if (!params->dry_run) {
         close_ofstream();
+    }
+
+    if (les_meta) {
+        ggml_free(les_meta);
+        les_meta = nullptr;
     }
 
     LLAMA_LOG_INFO("%s: model size  = %8.2f MiB (%.2f BPW)\n", __func__, total_size_org/1024.0/1024.0, total_size_org*8.0/ml.n_elements);
@@ -1300,7 +1584,8 @@ llama_model_quantize_params llama_model_quantize_default_params() {
         /*.imatrix                     =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
         /*.tensor_type                 =*/ nullptr,
-        /*.prune_layers                =*/ nullptr
+        /*.prune_layers                =*/ nullptr,
+        /*.les_experts                 =*/ false
     };
 
     return result;

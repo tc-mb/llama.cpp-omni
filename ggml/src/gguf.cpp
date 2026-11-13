@@ -1001,12 +1001,24 @@ const char * gguf_type_name(enum gguf_type type) {
     return it == GGUF_TYPE_NAME.end() ? nullptr : it->second;
 }
 
+// defined further down; used by gguf_set_alignment above it
+void gguf_set_val_u32(struct gguf_context * ctx, const char * key, uint32_t val);
+
 uint32_t gguf_get_version(const struct gguf_context * ctx) {
     return ctx->version;
 }
 
 size_t gguf_get_alignment(const struct gguf_context * ctx) {
     return ctx->alignment;
+}
+
+void gguf_set_alignment(struct gguf_context * ctx, size_t alignment) {
+    GGML_ASSERT(alignment > 0 && (alignment & (alignment - 1)) == 0 && "alignment must be a power of 2");
+    // Both, and in this order: the key so the file records it, the field so
+    // `gguf_add_tensor` lays out offsets with it. Writing only the key would leave the
+    // offsets on the old alignment.
+    gguf_set_val_u32(ctx, GGUF_KEY_GENERAL_ALIGNMENT, (uint32_t) alignment);
+    ctx->alignment = alignment;
 }
 
 size_t gguf_get_data_offset(const struct gguf_context * ctx) {

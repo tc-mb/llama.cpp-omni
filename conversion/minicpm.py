@@ -117,6 +117,78 @@ class MiniCPM3Model(TextModel):
         )
 
 
+@ModelBase.register("MiniCPM5MoEForCausalLM")
+class MiniCPM5MoEModel(TextModel):
+    model_arch = gguf.MODEL_ARCH.MINICPM5MOE
+
+    merge_expert = True
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        hparams = self.hparams
+
+        self.gguf_writer.add_expert_count(hparams["n_routed_experts"])
+        self.gguf_writer.add_expert_shared_count(hparams.get("n_shared_experts", 0))
+
+        n_ff_exp = hparams["moe_intermediate_size"]
+        self.gguf_writer.add_expert_feed_forward_length(n_ff_exp)
+        self.gguf_writer.add_expert_shared_feed_forward_length(n_ff_exp * hparams.get("n_shared_experts", 1))
+
+        if (routed_scaling_factor := hparams.get("routed_scaling_factor")) is not None:
+            self.gguf_writer.add_expert_weights_scale(routed_scaling_factor)
+        if hparams.get("norm_topk_prob", True):
+            self.gguf_writer.add_expert_weights_norm(True)
+
+        self.gguf_writer.add_expert_gating_func(gguf.ExpertGatingFuncType.SIGMOID)
+
+        # layers with a dense FFN before the first MoE layer
+        self.gguf_writer.add_leading_dense_block_count(hparams.get("first_k_dense_replace", 0))
+
+        head_dim = hparams.get("head_dim", hparams["hidden_size"] // hparams["num_attention_heads"])
+        self.gguf_writer.add_rope_dimension_count(head_dim)
+
+    _experts: list[dict[str, Tensor]] | None = None
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        # stack the per-expert weights into a single 3d tensor
+        if self.merge_expert and "mlp.experts" in name:
+            n_experts = self.hparams["n_routed_experts"]
+            assert bid is not None
+
+            if self._experts is None:
+                self._experts = [{} for _ in range(self.block_count)]
+
+            self._experts[bid][name] = data_torch
+
+            if len(self._experts[bid]) >= n_experts * 3:
+                for w_name in ["down_proj", "gate_proj", "up_proj"]:
+                    datas: list[Tensor] = []
+
+                    for xid in range(n_experts):
+                        ename = f"model.layers.{bid}.mlp.experts.{xid}.{w_name}.weight"
+                        datas.append(self._experts[bid][ename])
+                        del self._experts[bid][ename]
+
+                    data_torch = torch.stack(datas, dim=0)
+
+                    merged_name = f"model.layers.{bid}.mlp.experts.{w_name}.weight"
+
+                    yield from super().modify_tensors(data_torch, merged_name, bid)
+                return
+
+            return
+
+        yield from super().modify_tensors(data_torch, name, bid)
+
+    def prepare_tensors(self):
+        super().prepare_tensors()
+
+        if self._experts is not None:
+            experts = [k for d in self._experts for k in d.keys()]
+            if len(experts) > 0:
+                raise ValueError(f"Unprocessed experts: {experts}")
+
+
 # MiniCPM-V 4.6: text tower is Qwen3.5 (linear+full hybrid attention) wrapped under
 # `model.language_model.*`; vision tower is SigLIP + a window-attention ViT merger
 # + a final DownsampleMLP merger. The same HF arch is registered twice below: once as
