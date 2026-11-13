@@ -124,10 +124,16 @@ protected:
         const int lo = static_cast<int>(fl);
         return (lo % 2 == 0) ? lo : lo + 1;
     }
+
+    // may the overview be upscaled to the slice budget? reference: allow_upscale = !has_slices
+    virtual bool allow_overview_upscale(bool /*has_slices*/) const {
+        return true;
+    }
 };
 
 // MiniCPM-OCR 1.0 ships 4x only, so slices align to patch_size * 2 (28) rather
 // than the patch_size * 4 slot the 4.6/4.7 stack keeps for its ViT merger.
+// allow_upscale follows tools/omni/vision.cpp, see allow_overview_upscale().
 struct mtmd_image_preprocessor_minicpm_ocr_1_0 : mtmd_image_preprocessor_minicpmv {
     using mtmd_image_preprocessor_minicpmv::mtmd_image_preprocessor_minicpmv;
 
@@ -135,6 +141,10 @@ protected:
     int get_slice_align() const override {
         const int merge = hparams.n_merge > 0 ? hparams.n_merge : 2;
         return hparams.patch_size * merge;
+    }
+
+    bool allow_overview_upscale(bool has_slices) const override {
+        return !has_slices;
     }
 };
 

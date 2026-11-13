@@ -43,6 +43,8 @@ add_library(mtmd
             models/mobilenetv5.cpp
             models/youtuvl.cpp
             models/yasa2.cpp
+            clip_qnn/clip_qnn.cpp
+            clip_qnn/clip_qnn.h
             )
 
 set_target_properties(mtmd PROPERTIES
@@ -87,6 +89,20 @@ endif()
 if (ANDROID)
     # miniaudio.h defines ma_android_sdk_version() without a prior prototype
     target_compile_options(mtmd PRIVATE -Wno-missing-prototypes)
+endif()
+
+# QNN / Hexagon support for the OCR vision encoder
+if(ENABLE_QNN)
+    if(NOT DEFINED QNN_INCLUDE_DIR)
+        message(FATAL_ERROR
+            "ENABLE_QNN requires -DQNN_INCLUDE_DIR=<QAIRT>/include/QNN "
+            "pointing at a QAIRT SDK install.")
+    endif()
+    if(NOT EXISTS "${QNN_INCLUDE_DIR}/QnnInterface.h")
+        message(FATAL_ERROR "QnnInterface.h not found in ${QNN_INCLUDE_DIR}")
+    endif()
+    target_compile_definitions(mtmd PRIVATE ENABLE_QNN)
+    target_include_directories(mtmd PRIVATE ${QNN_INCLUDE_DIR} ${QNN_INCLUDE_DIR}/..)
 endif()
 
 if (TARGET BUILD_INFO)
