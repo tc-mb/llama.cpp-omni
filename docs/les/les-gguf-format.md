@@ -194,8 +194,8 @@ From there the expert runtime sees exactly what it saw before: one path per laye
 `expert_stride`, and the three families inside that stride. `finalize_pack` validates those three
 properties and the read path is unchanged.
 
-`llama_les_probe()` exposes the per-layer slot sizes from the header alone, so a caller can size an
-expert cache before committing to a ~15 GiB load.
+`llama_moe_experts_geometry_from_file()` exposes the per-layer slot sizes from the header alone, so
+a caller can size an expert cache before committing to a ~15 GiB load.
 
 ## 7. Tooling
 
