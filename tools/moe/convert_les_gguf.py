@@ -305,22 +305,24 @@ def check_layout(layout: dict, tensors: dict | None) -> None:
                 f"{first_carrier}; resident tensors must come first")
 
 
-def force_no_thinking(template: str) -> tuple[str, str]:
-    """Rewrite the generation prompt so the assistant turn is an empty think block.
+def set_thinking(template: str, enable: bool) -> tuple[str, str]:
+    """Bake the thinking mode of the assistant turn into the template.
 
     Returns (new_template, note). When the template has no recognisable generation
     prompt, it is returned unchanged and `note` says why.
 
-    Why rewrite at all: the upstream GGUF ships a template whose generation prompt
-    emits `<|im_start|>assistant\\n<think>\\n\\n</think>\\n\\n`, i.e. thinking is already
-    off — but it does so through a hand-edited line carrying a filler comment, and it
-    ignores `enable_thinking` entirely (the variable does not occur in the template).
-    Both facts make the prompt fragile: a converter that reformats the template, or a
-    caller that expects the standard switch, silently gets a different prompt.
+    Why bake it rather than honour `enable_thinking`: `common_chat_templates` defaults
+    that variable to **true**, so a template that merely checks it thinks by default —
+    which is exactly the failure mode this model hits in llama.cpp. The generated file
+    therefore always emits one fixed prefix, so what the model does cannot depend on a
+    runtime default:
 
-    So the output file states it plainly: the assistant turn opens with an empty think
-    block, unconditionally. Thinking is not a user-facing option for this model in this
-    runtime, and a template that pretends otherwise is the source of the confusion.
+        enable=True   ->  <|im_start|>assistant\\n<think>\\n      (model thinks)
+        enable=False  ->  <|im_start|>assistant\\n<think>\\n\\n</think>\\n\\n
+
+    The upstream GGUF already ships the second form, but reaches it through a
+    hand-edited line carrying a filler comment and exposes no way to reach the first.
+    Declaring the choice at conversion time makes both explicit and reproducible.
     """
     marker = "{%- if add_generation_prompt %}"
     i = template.rfind(marker)
@@ -332,11 +334,21 @@ def force_no_thinking(template: str) -> tuple[str, str]:
     if j < 0:
         return template, "unterminated add_generation_prompt block; template left as-is"
 
+    if enable:
+        body = (
+            "    {# LES: thinking enabled at conversion time. #}\n"
+            "    {{- '<think>\\n' }}\n"
+        )
+    else:
+        body = (
+            "    {# LES: thinking disabled at conversion time; answer directly. #}\n"
+            "    {{- '<think>\\n\\n</think>\\n\\n' }}\n"
+        )
+
     new_block = (
         "{%- if add_generation_prompt %}\n"
         "    {{- '<|im_start|>assistant\\n' }}\n"
-        "    {# LES: the assistant turn opens with an empty think block. #}\n"
-        "    {{- '<think>\\n\\n</think>\\n\\n' }}\n"
+        + body +
         "{%- endif %}"
     )
     return template[:i] + new_block + tail[j + len("{%- endif %}"):], "rewritten"
@@ -375,7 +387,7 @@ def pack(args: argparse.Namespace) -> int:
         subtype = field.types[-1] if vtype == GGUFValueType.ARRAY else None
 
         if name == "tokenizer.chat_template":
-            template, note = force_no_thinking(str(field.contents()))
+            template, note = set_thinking(str(field.contents()), args.thinking == "on")
             if note != "rewritten":
                 print(f"warning: chat template not rewritten ({note})")
             writer.add_key_value(name, template, vtype, sub_type=subtype)
@@ -533,6 +545,10 @@ def main() -> int:
     p_pack.add_argument("--model", required=True, help="source gguf with inline experts")
     p_pack.add_argument("--out", required=True, help="output gguf")
     p_pack.add_argument("--force", action="store_true", help="overwrite the output")
+    p_pack.add_argument(
+        "--thinking", choices=("off", "on"), default="off",
+        help="bake the assistant turn's thinking mode into the chat template (default: off; "
+             "llama.cpp defaults reasoning to on, which breaks this model)")
     p_pack.set_defaults(func=pack)
 
     p_verify = commands.add_parser("verify", help="byte-compare the repack against its source")
