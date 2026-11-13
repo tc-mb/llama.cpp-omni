@@ -1345,13 +1345,19 @@ struct llama_moe_slot_runtime::impl {
 
     /// 把已打开的 experts fd 的 F_NOCACHE 拨到 `on`。只改缓存行为，不动数据。
     void apply_experts_nocache(bool on) {
-#if defined(__APPLE__) && defined(F_NOCACHE)
+#ifdef F_NOCACHE
+#ifndef _WIN32
         std::lock_guard<std::mutex> lock(fd_mutex);
         for (const auto & kv : fds) {
             if (fcntl(kv.second, F_NOCACHE, on ? 1 : 0) != 0) {
                 moe_log("F_NOCACHE 切换失败: %s", std::strerror(errno));
             }
         }
+#endif
+#else
+        // 平台没有 F_NOCACHE，拨开关无意义，但仍要走完下面的日志逻辑。
+        (void) on;
+#endif
         // 只在每个方向各打一次，避免长会话刷屏。
         static bool logged[2] = { false, false };
         if (!logged[on ? 0 : 1]) {
@@ -1359,10 +1365,6 @@ struct llama_moe_slot_runtime::impl {
             moe_log("experts 读%s page cache（%s 阶段）", on ? "绕过" : "经过",
                     on ? "prefill" : "decode");
         }
-#else
-        // F_NOCACHE is Apple-specific; other platforms keep normal cached I/O.
-        (void) on;
-#endif
     }
 
     int fd_for(const std::string & path) {
@@ -1375,7 +1377,7 @@ struct llama_moe_slot_runtime::impl {
         const int fd = _open(path.c_str(), _O_RDONLY | _O_BINARY);
 #else
         const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
-#if defined(__APPLE__) && defined(F_NOCACHE)
+#ifdef F_NOCACHE
         if (experts_nocache_desired() && fcntl(fd, F_NOCACHE, 1) != 0) {
             moe_log("F_NOCACHE 设置失败: %s", std::strerror(errno));
         }
