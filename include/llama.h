@@ -315,9 +315,13 @@ extern "C" {
         // override key-value pairs of the model meta data
         const struct llama_model_kv_override * kv_overrides;
 
-        // Expert-major experts manifest and slots per routed layer.
-        // Both fields must be set together.
-        const char * moe_experts_path;
+        // Routed MoE experts and how many slots to keep resident per routed layer.
+        //
+        // There is exactly one expert layout: the one the model file declares in its
+        // own `les.moe.layout` metadata. A model either has routed experts or it does
+        // not, so `moe_slot_bank > 0` is the whole switch — there is no source to
+        // select. `moe_slot_bank == 0` on a model that does declare the layout, or a
+        // non-zero bank on one that does not, is rejected at load time.
         int32_t moe_slot_bank;
 
         // Keep the booleans together to avoid misalignment during copy-by-value.
@@ -604,6 +608,23 @@ extern "C" {
 
     // Get metadata value as a string by key name
     LLAMA_API int32_t llama_model_meta_val_str(const struct llama_model * model, const char * key, char * buf, size_t buf_size);
+
+    // Geometry of the routed experts declared by a model file, read without loading it.
+    struct llama_moe_experts_geometry {
+        int32_t n_layer;        // number of layers carrying routed experts
+        int32_t n_expert;       // experts per layer
+        int32_t n_expert_used;  // top-k per layer
+        size_t  bytes_per_slot; // bytes of one expert slot, summed over layers
+    };
+
+    // Read the routed-expert geometry out of a model file's metadata, without loading
+    // any weights.
+    //
+    // Returns false when the file declares no routed experts, is unreadable, or the
+    // metadata is malformed. A caller that must size an expert cache before committing
+    // to a multi-gigabyte load runs this first.
+    LLAMA_API bool llama_moe_experts_geometry_from_file(
+            const char * path_model, struct llama_moe_experts_geometry * out);
 
     // Get the number of metadata key/value pairs
     LLAMA_API int32_t llama_model_meta_count(const struct llama_model * model);

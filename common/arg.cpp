@@ -2267,13 +2267,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_DIO"));
     add_opt(common_arg(
-        {"--moe-experts"}, "PATH",
-        "expert-major routed MoE experts directory or manifest",
-        [](common_params & params, const std::string & value) {
-            params.moe_experts = value;
-        }
-    ).set_env("LLAMA_ARG_MOE_EXPERTS"));
-    add_opt(common_arg(
         {"--moe-slot-bank"}, "N",
         "number of resident routed expert slots per layer",
         [](common_params & params, int value) {

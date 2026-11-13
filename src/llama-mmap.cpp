@@ -84,6 +84,7 @@ struct llama_file::impl {
     }
 
     impl(const char * fname, const char * mode, [[maybe_unused]] const bool use_direct_io = false) {
+        this->fname = fname;
         fp = ggml_fopen(fname, mode);
         if (fp == NULL) {
             throw std::runtime_error(format("failed to open %s: %s", fname, strerror(errno)));
@@ -95,6 +96,7 @@ struct llama_file::impl {
     }
 
     impl(FILE * file) : owns_fp(false) {
+        fname = "(file*)";
         fp = file;
         fp_win32 = (HANDLE) _get_osfhandle(_fileno(fp));
         seek(0, SEEK_END);
@@ -179,6 +181,7 @@ struct llama_file::impl {
             std::fclose(fp);
         }
     }
+    std::string fname;
 #else
     impl(const char * fname, const char * mode, [[maybe_unused]] const bool use_direct_io = false) : fname(fname) {
 #ifdef __linux__
@@ -404,6 +407,7 @@ llama_file::~llama_file() = default;
 
 size_t llama_file::tell() const { return pimpl->tell(); }
 size_t llama_file::size() const { return pimpl->size; }
+std::string llama_file::path() const { return pimpl->fname; }
 
 size_t llama_file::read_alignment() const { return pimpl->read_alignment(); }
 bool llama_file::has_direct_io() const { return pimpl->has_direct_io(); }
@@ -447,20 +451,27 @@ struct llama_mmap::impl {
         int fd = file->file_id();
         int flags = MAP_SHARED;
         if (numa) { prefetch = 0; }
+        // `prefetch` 是**长度**，不是开关：(size_t) -1 = 整个文件，0 = 不预读。
+        //
+        // MAP_POPULATE 会把整个映射一次性触进来，没法只做一段，所以它只在调用方要了
+        // 「整个文件」时才合法；只要一段的请求必须走下面的 madvise。这条区分是「专家
+        // 内联进主 gguf」的前提：映射可以覆盖 ~15 GiB，但加载时只该读常驻的那一段。
+        const size_t prefetch_len = prefetch == (size_t) -1 ? size : std::min(prefetch, size);
+        [[maybe_unused]] const bool prefetch_all = prefetch_len >= size;
 #ifdef __linux__
         if (posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL)) {
             LLAMA_LOG_WARN("warning: posix_fadvise(.., POSIX_FADV_SEQUENTIAL) failed: %s\n",
                     strerror(errno));
         }
-        if (prefetch) { flags |= MAP_POPULATE; }
+        if (prefetch_all) { flags |= MAP_POPULATE; }
 #endif
         addr = mmap(NULL, file->size(), PROT_READ, flags, fd, 0);
         if (addr == MAP_FAILED) {
             throw std::runtime_error(format("mmap failed: %s", strerror(errno)));
         }
 
-        if (prefetch > 0) {
-            if (posix_madvise(addr, std::min(file->size(), prefetch), POSIX_MADV_WILLNEED)) {
+        if (prefetch_len > 0) {
+            if (posix_madvise(addr, prefetch_len, POSIX_MADV_WILLNEED)) {
                 LLAMA_LOG_WARN("warning: posix_madvise(.., POSIX_MADV_WILLNEED) failed: %s\n",
                         strerror(errno));
             }

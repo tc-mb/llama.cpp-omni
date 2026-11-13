@@ -299,7 +299,7 @@ struct llama_layer {
     struct ggml_tensor * ffn_up_exps       = nullptr;
     struct ggml_tensor * ffn_gate_up_exps  = nullptr;
 
-    // MoE-SSD decode 专用 slot 张量。指向**同一块 buffer 上本层自己的偏移**
+    // LES decode 专用 slot 张量。指向**同一块 buffer 上本层自己的偏移**
     // （`view_offs = il * c * bytes_per_expert`），ne[2] = 每层窗口宽度 c，
     // 所以层间不共用 slot，decode 缓存能跨 token 保留。
     //

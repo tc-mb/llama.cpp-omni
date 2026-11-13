@@ -748,7 +748,7 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
     // Check if this is an MoE layer
     GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
 
-    // MoE-SSD 阶段选张量：decode 用每层独立的窗口张量（base 上的 view），
+    // LES 阶段选张量：decode 用每层独立的窗口张量（base 上的 view），
     // prefill 用共享窗口。两者 ne[2] 不同，所以必须由阶段决定，不能共用。
     const auto & L = model.layers[il];
     ggml_tensor * p_up   = moe_decode_phase && L.ffn_up_exps_dec      ? L.ffn_up_exps_dec      : L.ffn_up_exps;
