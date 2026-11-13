@@ -305,6 +305,43 @@ def check_layout(layout: dict, tensors: dict | None) -> None:
                 f"{first_carrier}; resident tensors must come first")
 
 
+def force_no_thinking(template: str) -> tuple[str, str]:
+    """Rewrite the generation prompt so the assistant turn is an empty think block.
+
+    Returns (new_template, note). When the template has no recognisable generation
+    prompt, it is returned unchanged and `note` says why.
+
+    Why rewrite at all: the upstream GGUF ships a template whose generation prompt
+    emits `<|im_start|>assistant\\n<think>\\n\\n</think>\\n\\n`, i.e. thinking is already
+    off — but it does so through a hand-edited line carrying a filler comment, and it
+    ignores `enable_thinking` entirely (the variable does not occur in the template).
+    Both facts make the prompt fragile: a converter that reformats the template, or a
+    caller that expects the standard switch, silently gets a different prompt.
+
+    So the output file states it plainly: the assistant turn opens with an empty think
+    block, unconditionally. Thinking is not a user-facing option for this model in this
+    runtime, and a template that pretends otherwise is the source of the confusion.
+    """
+    marker = "{%- if add_generation_prompt %}"
+    i = template.rfind(marker)
+    if i < 0:
+        return template, "no add_generation_prompt block found; template left as-is"
+
+    tail = template[i:]
+    j = tail.find("{%- endif %}")
+    if j < 0:
+        return template, "unterminated add_generation_prompt block; template left as-is"
+
+    new_block = (
+        "{%- if add_generation_prompt %}\n"
+        "    {{- '<|im_start|>assistant\\n' }}\n"
+        "    {# LES: the assistant turn opens with an empty think block. #}\n"
+        "    {{- '<think>\\n\\n</think>\\n\\n' }}\n"
+        "{%- endif %}"
+    )
+    return template[:i] + new_block + tail[j + len("{%- endif %}"):], "rewritten"
+
+
 def pack(args: argparse.Namespace) -> int:
     src = Path(args.model).expanduser().resolve()
     out = Path(args.out).expanduser().resolve()
@@ -336,6 +373,15 @@ def pack(args: argparse.Namespace) -> int:
             continue
         vtype = field.types[0]
         subtype = field.types[-1] if vtype == GGUFValueType.ARRAY else None
+
+        if name == "tokenizer.chat_template":
+            template, note = force_no_thinking(str(field.contents()))
+            if note != "rewritten":
+                print(f"warning: chat template not rewritten ({note})")
+            writer.add_key_value(name, template, vtype, sub_type=subtype)
+            n_kv += 1
+            continue
+
         writer.add_key_value(name, field.contents(), vtype, sub_type=subtype)
         n_kv += 1
 
