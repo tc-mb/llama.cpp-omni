@@ -95,6 +95,17 @@ extern "C" {
     GGML_API size_t   gguf_get_alignment  (const struct gguf_context * ctx);
     GGML_API size_t   gguf_get_data_offset(const struct gguf_context * ctx);  // padded to gguf_get_alignment if and only if the gguf_context contains at least one tensor
 
+    // Set the alignment of a context built in memory (gguf_init_empty and friends).
+    //
+    // Reading a file picks up "general.alignment" from its key-value pairs, but a context
+    // created empty always starts at GGUF_DEFAULT_ALIGNMENT and that value decides every
+    // tensor offset. A writer that pads its own output to a different alignment therefore
+    // produces a file whose recorded offsets do not match its bytes. This sets both the
+    // field and the key, so `gguf_add_tensor` and the file agree.
+    //
+    // `alignment` must be a power of two and greater than zero.
+    GGML_API void     gguf_set_alignment  (struct gguf_context * ctx, size_t alignment);
+
     GGML_API int64_t      gguf_get_n_kv(const struct gguf_context * ctx);
     GGML_API int64_t      gguf_find_key(const struct gguf_context * ctx, const char * key); // returns -1 if key is not found
     GGML_API const char * gguf_get_key (const struct gguf_context * ctx, int64_t key_id);
