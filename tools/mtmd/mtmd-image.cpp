@@ -771,10 +771,15 @@ mtmd_image_preprocessor_llava_uhd::slice_instructions mtmd_image_preprocessor_mi
     const int   slice_size = hparams.image_size;
     const float ratio      = (float) original_size.width * original_size.height / (slice_size * slice_size);
     if (ratio <= 1.0f) {
+        // match tools/omni/vision.cpp: already oversized on one axis -> keep native pixels
+        const bool has_slices = original_size.width > slice_size || original_size.height > slice_size;
         mtmd_image_preprocessor_llava_uhd::slice_instructions inst;
-        inst.overview_size = get_best_resize(original_size, slice_size, get_slice_align(), true);
+        inst.overview_size = get_best_resize(original_size, slice_size, get_slice_align(), allow_overview_upscale(has_slices));
         inst.refined_size  = clip_image_size{0, 0};
         inst.grid_size     = clip_image_size{0, 0};
+        LOG_DBG("%s: original size: %dx%d (has_slices=%d) -> overview size: %dx%d, no slices\n",
+                __func__, original_size.width, original_size.height, (int) has_slices,
+                inst.overview_size.width, inst.overview_size.height);
         return inst;
     }
     return mtmd_image_preprocessor_llava_uhd::get_slice_instructions(original_size);
