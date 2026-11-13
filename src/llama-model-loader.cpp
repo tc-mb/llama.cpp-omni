@@ -1053,7 +1053,7 @@ ggml_context * llama_model_loader::ctx_for_buft(
         int max_n_tensors = n_tensors;
         max_n_tensors += 1;                 // duplicated output tensor
         max_n_tensors += hparams.n_layer*2; // duplicated rope freq tensors
-        // MoE-SSD decode 窗口：每种 family 每层 2 个 view（prefill + decode），共 ~8/层。
+        // LES decode 窗口：每种 family 每层 2 个 view（prefill + decode），共 ~8/层。
         // 这些张量在 load_arch_tensors 里新建，不经过 create_tensor，所以不在这里
         // 预留的话 ctx 的 metadata 空间会溢出、ggml_new_tensor 直接 abort。
         max_n_tensors += hparams.n_layer * 10;

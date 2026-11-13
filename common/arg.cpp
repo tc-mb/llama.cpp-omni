@@ -2267,28 +2267,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_DIO"));
     add_opt(common_arg(
-        {"--moe-experts-source"}, "{none,manifest,model}",
-        "where routed MoE expert weights come from (default: none)",
-        [](common_params & params, const std::string & value) {
-            if (value == "none") {
-                params.moe_experts_source = LLAMA_MOE_EXPERTS_SOURCE_NONE;
-            } else if (value == "manifest") {
-                params.moe_experts_source = LLAMA_MOE_EXPERTS_SOURCE_MANIFEST;
-            } else if (value == "model") {
-                params.moe_experts_source = LLAMA_MOE_EXPERTS_SOURCE_MODEL;
-            } else {
-                throw std::invalid_argument("moe-experts-source must be one of: none, manifest, model");
-            }
-        }
-    ).set_env("LLAMA_ARG_MOE_EXPERTS_SOURCE"));
-    add_opt(common_arg(
-        {"--moe-experts"}, "PATH",
-        "directory holding the routed MoE experts manifest (used with --moe-experts-source manifest)",
-        [](common_params & params, const std::string & value) {
-            params.moe_experts = value;
-        }
-    ).set_env("LLAMA_ARG_MOE_EXPERTS"));
-    add_opt(common_arg(
         {"--moe-slot-bank"}, "N",
         "number of resident routed expert slots per layer",
         [](common_params & params, int value) {

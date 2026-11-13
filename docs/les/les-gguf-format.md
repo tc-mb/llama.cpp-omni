@@ -1,6 +1,6 @@
 # LES single-file GGUF layout
 
-This document describes the GGUF layout used by the MoE-SSD runtime in this repository to keep
+This document describes the GGUF layout used by the LES runtime in this repository to keep
 routed expert weights **inside the model file**, and the metadata that describes that region.
 
 It covers the format only. The scheduling side (look-ahead prefetch, decode window) is described
@@ -174,8 +174,8 @@ packed region                  begins at or after every resident tensor's end
 packed region base             % align == 0
 ```
 
-`tools/moe/pack_experts.py verify` checks the same table, plus a byte-for-byte comparison against
-the source files.
+`tools/moe/convert_les_gguf.py verify` checks the same table, plus a byte-for-byte comparison
+against the source file.
 
 ## 6. What the engine does with it
 
@@ -188,11 +188,16 @@ At load time, before any weights are touched:
 Taking the carrier out of `weights_map` is what makes the layout safe with mmap: the mapping range
 is computed from the tensors that remain, so the mapped window covers the resident prefix only,
 and the end-of-load cleanup unmaps the expert region. Expert bytes are read through a plain file
-layout with `preadv`, which the streaming runtime already did for the split layout.
+descriptor with `preadv`.
 
-From there the expert runtime sees exactly what it saw before: one path per layer, one
-`expert_stride`, and the three families inside that stride. `finalize_pack` validates those three
-properties and the read path is unchanged.
+From there the expert runtime sees exactly what it needs: one path per layer, one `expert_stride`,
+and the three tensor families inside that stride. `finalize_pack` validates those three properties
+and the read path is unchanged.
+
+There is no switch to select this layout. A model either declares `les.moe.layout` or it does not,
+so the only thing a caller sets is `moe_slot_bank`: non-zero for a model that has routed experts,
+zero otherwise. A non-zero bank on a model that declares no layout is rejected rather than being
+loaded as a dense model, which would silently run with garbage expert weights.
 
 `llama_moe_experts_geometry_from_file()` exposes the per-layer slot sizes from the header alone, so
 a caller can size an expert cache before committing to a ~15 GiB load.
@@ -200,17 +205,24 @@ a caller can size an expert cache before committing to a ~15 GiB load.
 ## 7. Tooling
 
 ```
-tools/moe/pack_experts.py pack    --model <les.gguf> --experts <dir> --out <packed.gguf>
-tools/moe/pack_experts.py verify  --model <les.gguf> --experts <dir> --packed <packed.gguf>
-tools/moe/pack_experts.py probe   --packed <packed.gguf>
+tools/moe/convert_les_gguf.py pack   --model <in.gguf> --out <out.gguf>
+tools/moe/convert_les_gguf.py verify --model <in.gguf> --packed <out.gguf>
+tools/moe/convert_les_gguf.py probe  --packed <out.gguf>
 ```
 
-`pack` copies resident tensors raw, concatenates each layer's expert shard verbatim into its carrier
-tensor, and writes the layout. `verify` compares every resident tensor and every packed region
-byte for byte against the sources. `probe` prints the per-layer slot budget from the header.
+`pack` reads a standard GGUF, copies its resident tensors raw, interleaves each layer's routed expert
+tensors expert-major into one carrier tensor, and writes the layout. One input, one output, no
+intermediate files.
 
-Peak memory during `pack` is one tensor at a time (it streams in 8 MiB chunks), but the writer keeps
-a temporary copy on disk, so a conversion host needs roughly twice the output size free.
+`verify` compares every resident tensor and every expert region byte for byte against the input, so
+a repack cannot silently change a value. `probe` prints the per-layer slot budget from the header
+alone.
+
+Peak memory during `pack` is one layer of experts. Note that the writer keeps a temporary copy on
+disk, so a conversion host needs roughly twice the output size free.
+
+Because the repack only moves bytes, it is also the right tool for a model that was already
+quantised upstream: re-running `llama-quantize` would change the bytes, which is not a repack.
 
 ## 8. Compatibility
 

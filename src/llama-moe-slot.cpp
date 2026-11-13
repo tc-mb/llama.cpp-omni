@@ -42,13 +42,13 @@ namespace {
 // reads decides whether raising this helps at all. It is a tunable rather than a
 // constant so it can be swept on device without a rebuild -- set
 // LLAMA_MOE_IO_THREADS. Defaults to 4, the value all earlier measurements used.
-constexpr int kMoeSsdIoThreadsDefault = 4;
+constexpr int kLesIoThreadsDefault = 4;
 
-static int moe_ssd_io_threads() {
+static int les_io_threads() {
     static const int n = []() {
         const char * s = std::getenv("LLAMA_MOE_IO_THREADS");
         const int v = s ? std::atoi(s) : 0;
-        return (v > 0 && v <= 64) ? v : kMoeSsdIoThreadsDefault;
+        return (v > 0 && v <= 64) ? v : kLesIoThreadsDefault;
     }();
     return n;
 }
@@ -65,7 +65,7 @@ constexpr int32_t kSlotPending = -2;
 // the disk idles across it. Measured 2026-09-12 (paired A/B, 8/8 reps positive): 13 waves ->
 // 1 wave is worth +3.65% prefill (261.9 -> 271.2 t/s), at zero memory cost.
 // Kept as a named constant (rather than deleting the loop) so the cap stays explicit.
-constexpr int kMoeSsdIoChunk = 256;
+constexpr int kLesIoChunk = 256;
 
 static int64_t now_ns() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -79,9 +79,9 @@ static void moe_log(const char * fmt, ...) {
     va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    fprintf(stderr, "[moe-ssd] %s\n", buf);
+    fprintf(stderr, "[les] %s\n", buf);
     fflush(stderr);
-    LLAMA_LOG_INFO("[moe-ssd] %s\n", buf);
+    LLAMA_LOG_INFO("[les] %s\n", buf);
 }
 
 static bool park_window_enabled() {
@@ -413,7 +413,7 @@ struct lookahead_expert_prefetch {
                 memcpy(ex, job_expert, sizeof(ex));
             }
             const int32_t base = bank_base(bank);
-            const int n_th = std::max(1, std::min(moe_ssd_io_threads(), n));
+            const int n_th = std::max(1, std::min(les_io_threads(), n));
             std::atomic<int> next{0};
             auto read_one = [&]() {
                 for (;;) {
@@ -690,7 +690,7 @@ struct llama_moe_slot_runtime::impl {
         moe_log("init pack=%s pack_layers=%d/%d bank=%d shared=%s experts=%d io_threads=%d stride0=%zu preadv=on park_window=%s",
             n_pack_ok == n_enabled && n_enabled > 0 ? "on" : (n_pack_ok > 0 ? "partial" : "off"),
             n_pack_ok, n_enabled, (int) n_slots, shared_bank ? "on" : "off",
-            (int) n_expert, moe_ssd_io_threads(), stride0,
+            (int) n_expert, les_io_threads(), stride0,
             park_window_enabled() ? "on" : "off");
 
         lookahead.init((int32_t) n_slots, n_expert, last_moe_layer,
@@ -969,7 +969,7 @@ struct llama_moe_slot_runtime::impl {
             }
         }
         const int n = (int) q.size();
-        const int n_th = std::max(1, std::min(moe_ssd_io_threads(), n));
+        const int n_th = std::max(1, std::min(les_io_threads(), n));
         std::atomic<int> next{0};
         std::atomic<int> n_read{0};
         std::atomic<int64_t> n_bytes{0};
@@ -1651,8 +1651,8 @@ struct llama_moe_slot_runtime::impl {
         if (n <= 0) {
             return total;
         }
-        for (int offset = 0; offset < n; offset += kMoeSsdIoChunk) {
-            const int n_wave = std::min(kMoeSsdIoChunk, n - offset);
+        for (int offset = 0; offset < n; offset += kLesIoChunk) {
+            const int n_wave = std::min(kLesIoChunk, n - offset);
             std::vector<pending_install> wave(
                 pending.begin() + offset, pending.begin() + offset + n_wave);
             const install_timing t = install_packed_wave(state, wave, window_mode);
@@ -1689,7 +1689,7 @@ struct llama_moe_slot_runtime::impl {
             }
         };
 
-        t.n_th = std::max(1, std::min(moe_ssd_io_threads(), n));
+        t.n_th = std::max(1, std::min(les_io_threads(), n));
         const int64_t wall0 = now_ns();
         // 注意：单线程不能只调 read_one(0) —— 那只会装第一个专家，
         // 其余 N-1 个被静默跳过，slot 里留着上一层/上一个 token 的旧权重，

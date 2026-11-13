@@ -198,13 +198,6 @@ extern "C" {
         LLAMA_SPLIT_MODE_TENSOR = 3,
     };
 
-    // Where the routed MoE expert weights come from. See `llama_model_params`.
-    enum llama_moe_experts_source {
-        LLAMA_MOE_EXPERTS_SOURCE_NONE     = 0, // no routed experts (dense model)
-        LLAMA_MOE_EXPERTS_SOURCE_MANIFEST = 1, // external directory + manifest.json
-        LLAMA_MOE_EXPERTS_SOURCE_MODEL    = 2, // layout described inside the model file
-    };
-
     enum llama_context_type {
         LLAMA_CONTEXT_TYPE_DEFAULT = 0,
         LLAMA_CONTEXT_TYPE_MTP     = 1,
@@ -322,21 +315,14 @@ extern "C" {
         // override key-value pairs of the model meta data
         const struct llama_model_kv_override * kv_overrides;
 
-        // Routed MoE experts: where the expert weights come from, and how many slots
-        // to keep resident per routed layer.
+        // Routed MoE experts and how many slots to keep resident per routed layer.
         //
-        // `moe_experts_source` selects the layout:
-        //   NONE     - no routed experts (dense model)
-        //   MANIFEST - `moe_experts_path` points at a directory holding manifest.json
-        //              and one file per layer, experts packed expert-major
-        //   MODEL    - the experts are inside the model file itself; the layout is
-        //              described by the model file's own metadata
-        //
-        // `moe_experts_path` is only read when the source is MANIFEST. `moe_slot_bank`
-        // must be non-zero exactly when the source is not NONE.
-        const char * moe_experts_path;
+        // There is exactly one expert layout: the one the model file declares in its
+        // own `les.moe.layout` metadata. A model either has routed experts or it does
+        // not, so `moe_slot_bank > 0` is the whole switch — there is no source to
+        // select. `moe_slot_bank == 0` on a model that does declare the layout, or a
+        // non-zero bank on one that does not, is rejected at load time.
         int32_t moe_slot_bank;
-        enum llama_moe_experts_source moe_experts_source;
 
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights

@@ -1022,19 +1022,9 @@ struct llama_model::impl {
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
     pimpl->has_tensor_overrides = params.tensor_buft_overrides && params.tensor_buft_overrides[0].pattern;
 
-    const bool has_experts = params.moe_experts_source != LLAMA_MOE_EXPERTS_SOURCE_NONE;
-    const bool has_slots   = params.moe_slot_bank > 0;
-    if (has_experts != has_slots) {
-        throw std::invalid_argument(
-            "moe_slot_bank must be non-zero exactly when moe_experts_source is not NONE");
-    }
-    if (params.moe_experts_source == LLAMA_MOE_EXPERTS_SOURCE_MANIFEST &&
-            (!params.moe_experts_path || params.moe_experts_path[0] == '\0')) {
-        throw std::invalid_argument(
-            "moe_experts_source is MANIFEST but moe_experts_path is empty");
-    }
     // The expert table is not built here: its absolute offsets come from the loader's
-    // weights_map, which does not exist yet. It is built in load_hparams().
+    // weights_map, which does not exist yet. It is built in load_hparams(), which also
+    // checks that `moe_slot_bank` agrees with what the model file declares.
 }
 
 llama_model::~llama_model() {
@@ -1230,13 +1220,16 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     // from the loader's weights_map; built after load_arch_hparams() and before load_tensors()
     // because creating the slot tensors needs the entry types, while init_mappings() needs
     // the start of the expert region.
-    if (params.moe_experts_source == LLAMA_MOE_EXPERTS_SOURCE_MODEL && !pimpl->moe_experts) {
+    if (params.moe_slot_bank > 0 && !pimpl->moe_experts) {
         const gguf_context * gctx = ml.metadata;
 
+        // One layout only: what the model file declares. A non-zero slot bank on a model
+        // that declares no layout is a configuration error, not a reason to fall back to
+        // a dense load — that would run with garbage expert weights instead of failing.
         const int key_layout = gguf_find_key(gctx, "les.moe.layout");
         if (key_layout < 0) {
             throw std::runtime_error(
-                "moe_experts_source is MODEL but the model file declares no 'les.moe.layout'");
+                "moe_slot_bank is non-zero but the model file declares no 'les.moe.layout'");
         }
 
         // Capability gate: refuse a file that asks for something this build cannot do. This
@@ -2526,9 +2519,7 @@ llama_model_params llama_model_default_params() {
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
-        /*.moe_experts_path            =*/ nullptr,
         /*.moe_slot_bank               =*/ 0,
-        /*.moe_experts_source          =*/ LLAMA_MOE_EXPERTS_SOURCE_NONE,
         /*.vocab_only                  =*/ false,
         /*.use_mmap                    =*/ true,
         /*.use_direct_io               =*/ false,

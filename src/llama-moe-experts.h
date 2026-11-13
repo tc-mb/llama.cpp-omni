@@ -16,7 +16,7 @@ struct llama_moe_experts_entry {
     std::string tensor_family;
 
     /// Name of the tensor that carries this layer's expert bytes
-    /// (`blk.N.moe_exps_packed.weight`). Empty when the source is a manifest.
+    /// (`blk.N.moe_exps_packed.weight`).
     std::string packed_tensor_name;
     /// Offset of this family inside one expert. The absolute file offset is
     /// `packed_tensor_offset + offset_in_expert`.
@@ -33,16 +33,11 @@ struct llama_moe_experts_entry {
 
 // Routed expert weights for a MoE model.
 //
-// Two sources produce the same entry table:
-//   - `llama_moe_experts(path)`        - an external directory + manifest.json
-//   - `from_layout(json, path_model)`  - the layout declared by the model file itself
-//
-// In the second case the absolute offsets are unknown until the loader has resolved
-// where the carrier tensors sit, so `bind_region()` has to be called for each of them.
+// The layout always comes from the model file's own `les.moe.layout` metadata; there is
+// no second source to reconcile. The absolute offsets are unknown until the loader has
+// resolved where the carrier tensors sit, so `bind_region()` has to be called for each.
 class llama_moe_experts {
 public:
-    explicit llama_moe_experts(const char * input_path);
-
     static std::unique_ptr<llama_moe_experts> from_layout(
             const std::string & layout_json, const std::string & path_model);
 

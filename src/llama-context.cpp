@@ -2555,7 +2555,7 @@ llm_graph_params llama_context::graph_params(
         /*.loras       =*/ loras.get(),
         /*.mctx        =*/ mctx,
         /*.moe_slots   =*/ moe_slots.get(),
-        // MoE-SSD 阶段：批宽落在窗口覆盖范围内时才是「窗口阶段」。
+        // LES 阶段：批宽落在窗口覆盖范围内时才是「窗口阶段」。
         //
         // 判据必须与 llama-moe-slot 的 window_mode **逐字一致** —— 它同时决定运行期
         // 往哪段槽位写、以及建图用哪套张量（每层 `.dec` 视图 vs prefill 共享视图）。

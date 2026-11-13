@@ -604,7 +604,7 @@ struct llm_graph_params {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     llama_moe_slot_runtime       * moe_slots;
-    // MoE-SSD 阶段。决定 FFN 用哪套 slot 张量（prefill 共享 / decode 每层独立）。
+    // LES 阶段。决定 FFN 用哪套 slot 张量（prefill 共享 / decode 每层独立）。
     // **必须进 operator==**：否则图缓存会把上一个阶段的图复用过来，而图里嵌的是
     // 张量指针 —— 那就会拿 prefill 的共享张量去跑 decode（窗口失效但不报错）。
     // n_tokens 不足以区分：单 token 的 prefill 与 decode 都是 1。
