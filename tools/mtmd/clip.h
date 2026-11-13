@@ -44,6 +44,8 @@ struct clip_context_params {
     ggml_backend_sched_eval_callback cb_eval;
     void * cb_eval_user_data;
     bool no_alloc;
+    const char * qnn_model_path;    // path to a QNN context binary for Hexagon acceleration
+    const char * qnn_skel_dir;      // directory holding libQnnHtpV85Skel.so
 };
 
 struct clip_init_result {
