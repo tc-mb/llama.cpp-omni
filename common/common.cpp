@@ -1537,6 +1537,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.no_host         = params.no_host;
     mparams.moe_experts_path = params.moe_experts.empty() ? nullptr : params.moe_experts.c_str();
     mparams.moe_slot_bank    = params.moe_slot_bank;
+    mparams.moe_experts_in_model = params.moe_experts_in_model;
 
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;

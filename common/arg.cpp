@@ -2274,6 +2274,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_EXPERTS"));
     add_opt(common_arg(
+        {"--moe-experts-in-model"},
+        "routed experts are inside the model file (LES packed regions, described by les.moe.descriptor)",
+        [](common_params & params) {
+            params.moe_experts_in_model = true;
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERTS_IN_MODEL"));
+    add_opt(common_arg(
         {"--moe-slot-bank"}, "N",
         "number of resident routed expert slots per layer",
         [](common_params & params, int value) {

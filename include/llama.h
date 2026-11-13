@@ -327,6 +327,11 @@ extern "C" {
         bool use_mlock;       // force system to keep model in RAM
         bool check_tensors;   // validate model tensor data
         bool use_extra_bufts; // use extra buffer types (used for weight repacking)
+
+        // The routed experts live inside the model file itself, as LES packed regions
+        // (an I8 carrier tensor per layer, described by the `les.moe.descriptor` KV).
+        // When true, `moe_experts_path` is not used and `moe_slot_bank` still applies.
+        bool moe_experts_in_model;
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool partial_load;    // allow loading with fewer tensors than in the GGUF (e.g. TTS model with extra tensors)
@@ -604,6 +609,23 @@ extern "C" {
 
     // Get metadata value as a string by key name
     LLAMA_API int32_t llama_model_meta_val_str(const struct llama_model * model, const char * key, char * buf, size_t buf_size);
+
+    // What an LES single-file model declares about its routed experts.
+    struct llama_les_info {
+        int32_t n_layer;        // number of layers carrying routed experts
+        int32_t n_expert;       // experts per layer
+        int32_t expert_used;    // top-k per layer
+        size_t  bytes_per_slot; // sum over layers of one expert slot's bytes
+    };
+
+    // Read the LES descriptor out of a gguf header, without loading the model.
+    //
+    // Returns false when the file is not an LES single-file model (no
+    // `les.moe.descriptor`), is unreadable, or the descriptor is malformed.
+    // A caller that needs the decode-window memory budget runs this before
+    // `llama_model_load_from_file`, so that a budget that would not fit is
+    // rejected before 14 GiB of weights are touched.
+    LLAMA_API bool llama_les_probe(const char * gguf_path, struct llama_les_info * out);
 
     // Get the number of metadata key/value pairs
     LLAMA_API int32_t llama_model_meta_count(const struct llama_model * model);

@@ -25,6 +25,9 @@ struct llama_file {
 
     void seek(size_t offset, int whence) const;
 
+    /// 这个 llama_file 打开的是哪个文件。MoE 专家运行时按路径 preadv，需要它。
+    std::string path() const;
+
     void read_raw(void * ptr, size_t len);
     void read_raw_unsafe(void * ptr, size_t len);
     void read_aligned_chunk(void * dest, size_t size);

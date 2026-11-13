@@ -29,6 +29,15 @@ enum llama_fver {
 const char * llama_file_version_name(llama_fver version);
 
 struct llama_model_loader {
+    // 一个「字节载体」张量：LES 把一层交错后的专家字节放进一个 I8 张量里，它的内容不是
+    // 任何架构绑定的权重，含义完全由 les.moe.descriptor 赋予。take_packed_tensor() 把它
+    // 从 weights_map 里取出后记在这里：文件下标 + 绝对偏移 + 载体几何。
+    struct llama_packed_expert {
+        uint16_t idx = 0;   // 源文件下标
+        size_t  offs = 0;   // 张量数据在文件内的绝对偏移
+        size_t  nbytes = 0;
+    };
+
     // Holds information on a model weight
     struct llama_tensor_weight {
         uint16_t  idx; // source file index
@@ -99,6 +108,12 @@ struct llama_model_loader {
     llama_mmaps mappings;
 
     std::map<std::string, llama_tensor_weight, weight_name_comparer> weights_map;
+
+    /// 被 take_packed_tensor() 取走的字节载体张量（LES 交错专家区）。
+    std::map<std::string, llama_packed_expert> packed_experts;
+    /// packed 区在文件内的最小偏移；没有 packed 张量时保持 (size_t) -1。
+    size_t packed_begin = (size_t) -1;
+
     std::unordered_map<std::string, llama_model_kv_override> kv_overrides;
     const llama_model_tensor_buft_override * tensor_buft_overrides;
 
@@ -238,9 +253,23 @@ struct llama_model_loader {
 
     struct ggml_tensor * create_tensor_as_view(struct ggml_context * ctx, struct ggml_tensor * base, const std::string & name, const std::initializer_list<int64_t> & ne, size_t offset, bool required = true);
 
+    /// 取出一个「字节载体」张量（LES 的交错专家区），并从 weights_map 里摘掉。
+    ///
+    /// 摘掉是三条性质的来源：load_all_data 不会试图加载它（它没有 ggml 张量）；size_data
+    /// 不含它（进度与「加载完成」不被十几 GiB 拖偏）；get_mapping_range 也不会把它算进
+    /// 映射区间（Metal 的 mmap buffer 因此只覆盖常驻前缀，而不是整个文件）。
+    ///
+    /// 名字不在文件里时返回 nullptr —— 旧格式（专家在 experts/ 目录）走的就是这条路。
+    const llama_packed_expert * take_packed_tensor(const char * name);
+
+    /// packed 区的起始偏移（同一文件内），没有则 (size_t) -1。
+    /// init_mappings() 用它把加载期预读限制在常驻前缀内。
+    size_t packed_region_offset() const;
+
     void done_getting_tensors(bool partial = false) const;
 
-    void init_mappings(bool prefetch = true, llama_mlocks * mlock_mmaps = nullptr);
+    void init_mappings(bool prefetch = true, llama_mlocks * mlock_mmaps = nullptr,
+                       size_t prefetch_limit = (size_t) -1);
 
     void get_mapping_range(size_t * first, size_t * last, void ** addr, int idx, ggml_context * ctx) const;
 

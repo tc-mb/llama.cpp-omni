@@ -1111,7 +1111,17 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             const size_t nbytes = ggml_nbytes(t_meta);
             LLAMA_LOG_WARN("model has unused tensor %s (size = %zu bytes) -- ignoring\n", tn.str().c_str(), nbytes);
 
-            size_data -= nbytes;
+            // 从 weights_map 里摘掉，而不是从 size_data 里减。
+            //
+            // 这个分支跑在 load_tensors 期间，而 `size_data` 是 init_mappings() 才累加出来的
+            // （见那里的注释）：此刻它还是 0，减一个没加过的字节数会让 size_t 下溢成天文数字，
+            // 于是 `size_done >= size_data` 永远不成立，末尾那段
+            // `mapping->unmap_fragment(...)` 永远不执行 —— 整个文件的映射（包括那些本该在加载
+            // 完成后就解除映射的尾部）就一直挂着。对「专家内联进主 gguf」的布局这是致命的：
+            // 解除尾部映射正是把 ~13 GiB 专家区从映射里放掉的唯一动作。
+            //
+            // 摘掉之后 init_mappings 累加时自然不含它，进度推进和解除映射都回到正确行为。
+            weights_map.erase(tn.str());
             n_created++;
 
             return nullptr;
@@ -1480,7 +1490,34 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
     }
 }
 
-void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps) {
+const llama_model_loader::llama_packed_expert * llama_model_loader::take_packed_tensor(const char * name) {
+    if (!name) {
+        return nullptr;
+    }
+    const auto it = weights_map.find(name);
+    if (it == weights_map.end()) {
+        return nullptr;
+    }
+
+    llama_packed_expert packed;
+    packed.idx    = it->second.idx;
+    packed.offs   = it->second.offs;
+    packed.nbytes = ggml_nbytes(it->second.tensor);
+
+    weights_map.erase(it);
+    // 它在文件里，只是不由任何架构绑定；算进 n_created，done_getting_tensors 的张量数
+    // 校验才是对的。
+    n_created++;
+
+    packed_begin = std::min(packed_begin, packed.offs);
+    return &packed_experts.emplace(name, packed).first->second;
+}
+
+size_t llama_model_loader::packed_region_offset() const {
+    return packed_begin;
+}
+
+void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps, size_t prefetch_limit) {
     if (use_mmap) {
         mappings.reserve(files.size());
         mmaps_used.reserve(files.size());
@@ -1496,7 +1533,10 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
                 }
             }
 
-            std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch ? -1 : 0, is_numa);
+            // 预读长度：默认整文件（旧行为）；调用方可以用 prefetch_limit 只预读前缀，
+            // 这是在「专家内联进主 gguf」时避免把十几 GiB 在加载期触进来的唯一手段。
+            const size_t want = prefetch ? prefetch_limit : 0;
+            std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), want, is_numa);
             mmaps_used.emplace_back(mapping->size(), 0);
             if (mlock_mmaps) {
                 std::unique_ptr<llama_mlock> mlock_mmap(new llama_mlock());

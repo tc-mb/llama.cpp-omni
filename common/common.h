@@ -501,6 +501,7 @@ struct common_params {
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
 
     std::string moe_experts;
+    bool moe_experts_in_model = false;
     int32_t moe_slot_bank = 0;
     // 0 = hparams. Prefill/decode can differ; experts stays at training K.
     int32_t moe_k_prefill = 0;
