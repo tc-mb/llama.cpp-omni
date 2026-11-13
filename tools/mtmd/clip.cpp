@@ -1,5 +1,6 @@
 #include "clip.h"
 #include "clip-impl.h"
+#include "clip_qnn/clip_qnn.h"
 #include "clip-model.h"
 #include "clip-graph.h"
 #include "models/models.h"
@@ -162,6 +163,9 @@ struct clip_ctx {
 
     bool debug_output_embeddings = false;
 
+    // QNN context binary, when one was supplied and ENABLE_QNN is on
+    const void * qnn_model = nullptr;
+
     // for measuring memory usage
     bool no_alloc = false;
     std::map<ggml_backend_dev_t, size_t> mem_usage;
@@ -222,6 +226,10 @@ struct clip_ctx {
     }
 
     ~clip_ctx() {
+        if (qnn_model) {
+            clip_qnn_closeModel(qnn_model);
+            qnn_model = nullptr;
+        }
         ggml_backend_free(backend);
         if (backend != backend_cpu) {
             ggml_backend_free(backend_cpu);
@@ -2978,6 +2986,11 @@ struct clip_init_result clip_init(const char * fname, struct clip_context_params
             if (ctx_params.warmup) {
                 loader.warmup(*ctx_vision);
             }
+            if (ctx_params.qnn_model_path && ctx_params.qnn_model_path[0] != '\0' &&
+                    ctx_vision->model.proj_type == PROJECTOR_TYPE_MINICPM_OCR_1_0) {
+                ctx_vision->qnn_model = clip_qnn_loadModel(ctx_params.qnn_model_path,
+                                                           ctx_params.qnn_skel_dir);
+            }
 
             // TODO: we don't support audio for Gemma 3N, but GGUF contains audio tensors
             // we can remove this check when we implement audio support for Gemma 3N
@@ -3410,6 +3423,19 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
     if (batch_size != 1) {
         return false; // only support batch size of 1
     }
+
+    // The OCR vision tower can run on the Hexagon NPU when a QNN context binary was
+    // supplied. Fall through to the ggml path if it fails, so this is never a hard
+    // dependency.
+#if defined(ENABLE_QNN)
+    if (ctx->qnn_model && ctx->model.proj_type == PROJECTOR_TYPE_MINICPM_OCR_1_0) {
+        const auto & img = imgs.entries[0];
+        if (clip_qnn_encode(ctx->qnn_model, img->buf.data(), img->nx, img->ny, vec) == 0) {
+            return true;
+        }
+        LOG_WRN("%s: QNN encode failed, falling back to ggml\n", __func__);
+    }
+#endif
 
     // if buffers are not allocated, we need to do a warmup run to allocate them
     if (!ctx->is_allocated) {
