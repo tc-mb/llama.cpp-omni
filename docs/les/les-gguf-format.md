@@ -67,17 +67,17 @@ Each group of experts is carried by one tensor whose bytes are the region verbat
 ```
 name   blk.{L}.moe_exps_packed.weight
 type   GGML_TYPE_I8            (1 byte per element, no block)
-ne     [unit_bytes, 1, 1, n_expert]        (GGUF stores ne reversed)
+ne     [expert_stride, 1, 1, n_expert]        (GGUF stores ne reversed)
 ```
 
 `I8` is not a quantised type: one element is one byte, so the tensor's size is exactly the region's
 size, it overlaps nothing, and any standard reader sees a structurally valid file. Its meaning comes
-entirely from `les.moe.descriptor`; no architecture binds to that name.
+entirely from `les.moe.layout`; no architecture binds to that name.
 
 Why a carrier instead of overlapping the offsets of the three quantised tensors: every tensor keeps
 a self-consistent, disjoint extent, so `gguf-dump`, `gguf-split` and friends cannot read shifted
 data. A single quantised tensor could not hold a group anyway — one tensor has one `ggml_type`,
-while a group's families may differ, and `gate`/`up` are `[n_embd, n_ff]` while `down` is
+while a group's tensor families may differ, and `gate`/`up` are `[n_embd, n_ff]` while `down` is
 `[n_ff, n_embd]`.
 
 ## 4. Metadata
@@ -86,15 +86,15 @@ Three entries in the KV section:
 
 ```
 les.moe.version      uint32    1                       structural version
-les.moe.descriptor   string    { ... }                 the layout, as JSON
+les.moe.layout   string    { ... }                 the layout, as JSON
 les.moe.requires     string[]  ["moe.expert_major_packed_v1"]
 ```
 
-`les.moe.requires` is separate from the descriptor so an engine can reject a file **before**
+`les.moe.requires` is separate from the layout so an engine can reject a file **before**
 parsing it, naming the capability it does not implement.
 
-The descriptor is a single JSON document rather than one KV per field, because the structure is
-nested (layers -> groups -> families) and because most fields are absent in the common case. Binary
+The layout is a single JSON document rather than one KV per field, because the structure is
+nested (layers -> groups -> tensors) and because most fields are absent in the common case. Binary
 payloads do not belong in it: a block that is large or binary becomes its own tensor, referenced by
 name.
 
@@ -102,24 +102,24 @@ name.
 {
   "les_version": 1,
   "layout": "expert_major_packed",
-  "align": 4096,
-  "defaults": { "expert_used": 8, "router": {"kind": "linear"} },
+  "alignment": 4096,
+  "defaults": { "n_expert_used": 8, "router": {"kind": "linear"} },
   "layers": [
     {
       "layer": 0,
       "n_expert": 256,
-      "expert_used": 8,
+      "n_expert_used": 8,
       "n_ff_exp": 512,
       "groups": [
         {
           "expert_begin": 0,
-          "expert_end": 256,
-          "unit_bytes": 1351680,
-          "tensor": "blk.0.moe_exps_packed.weight",
-          "families": [
-            {"name": "ffn_gate_exps", "offset": 0,      "bytes": 450560, "type": "Q3_K", "ne": [2048, 512]},
-            {"name": "ffn_up_exps",   "offset": 450560, "bytes": 450560, "type": "Q3_K", "ne": [2048, 512]},
-            {"name": "ffn_down_exps", "offset": 901120, "bytes": 450560, "type": "Q3_K", "ne": [512, 2048]}
+          "expert_count": 256,
+          "expert_stride": 1351680,
+          "tensor_name": "blk.0.moe_exps_packed.weight",
+          "tensors": [
+            {"tensor_family": "ffn_gate_exps", "offset_in_expert": 0,      "bytes_per_expert": 450560, "type": "Q3_K"},
+            {"tensor_family": "ffn_up_exps",   "offset_in_expert": 450560, "bytes_per_expert": 450560, "type": "Q3_K"},
+            {"tensor_family": "ffn_down_exps", "offset_in_expert": 901120, "bytes_per_expert": 450560, "type": "Q3_K"}
           ]
         }
       ],
@@ -134,26 +134,26 @@ name.
 | --- | --- | --- |
 | `les_version` | required | must be `1` |
 | `layout` | required | must be `expert_major_packed` |
-| `align` | required | power of two, >= 2048; matches `general.alignment` |
+| `alignment` | required | power of two, >= 2048; matches `general.alignment` |
 | `layers[]` | required | one entry per layer carrying routed experts |
 | `layers[].n_expert` | required | expert count of this layer |
-| `layers[].expert_used` | `defaults.expert_used` | top-k of this layer |
+| `layers[].n_expert_used` | `defaults.n_expert_used` | top-k of this layer |
 | `layers[].n_ff_exp` | required | expert feed-forward width |
 | `layers[].groups[]` | required | one group per contiguous expert range with a uniform layout |
-| `groups[].expert_begin` / `expert_end` | — | half-open expert id range |
-| `groups[].unit_bytes` | — | bytes of one expert in this group |
-| `groups[].tensor` | — | carrier tensor name |
-| `groups[].families[].name` | — | `ffn_gate_exps`, `ffn_up_exps`, `ffn_down_exps` |
-| `groups[].families[].offset` / `bytes` | — | position and length inside one expert |
-| `groups[].families[].type` / `ne` | — | `ggml_type` name and matrix shape |
+| `groups[].expert_begin` / `expert_count` | — | first expert id and how many |
+| `groups[].expert_stride` | — | bytes of one expert in this group |
+| `groups[].tensor_name` | — | carrier tensor name |
+| `groups[].tensors[].tensor_family` | — | `ffn_gate_exps`, `ffn_up_exps`, `ffn_down_exps` |
+| `groups[].tensors[].offset_in_expert` / `bytes_per_expert` | — | position and length inside one expert |
+| `groups[].tensors[].type` | — | `ggml_type` name |
 | `layers[].router.kind` | `linear` | `linear` uses `tensor`; `none` means the layer has no router |
 | `layers[].router.tensor` / `ne` | `blk.{L}.ffn_gate_inp.weight` | router weight and shape |
 | `layers[].predictor.kind` | `none` | `none` (engine heuristic), `lookahead`, `static_table` |
 | `layers[].predictor.scope` | `1` | how many layers ahead the prediction covers |
 
-Offsets in the descriptor are **relative to the tensor named by `groups[].tensor`**, never absolute
+Offsets in the layout are **relative to the tensor named by `groups[].tensor_name`**, never absolute
 file offsets. Absolute positions are resolved from the tensor table at load time, so a file can be
-re-ordered or shipped as gguf shards without touching the descriptor.
+re-ordered or shipped as gguf shards without touching the layout.
 
 ## 5. Invariants
 
@@ -163,12 +163,12 @@ rather than loaded:
 ```
 align                          power of two, >= 2048
 groups                         sorted, contiguous, start at 0, end at n_expert
-unit_bytes                     == sum(families[].bytes)
-unit_bytes, family.offset, family.bytes    % 32 == 0
-family.offset + family.bytes   <= unit_bytes
+expert_stride                     == sum(tensors[].bytes_per_expert)
+expert_stride, tensors[].offset_in_expert, bytes_per_expert    % 32 == 0
+offset_in_expert + bytes_per_expert   <= expert_stride
 family names                   unique within a group
 carrier tensor                 type == I8
-carrier tensor                 nbytes == unit_bytes * (expert_end - expert_begin)
+carrier tensor                 nbytes == expert_stride * (expert_count)
 router.ne                      == [n_embd, n_expert] when kind == linear
 packed region                  begins at or after every resident tensor's end
 packed region base             % align == 0
@@ -182,13 +182,13 @@ the source files.
 At load time, before any weights are touched:
 
 1. read `les.moe.requires` and reject the file if a listed capability is unknown;
-2. parse `les.moe.descriptor` and validate the invariants above;
+2. parse `les.moe.layout` and validate the invariants above;
 3. take each carrier tensor out of `weights_map` and record its `(file, offset)`.
 
 Taking the carrier out of `weights_map` is what makes the layout safe with mmap: the mapping range
 is computed from the tensors that remain, so the mapped window covers the resident prefix only,
 and the end-of-load cleanup unmaps the expert region. Expert bytes are read through a plain file
-descriptor with `preadv`, which the streaming runtime already did for the split layout.
+layout with `preadv`, which the streaming runtime already did for the split layout.
 
 From there the expert runtime sees exactly what it saw before: one path per layer, one
 `expert_stride`, and the three families inside that stride. `finalize_pack` validates those three
@@ -206,7 +206,7 @@ tools/moe/pack_experts.py probe   --packed <packed.gguf>
 ```
 
 `pack` copies resident tensors raw, concatenates each layer's expert shard verbatim into its carrier
-tensor, and writes the descriptor. `verify` compares every resident tensor and every packed region
+tensor, and writes the layout. `verify` compares every resident tensor and every packed region
 byte for byte against the sources. `probe` prints the per-layer slot budget from the header.
 
 Peak memory during `pack` is one tensor at a time (it streams in 8 MiB chunks), but the writer keeps
@@ -215,7 +215,7 @@ a temporary copy on disk, so a conversion host needs roughly twice the output si
 ## 8. Compatibility
 
 Files in this layout are not interchangeable with standard GGUF files of the same model: the
-expert region is only meaningful to an engine that reads `les.moe.descriptor`. Tools that rewrite
+expert region is only meaningful to an engine that reads `les.moe.layout`. Tools that rewrite
 GGUF structure (`llama-quantize`, `gguf-split`) will preserve the tensors but invalidate the
 meaning of that region, so a file must be repacked after any such operation.
 

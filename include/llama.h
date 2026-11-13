@@ -198,6 +198,13 @@ extern "C" {
         LLAMA_SPLIT_MODE_TENSOR = 3,
     };
 
+    // Where the routed MoE expert weights come from. See `llama_model_params`.
+    enum llama_moe_experts_source {
+        LLAMA_MOE_EXPERTS_SOURCE_NONE     = 0, // no routed experts (dense model)
+        LLAMA_MOE_EXPERTS_SOURCE_MANIFEST = 1, // external directory + manifest.json
+        LLAMA_MOE_EXPERTS_SOURCE_MODEL    = 2, // layout described inside the model file
+    };
+
     enum llama_context_type {
         LLAMA_CONTEXT_TYPE_DEFAULT = 0,
         LLAMA_CONTEXT_TYPE_MTP     = 1,
@@ -315,10 +322,21 @@ extern "C" {
         // override key-value pairs of the model meta data
         const struct llama_model_kv_override * kv_overrides;
 
-        // Expert-major experts manifest and slots per routed layer.
-        // Both fields must be set together.
+        // Routed MoE experts: where the expert weights come from, and how many slots
+        // to keep resident per routed layer.
+        //
+        // `moe_experts_source` selects the layout:
+        //   NONE     - no routed experts (dense model)
+        //   MANIFEST - `moe_experts_path` points at a directory holding manifest.json
+        //              and one file per layer, experts packed expert-major
+        //   MODEL    - the experts are inside the model file itself; the layout is
+        //              described by the model file's own metadata
+        //
+        // `moe_experts_path` is only read when the source is MANIFEST. `moe_slot_bank`
+        // must be non-zero exactly when the source is not NONE.
         const char * moe_experts_path;
         int32_t moe_slot_bank;
+        enum llama_moe_experts_source moe_experts_source;
 
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
@@ -327,11 +345,6 @@ extern "C" {
         bool use_mlock;       // force system to keep model in RAM
         bool check_tensors;   // validate model tensor data
         bool use_extra_bufts; // use extra buffer types (used for weight repacking)
-
-        // The routed experts live inside the model file itself, as LES packed regions
-        // (an I8 carrier tensor per layer, described by the `les.moe.descriptor` KV).
-        // When true, `moe_experts_path` is not used and `moe_slot_bank` still applies.
-        bool moe_experts_in_model;
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool partial_load;    // allow loading with fewer tensors than in the GGUF (e.g. TTS model with extra tensors)
@@ -610,22 +623,22 @@ extern "C" {
     // Get metadata value as a string by key name
     LLAMA_API int32_t llama_model_meta_val_str(const struct llama_model * model, const char * key, char * buf, size_t buf_size);
 
-    // What an LES single-file model declares about its routed experts.
-    struct llama_les_info {
+    // Geometry of the routed experts declared by a model file, read without loading it.
+    struct llama_moe_experts_geometry {
         int32_t n_layer;        // number of layers carrying routed experts
         int32_t n_expert;       // experts per layer
-        int32_t expert_used;    // top-k per layer
-        size_t  bytes_per_slot; // sum over layers of one expert slot's bytes
+        int32_t n_expert_used;  // top-k per layer
+        size_t  bytes_per_slot; // bytes of one expert slot, summed over layers
     };
 
-    // Read the LES descriptor out of a gguf header, without loading the model.
+    // Read the routed-expert geometry out of a model file's metadata, without loading
+    // any weights.
     //
-    // Returns false when the file is not an LES single-file model (no
-    // `les.moe.descriptor`), is unreadable, or the descriptor is malformed.
-    // A caller that needs the decode-window memory budget runs this before
-    // `llama_model_load_from_file`, so that a budget that would not fit is
-    // rejected before 14 GiB of weights are touched.
-    LLAMA_API bool llama_les_probe(const char * gguf_path, struct llama_les_info * out);
+    // Returns false when the file declares no routed experts, is unreadable, or the
+    // metadata is malformed. A caller that must size an expert cache before committing
+    // to a multi-gigabyte load runs this first.
+    LLAMA_API bool llama_moe_experts_geometry_from_file(
+            const char * path_model, struct llama_moe_experts_geometry * out);
 
     // Get the number of metadata key/value pairs
     LLAMA_API int32_t llama_model_meta_count(const struct llama_model * model);

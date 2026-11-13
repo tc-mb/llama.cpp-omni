@@ -1022,17 +1022,19 @@ struct llama_model::impl {
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
     pimpl->has_tensor_overrides = params.tensor_buft_overrides && params.tensor_buft_overrides[0].pattern;
 
-    const bool has_experts = (params.moe_experts_path && params.moe_experts_path[0] != '\0') ||
-                             params.moe_experts_in_model;
-    const bool has_slots = params.moe_slot_bank > 0;
+    const bool has_experts = params.moe_experts_source != LLAMA_MOE_EXPERTS_SOURCE_NONE;
+    const bool has_slots   = params.moe_slot_bank > 0;
     if (has_experts != has_slots) {
-        throw std::invalid_argument("MoE experts path and slot bank size must be set together");
+        throw std::invalid_argument(
+            "moe_slot_bank must be non-zero exactly when moe_experts_source is not NONE");
     }
-    if (params.moe_experts_path && params.moe_experts_path[0] != '\0') {
-        pimpl->moe_experts = std::make_unique<llama_moe_experts>(params.moe_experts_path);
+    if (params.moe_experts_source == LLAMA_MOE_EXPERTS_SOURCE_MANIFEST &&
+            (!params.moe_experts_path || params.moe_experts_path[0] == '\0')) {
+        throw std::invalid_argument(
+            "moe_experts_source is MANIFEST but moe_experts_path is empty");
     }
-    // in-model 模式不在这里建：专家区的绝对偏移要从 loader 的 weights_map 解析出来，
-    // 而构造 llama_model 的时候还没有 loader。它在 load_hparams() 里建，见那里。
+    // The expert table is not built here: its absolute offsets come from the loader's
+    // weights_map, which does not exist yet. It is built in load_hparams().
 }
 
 llama_model::~llama_model() {
@@ -1222,60 +1224,64 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     // per-arch hparams
     load_arch_hparams(ml);
 
-    // in-model 模式：路由专家就在主 gguf 里，由 `les.moe.descriptor` 描述布局。
+    // Routed experts declared by the model file itself.
     //
-    // 放在这里而不是构造函数里，是因为 entry 的绝对偏移要从 loader 的 weights_map 解析；
-    // 放在 load_arch_hparams 之后、load_tensors 之前，是因为建 slot 张量要用 entry 的
-    // 类型与形状，而 init_mappings 要用 packed 区的起点。
-    if (params.moe_experts_in_model && !pimpl->moe_experts) {
+    // Built here rather than in the constructor because the entries' absolute offsets come
+    // from the loader's weights_map; built after load_arch_hparams() and before load_tensors()
+    // because creating the slot tensors needs the entry types, while init_mappings() needs
+    // the start of the expert region.
+    if (params.moe_experts_source == LLAMA_MOE_EXPERTS_SOURCE_MODEL && !pimpl->moe_experts) {
         const gguf_context * gctx = ml.metadata;
 
-        const int key_desc = gguf_find_key(gctx, "les.moe.descriptor");
-        if (key_desc < 0) {
+        const int key_layout = gguf_find_key(gctx, "les.moe.layout");
+        if (key_layout < 0) {
             throw std::runtime_error(
-                "moe_experts_in_model is set but the model has no 'les.moe.descriptor'");
+                "moe_experts_source is MODEL but the model file declares no 'les.moe.layout'");
         }
 
-        // 能力闸门：描述符声明了本 build 不认识的能力时明确拒绝。比「读进来再猜」重要 ——
-        // 静默地按旧语义解释一个新字段，结果只是错，且错得很安静。
-        const int key_req = gguf_find_key(gctx, "les.moe.requires");
-        if (key_req >= 0) {
+        // Capability gate: refuse a file that asks for something this build cannot do. This
+        // matters more than "parse and guess" — interpreting a newer field with older
+        // semantics produces a result that is simply wrong, and quietly so.
+        const int key_requires = gguf_find_key(gctx, "les.moe.requires");
+        if (key_requires >= 0) {
             static const std::unordered_set<std::string> known = {
                 "moe.expert_major_packed_v1",
             };
             std::string missing;
-            for (uint32_t i = 0; i < gguf_get_arr_n(gctx, key_req); ++i) {
-                const std::string cap = gguf_get_arr_str(gctx, key_req, i);
-                if (!known.count(cap)) {
-                    missing += (missing.empty() ? "" : ", ") + cap;
+            for (uint32_t i = 0; i < gguf_get_arr_n(gctx, key_requires); ++i) {
+                const std::string capability = gguf_get_arr_str(gctx, key_requires, i);
+                if (!known.count(capability)) {
+                    missing += (missing.empty() ? "" : ", ") + capability;
                 }
             }
             if (!missing.empty()) {
                 throw std::runtime_error(format(
-                    "model requires LES capabilities this build does not implement: %s",
+                    "model requires expert-layout capabilities this build does not implement: %s",
                     missing.c_str()));
             }
         }
 
-        pimpl->moe_experts = llama_moe_experts::from_descriptor(
-                gguf_get_val_str(gctx, key_desc), ml.files.empty() ? std::string() : ml.files[0]->path());
+        pimpl->moe_experts = llama_moe_experts::from_layout(
+                gguf_get_val_str(gctx, key_layout),
+                ml.files.empty() ? std::string() : ml.files[0]->path());
 
-        // 把每个载体张量从 weights_map 里取出来。这一步是单文件布局成立的关键：取走之后
-        // load_all_data 不会试图加载它、size_data 不含它、get_mapping_range 也不会把它算进
-        // 映射区间（Metal 的 mmap buffer 因此只覆盖常驻前缀）。
-        for (const auto & name : pimpl->moe_experts->packed_tensor_names()) {
-            const auto * packed = ml.take_packed_tensor(name.c_str());
-            if (!packed) {
+        // Take each carrier tensor out of weights_map. This is what makes the single-file
+        // layout safe with mmap: afterwards load_all_data will not try to load it, size_data
+        // does not include it, and get_mapping_range will not cover it — so the mapped window
+        // spans the resident prefix only.
+        for (const auto & name : pimpl->moe_experts->region_names()) {
+            const auto * region = ml.take_expert_region(name.c_str());
+            if (!region) {
                 throw std::runtime_error(format(
-                    "les.moe.descriptor references packed tensor '%s' but the model has no such tensor",
+                    "the expert layout references tensor '%s' but the model has no such tensor",
                     name.c_str()));
             }
-            pimpl->moe_experts->bind_packed(name, packed->offs, ml.files.at(packed->idx)->path());
+            pimpl->moe_experts->bind_region(name, region->offset, ml.files.at(region->idx)->path());
         }
 
-        LLAMA_LOG_INFO("%s: LES in-model experts: %d layers, %zu packed tensors, %.2f MiB/layer slot\n",
+        LLAMA_LOG_INFO("%s: routed experts from the model file: %d layers, %zu regions, %.2f MiB total\n",
                 __func__, pimpl->moe_experts->layer_count(),
-                pimpl->moe_experts->packed_tensor_names().size(),
+                pimpl->moe_experts->region_names().size(),
                 pimpl->moe_experts->bytes_per_slot_all_layers() / 1024.0 / 1024.0);
     }
 
@@ -1612,7 +1618,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr, ml.packed_region_offset());
+    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr, ml.expert_region_offset());
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers
@@ -2522,13 +2528,13 @@ llama_model_params llama_model_default_params() {
         /*.kv_overrides                =*/ nullptr,
         /*.moe_experts_path            =*/ nullptr,
         /*.moe_slot_bank               =*/ 0,
+        /*.moe_experts_source          =*/ LLAMA_MOE_EXPERTS_SOURCE_NONE,
         /*.vocab_only                  =*/ false,
         /*.use_mmap                    =*/ true,
         /*.use_direct_io               =*/ false,
         /*.use_mlock                   =*/ false,
         /*.check_tensors               =*/ false,
         /*.use_extra_bufts             =*/ true,
-        /*.moe_experts_in_model        =*/ false,
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
         /*.partial_load                =*/ false,

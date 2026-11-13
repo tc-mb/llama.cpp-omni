@@ -1490,7 +1490,7 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
     }
 }
 
-const llama_model_loader::llama_packed_expert * llama_model_loader::take_packed_tensor(const char * name) {
+const llama_model_loader::llama_moe_region * llama_model_loader::take_expert_region(const char * name) {
     if (!name) {
         return nullptr;
     }
@@ -1499,22 +1499,22 @@ const llama_model_loader::llama_packed_expert * llama_model_loader::take_packed_
         return nullptr;
     }
 
-    llama_packed_expert packed;
-    packed.idx    = it->second.idx;
-    packed.offs   = it->second.offs;
-    packed.nbytes = ggml_nbytes(it->second.tensor);
+    llama_moe_region region;
+    region.idx    = it->second.idx;
+    region.offset = it->second.offs;
+    region.nbytes = ggml_nbytes(it->second.tensor);
 
     weights_map.erase(it);
     // 它在文件里，只是不由任何架构绑定；算进 n_created，done_getting_tensors 的张量数
     // 校验才是对的。
     n_created++;
 
-    packed_begin = std::min(packed_begin, packed.offs);
-    return &packed_experts.emplace(name, packed).first->second;
+    moe_region_begin = std::min(moe_region_begin, region.offset);
+    return &moe_regions.emplace(name, region).first->second;
 }
 
-size_t llama_model_loader::packed_region_offset() const {
-    return packed_begin;
+size_t llama_model_loader::expert_region_offset() const {
+    return moe_region_begin;
 }
 
 void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps, size_t prefetch_limit) {
