@@ -5754,11 +5754,12 @@ int main(int argc, char ** argv) {
                 }
             }
             if (worker.joinable()) worker.join();
-            // send done
+            // sink.done() ends the httplib loop; return false as a belt-and-suspenders
+            // guard (return true after a non-empty write can re-enter the provider).
             static const std::string ev_done = "data: [DONE]\n\n";
             sink.write(ev_done.data(), ev_done.size());
             sink.done();
-            return true;
+            return false;
         };
 
         auto on_complete = [] (bool) {};

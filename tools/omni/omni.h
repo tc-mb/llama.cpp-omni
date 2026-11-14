@@ -273,9 +273,18 @@ struct omni_context {
     std::mutex frame_timing_mtx;
     std::map<int, DuplexFrameTiming> frame_timing;
     
-    volatile bool need_speek = false;
-    volatile bool speek_done = true;
-    
+    // 跨线程标志，用 atomic 而不是 volatile。llm 线程运行期间，need_speek
+    // 要持 llm_thread_info->mtx 写，和 prefill_epoch_* 在同一个临界区里更新。
+    std::atomic<bool> need_speek{false};
+    std::atomic<bool> speek_done{true};
+
+    // stream_decode 等 prefill 排空用的栅栏，两个计数都由 llm_thread_info->mtx 保护。
+    // 请求方持锁 ++prefill_epoch_request 并置 need_speek，然后等
+    // prefill_epoch_done >= 自己的请求号；llm 线程在队列为空且 need_speek 时
+    // 持锁把 done 推到 request。
+    uint64_t prefill_epoch_request = 0;
+    uint64_t prefill_epoch_done    = 0;
+
     // 预热标志：第一轮对话视为预热（例如音色克隆参考音频），完成后设为 true
     std::atomic<bool> warmup_done{false};
     
