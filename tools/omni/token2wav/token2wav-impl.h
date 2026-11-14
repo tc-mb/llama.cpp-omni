@@ -2229,6 +2229,14 @@ class Token2Wav {
         return push_tokens_window(tokens.data(), (int64_t) tokens.size(), is_final, wave_bt_out, out_T_audio);
     }
 
+    // May overlap only after initialization, with one caller per stage.
+    // Drain the consumer before reset, prompt changes, or model destruction.
+    bool push_tokens_mel_only(const int32_t * tokens, int64_t n_tokens, bool is_final,
+                               std::vector<float> & mel_bct_out);
+    bool push_mel_to_wave(const std::vector<float> & mel_bct, bool is_final,
+                           std::vector<float> & wave_bt_out, int64_t & out_T_audio);
+    bool pipeline_vocoder_supported() const;
+
     void reset_stream();
 
     static constexpr int32_t kSampleRate = omni::vocoder::hifigan2::hg2_hift_generator::HG2_SAMPLING_RATE;

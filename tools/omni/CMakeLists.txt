@@ -21,6 +21,7 @@ add_library(omni
             omni-impl.h
             token2wav/token2wav-impl.cpp
             token2wav/token2wav-impl.h
+            token2wav/token2wav-pipeline.h
             token2wav/token2wav.cpp
             token2wav/token2wav.h
             token2wav/token2wav-profile.h
@@ -201,6 +202,12 @@ endif()
 # voxcpm2-cli build + smoke test (no weights). --help exits non-zero by design,
 # so assert on the usage banner instead of the exit code.
 if (LLAMA_BUILD_TESTS)
+    add_executable(test-t2w-pipeline test/test-t2w-pipeline.cpp)
+    target_link_libraries(test-t2w-pipeline PRIVATE Threads::Threads)
+    target_compile_features(test-t2w-pipeline PRIVATE cxx_std_17)
+    add_test(NAME test-t2w-pipeline COMMAND test-t2w-pipeline)
+    set_tests_properties(test-t2w-pipeline PROPERTIES TIMEOUT 30 LABELS "main;t2w")
+
     add_test(
         NAME voxcpm2-cli-smoke
         COMMAND ${TARGET_VOXCPM2_CLI} --help
