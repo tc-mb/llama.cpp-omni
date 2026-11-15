@@ -5863,6 +5863,25 @@ struct test_topk_moe : public test_case {
     }
 };
 
+// Selection bias may introduce NaNs after the gating probabilities were sanitized.
+struct test_topk_moe_post_bias_nan : public test_topk_moe {
+    test_topk_moe_post_bias_nan()
+        : test_topk_moe({4, 1, 1, 1}, 4, false, true, GATING_FUNC_SIGMOID) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "TOPK_MOE_POST_BIAS_NAN";
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_case::initialize_tensors(ctx);
+        const std::vector<float> logits(4, 0.0f);
+        const std::vector<float> bias(4, NAN);
+        ggml_backend_tensor_set(ggml_get_tensor(ctx, "probs")->src[0], logits.data(), 0, logits.size()*sizeof(float));
+        ggml_backend_tensor_set(ggml_get_tensor(ctx, "exp_probs_b"), bias.data(), 0, bias.size()*sizeof(float));
+    }
+};
+
 struct test_mul_mat_vec_fusion : public test_case {
     const ggml_type type;
     const ggml_glu_op glu_op;
@@ -8896,9 +8915,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     for (ggml_sort_order order : {GGML_SORT_ORDER_ASC, GGML_SORT_ORDER_DESC}) {
         for (uint32_t i = 4; i <= 1024*1024; i *= 2) {
-            test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {i-1, 1, 1, 1}));
-            test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {i, 1, 1, 1}));
+            test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {i-1, 1, 1, 1}, order));
+            test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {i, 1, 1, 1}, order));
         }
+        test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {248000, 1, 1, 1}, order));
+        test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {248000, 2, 1, 1}, order));
         test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {16, 10, 10, 10}, order));
         test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {60, 10, 10, 10}, order)); // qwen
         test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {1023, 2, 1, 3}, order));
@@ -9181,6 +9202,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+
+    test_cases.emplace_back(new test_topk_moe_post_bias_nan());
 
     for (auto gate : {GATING_FUNC_SOFTMAX, GATING_FUNC_SIGMOID, GATING_FUNC_SOFTMAX_WEIGHT}) {
         for (bool with_norm : {false, true}) {

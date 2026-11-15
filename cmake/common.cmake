@@ -6,7 +6,7 @@ function(llama_add_compile_flags)
             list(APPEND C_FLAGS   -Werror)
             list(APPEND CXX_FLAGS -Werror)
         elseif (CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
-            add_compile_options(/WX)
+            add_compile_options("$<$<COMPILE_LANGUAGE:C,CXX>:/WX>")
         endif()
     endif()
 
@@ -37,21 +37,21 @@ function(llama_add_compile_flags)
         if (LLAMA_SANITIZE_THREAD)
             message(STATUS "Using -fsanitize=thread")
 
-            add_compile_options(-fsanitize=thread)
+            add_compile_options("$<$<COMPILE_LANGUAGE:C,CXX>:-fsanitize=thread>")
             link_libraries     (-fsanitize=thread)
         endif()
 
         if (LLAMA_SANITIZE_ADDRESS)
             message(STATUS "Using -fsanitize=address")
 
-            add_compile_options(-fsanitize=address -fno-omit-frame-pointer)
+            add_compile_options("$<$<COMPILE_LANGUAGE:C,CXX>:-fsanitize=address;-fno-omit-frame-pointer>")
             link_libraries     (-fsanitize=address)
         endif()
 
         if (LLAMA_SANITIZE_UNDEFINED)
             message(STATUS "Using -fsanitize=undefined")
 
-            add_compile_options(-fsanitize=undefined)
+            add_compile_options("$<$<COMPILE_LANGUAGE:C,CXX>:-fsanitize=undefined>")
             link_libraries     (-fsanitize=undefined)
         endif()
     endif()
