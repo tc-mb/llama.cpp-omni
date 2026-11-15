@@ -2881,12 +2881,17 @@ struct test_cpy : public test_case {
     const std::array<int64_t, 4> ne_dst;
     const std::array<int64_t, 4> permute_src;
     const std::array<int64_t, 4> permute_dst;
+    const std::array<int64_t, 4> dst_alloc; // if set, dst is a view into a larger buffer (strided)
     bool _src_use_permute;
     bool _dst_use_permute;
     bool _src_transpose;
     bool _use_dst_shape;
+    bool _use_dst_alloc;
 
     std::string vars() override {
+        if (_use_dst_alloc) {
+            return VARS_TO_STR8(type_src, type_dst, ne_src, ne_dst, permute_src, permute_dst, _src_transpose, dst_alloc);
+        }
         if (_use_dst_shape) {
             return VARS_TO_STR7(type_src, type_dst, ne_src, ne_dst, permute_src, permute_dst, _src_transpose);
         }
@@ -2934,12 +2939,15 @@ struct test_cpy : public test_case {
             std::array<int64_t, 4> ne_dst = {-1, -1, -1, -1},
             std::array<int64_t, 4> permute_src = {0, 0, 0, 0},
             std::array<int64_t, 4> permute_dst = {0, 0, 0, 0},
-            bool transpose_src = false)
+            bool transpose_src = false,
+            std::array<int64_t, 4> dst_alloc = {0, 0, 0, 0})
         : type_src(type_src), type_dst(type_dst), ne_src(ne_src), ne_dst(ne_dst), permute_src(permute_src), permute_dst(permute_dst),
+          dst_alloc(dst_alloc),
           _src_use_permute(permute_src[0] + permute_src[1] + permute_src[2] + permute_src[3] > 0),
           _dst_use_permute(permute_dst[0] + permute_dst[1] + permute_dst[2] + permute_dst[3] > 0),
           _src_transpose(transpose_src),
-          _use_dst_shape(ne_dst[0] >= 0 && ne_dst[1] >= 0 && ne_dst[2] >= 0 && ne_dst[3] >= 0){}
+          _use_dst_shape(ne_dst[0] >= 0 && ne_dst[1] >= 0 && ne_dst[2] >= 0 && ne_dst[3] >= 0),
+          _use_dst_alloc(dst_alloc[0] > 0){}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * src = ggml_new_tensor(ctx, type_src, 4, ne_src.data());
@@ -2957,12 +2965,23 @@ struct test_cpy : public test_case {
         }
 
         std::array<int64_t, 4> dst_ne = _use_dst_shape ? ne_dst : std::array<int64_t, 4>{src->ne[0], src->ne[1], src->ne[2], src->ne[3]};
-        ggml_tensor * dst = ggml_new_tensor(ctx, type_dst, 4, dst_ne.data());
-        ggml_set_name(dst, "dst");
+        ggml_tensor * dst;
 
-        if (_dst_use_permute) {
-            dst = ggml_permute(ctx, dst, permute_dst[0], permute_dst[1], permute_dst[2], permute_dst[3]);
-            ggml_set_name(dst, "dst_permuted");
+        if (_use_dst_alloc) {
+            // view a sub-block of a larger buffer -> strided dst
+            ggml_tensor * dst_buf = ggml_new_tensor(ctx, type_dst, 4, dst_alloc.data());
+            ggml_set_name(dst_buf, "dst_buf");
+            dst = ggml_view_4d(ctx, dst_buf, dst_ne[0], dst_ne[1], dst_ne[2], dst_ne[3],
+                dst_buf->nb[1], dst_buf->nb[2], dst_buf->nb[3], 0);
+            ggml_set_name(dst, "dst_view");
+        } else {
+            dst = ggml_new_tensor(ctx, type_dst, 4, dst_ne.data());
+            ggml_set_name(dst, "dst");
+
+            if (_dst_use_permute) {
+                dst = ggml_permute(ctx, dst, permute_dst[0], permute_dst[1], permute_dst[2], permute_dst[3]);
+                ggml_set_name(dst, "dst_permuted");
+            }
         }
 
         ggml_tensor * out = ggml_cpy(ctx, src, dst);
@@ -4558,24 +4577,65 @@ struct test_clamp : public test_case {
     const std::array<int64_t, 4> ne;
     float min;
     float max;
+    int v; // view (1 : non-contiguous a)
+    std::vector<float> expected;
 
     std::string vars() override {
-        return VARS_TO_STR4(type, ne, min, max);
+        return VARS_TO_STR5(type, ne, min, max, v);
     }
 
     test_clamp(ggml_type type = GGML_TYPE_F32,
             std::array<int64_t, 4> ne = {10, 5, 4, 3},
-            float min = -0.5f, float max = 0.5f)
-        : type(type), ne(ne), min(min), max(max) {}
+            float min = -0.5f, float max = 0.5f, int v = 0)
+        : type(type), ne(ne), min(min), max(max), v(v) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
-        ggml_set_name(a, "a");
+        ggml_tensor * a;
+        if (v & 1) {
+            auto ne_a = ne;
+            ne_a[0] *= 3;
+            ne_a[1] *= 2;
+            ne_a[2] *= 5;
+            ne_a[3] *= 4;
+            a = ggml_new_tensor(ctx, type, 4, ne_a.data());
+            ggml_set_name(a, "a");
+
+            a = ggml_view_4d(ctx, a, ne[0], ne[1], ne[2], ne[3], a->nb[1], a->nb[2], a->nb[3], 0);
+            ggml_set_name(a, "view_of_a");
+        } else {
+            a = ggml_new_tensor(ctx, type, 4, ne.data());
+            ggml_set_name(a, "a");
+        }
 
         ggml_tensor * out = ggml_clamp(ctx, a, min, max);
         ggml_set_name(out, "out");
 
         return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_case::initialize_tensors(ctx);
+        if (v) {
+            // Snapshot before compute: omni CLAMP aliases its input, including views.
+            expected = tensor_to_float(ggml_get_tensor(ctx, "out")->src[0]);
+            for (float & x : expected) {
+                x = std::min(std::max(x, min), max);
+            }
+        }
+    }
+
+    bool run_whole_graph() override {
+        return v != 0;
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        if (!v) {
+            return test_case::err(a, b, n);
+        }
+        GGML_ASSERT(n == expected.size());
+        // CPU and CPU reference share the same kernel; compare both to the scalar oracle.
+        return std::equal(expected.begin(), expected.end(), a) &&
+               std::equal(expected.begin(), expected.end(), b) ? 0.0 : 1.0;
     }
 
     float grad_eps() override {
@@ -5442,6 +5502,7 @@ struct test_concat : public test_case {
     const int64_t ne_b_d;
     const int dim;
     const int v; // view (1 << 0: non-cont a, 1 << 1: non-cont b)
+    std::vector<float> expected;
 
     std::string vars() override {
         return VARS_TO_STR5(type, ne_a, ne_b_d, dim, v);
@@ -5485,6 +5546,41 @@ struct test_concat : public test_case {
         ggml_set_name(out, "out");
 
         return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_case::initialize_tensors(ctx);
+        if (ggml_is_quantized(type)) {
+            const ggml_tensor * out = ggml_get_tensor(ctx, "out");
+            const auto a = tensor_to_float(out->src[0]);
+            const auto b = tensor_to_float(out->src[1]);
+            int64_t inner = 1;
+            for (int d = 0; d < dim; d++) {
+                inner *= ne_a[d];
+            }
+            const int64_t span_a = inner * ne_a[dim];
+            const int64_t span_b = inner * ne_b_d;
+            expected.clear();
+            expected.reserve(a.size() + b.size());
+            // Concatenate actual dequantized inputs, independently of the block-copy kernel.
+            for (size_t i = 0; i < a.size() / span_a; i++) {
+                expected.insert(expected.end(), a.begin() + i*span_a, a.begin() + (i + 1)*span_a);
+                expected.insert(expected.end(), b.begin() + i*span_b, b.begin() + (i + 1)*span_b);
+            }
+        }
+    }
+
+    bool run_whole_graph() override {
+        return ggml_is_quantized(type);
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        if (!ggml_is_quantized(type)) {
+            return test_case::err(a, b, n);
+        }
+        GGML_ASSERT(n == expected.size());
+        return std::equal(expected.begin(), expected.end(), a) &&
+               std::equal(expected.begin(), expected.end(), b) ? 0.0 : 1.0;
     }
 };
 
@@ -8099,6 +8195,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_cpy(GGML_TYPE_I32, GGML_TYPE_I32, {256, 4, 1, 1}, {-1,-1,-1,-1}, {0, 0, 0, 0}, {0, 0, 0, 0}, true));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_I32, GGML_TYPE_I32, {256, 1, 4, 1}, {-1,-1,-1,-1}, {1, 2, 0, 3}, {0, 0, 0, 0}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_F32, {256, 1, 4, 1}, {-1,-1,-1,-1}, {1, 2, 0, 3}, {0, 0, 0, 0}));
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_F32, {64, 16, 1, 1}, {1, 64, 16, 1}, {1, 2, 0, 3}, {0, 0, 0, 0}, false, {32, 64, 16, 1})); // permuted src, strided dst
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_F16, GGML_TYPE_F16, {64, 16, 1, 1}, {1, 64, 16, 1}, {1, 2, 0, 3}, {0, 0, 0, 0}, false, {32, 64, 16, 1})); // permuted src, strided dst
 
     // CPY - different src/dst shapes (reshaping via CPY)
     // Use permutations of {3, 5, 7, 32}. Total elements: 3*5*7*32 = 3360.
@@ -8601,6 +8699,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_sin       (type));
         test_cases.emplace_back(new test_cos       (type));
         test_cases.emplace_back(new test_clamp     (type));
+        test_cases.emplace_back(new test_clamp     (type, {10, 5, 4, 3}, -0.5f, 0.5f, 1));
         test_cases.emplace_back(new test_leaky_relu(type));
         test_cases.emplace_back(new test_floor     (type));
         test_cases.emplace_back(new test_ceil      (type));
@@ -8786,6 +8885,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int dim : { 0, 1, 2, 3, }) {
             test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {11, 12, 13, 14}, 7, dim, v));
             test_cases.emplace_back(new test_concat(GGML_TYPE_I32, {11, 12, 13, 14}, 7, dim, v));
+        }
+    }
+
+    for (ggml_type type_a : { GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0 }) {
+        for (int dim : { 0, 1, 2, 3 }) {
+            test_cases.emplace_back(new test_concat(type_a, {128, 12, 13, 14}, dim == 0 ? 256 : 7, dim, 0));
         }
     }
 

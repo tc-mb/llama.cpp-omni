@@ -1913,7 +1913,11 @@ static void ggml_compute_forward_concat_any(
     GGML_ASSERT(dim >= 0 && dim < 4);
 
     int64_t o[4] = {0, 0, 0, 0};
-    o[dim] = src0->ne[dim];
+    if (dim == 0) {
+        o[dim] = src0->ne[dim]/ggml_blck_size(src0->type);
+    } else {
+        o[dim] = src0->ne[dim];
+    }
 
     const char * x;
 
@@ -1921,8 +1925,8 @@ static void ggml_compute_forward_concat_any(
     for (int i3 = 0; i3 < ne3; i3++) {
         for (int i2 = ith; i2 < ne2; i2 += nth) {
             for (int i1 = 0; i1 < ne1; i1++) {
-                for (int i0 = 0; i0 < ne0; i0++) {
-                    if (i0 < ne00 && i1 < ne01 && i2 < ne02 && i3 < ne03) {
+                for (int i0 = 0; i0 < ne0/ggml_blck_size(dst->type); i0++) {
+                    if (i0 < ne00/ggml_blck_size(src0->type) && i1 < ne01 && i2 < ne02 && i3 < ne03) {
                         x = (const char *)src0->data + (i0       )*nb00 + (i1       )*nb01 + (i2       )*nb02 + (i3       )*nb03;
                     } else {
                         x = (const char *)src1->data + (i0 - o[0])*nb10 + (i1 - o[1])*nb11 + (i2 - o[2])*nb12 + (i3 - o[3])*nb13;
@@ -2071,6 +2075,14 @@ void ggml_compute_forward_concat(
     ggml_tensor * dst) {
 
     const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    if (ggml_is_quantized(src0->type)) {
+        GGML_ASSERT(ggml_is_contiguous(src0));
+        GGML_ASSERT(ggml_is_contiguous(src1));
+        GGML_ASSERT(src0->ne[0] % ggml_blck_size(src0->type) == 0);
+        GGML_ASSERT(src1->ne[0] % ggml_blck_size(src1->type) == 0);
+    }
 
     switch (src0->type) {
         case GGML_TYPE_F16:
@@ -5568,18 +5580,18 @@ static void ggml_compute_forward_clamp_f32(
     const int n  = ggml_nrows(src0);
     const int nc = src0->ne[0];
 
-    const size_t nb00 = src0->nb[0];
-    const size_t nb01 = src0->nb[1];
-
-    const size_t nb0 = dst->nb[0];
-    const size_t nb1 = dst->nb[1];
+    GGML_TENSOR_UNARY_OP_LOCALS
 
     GGML_ASSERT( nb0 == sizeof(float));
     GGML_ASSERT(nb00 == sizeof(float));
 
     for (int j = ith; j < n; j += nth) {
-        float * dst_ptr  = (float *) ((char *)  dst->data + j*nb1);
-        float * src0_ptr = (float *) ((char *) src0->data + j*nb01);
+        const int64_t i1 = j % ne01;
+        const int64_t i2 = (j / ne01) % ne02;
+        const int64_t i3 = j / (ne01*ne02);
+
+        float * dst_ptr  = (float *) ((char *)  dst->data + i1*nb1  + i2*nb2  + i3*nb3);
+        float * src0_ptr = (float *) ((char *) src0->data + i1*nb01 + i2*nb02 + i3*nb03);
 
         for (int i = 0; i < nc; i++) {
             dst_ptr[i] = MAX(MIN(src0_ptr[i], max), min);
@@ -5604,18 +5616,18 @@ static void ggml_compute_forward_clamp_f16(
     const int n  = ggml_nrows(src0);
     const int nc = src0->ne[0];
 
-    const size_t nb00 = src0->nb[0];
-    const size_t nb01 = src0->nb[1];
-
-    const size_t nb0 = dst->nb[0];
-    const size_t nb1 = dst->nb[1];
+    GGML_TENSOR_UNARY_OP_LOCALS
 
     GGML_ASSERT( nb0 == sizeof(ggml_fp16_t));
     GGML_ASSERT(nb00 == sizeof(ggml_fp16_t));
 
     for (int j = ith; j < n; j += nth) {
-        ggml_fp16_t * dst_ptr  = (ggml_fp16_t *) ((char *)  dst->data + j*nb1);
-        ggml_fp16_t * src0_ptr = (ggml_fp16_t *) ((char *) src0->data + j*nb01);
+        const int64_t i1 = j % ne01;
+        const int64_t i2 = (j / ne01) % ne02;
+        const int64_t i3 = j / (ne01*ne02);
+
+        ggml_fp16_t * dst_ptr  = (ggml_fp16_t *) ((char *)  dst->data + i1*nb1  + i2*nb2  + i3*nb3);
+        ggml_fp16_t * src0_ptr = (ggml_fp16_t *) ((char *) src0->data + i1*nb01 + i2*nb02 + i3*nb03);
 
         for (int i = 0; i < nc; i++) {
             float v = GGML_CPU_FP16_TO_FP32(src0_ptr[i]);
