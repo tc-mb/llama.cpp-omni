@@ -275,6 +275,15 @@ static bool is_minicpm_o_4_6(const vision_model & model) {
     return model.model_type == MiniCPM_o_4_6;
 }
 
+static bool vision_patch_mm_supported(int nx, int ny, int patch_size, int batch_size,
+                                       const ggml_tensor * weight) {
+    return batch_size == 1 && patch_size > 0 && nx > 0 && ny > 0 &&
+           nx % patch_size == 0 && ny % patch_size == 0 && weight &&
+           weight->ne[0] == patch_size && weight->ne[1] == patch_size &&
+           weight->ne[2] == 3 && ggml_is_contiguous(weight) &&
+           (weight->type == GGML_TYPE_F16 || weight->type == GGML_TYPE_F32);
+}
+
 struct vision_graph {
     vision_ctx * ctx;
     const vision_model & model;
@@ -297,6 +306,8 @@ struct vision_graph {
     ggml_context_ptr ctx0_ptr;
     ggml_context * ctx0;
     ggml_cgraph * gf;
+
+    bool patch_mm = false;
 
     vision_graph(vision_ctx * ctx, const vision_image_f32 & img, int batch_size = 1) :
             ctx(ctx),
@@ -322,6 +333,9 @@ struct vision_graph {
         ctx0_ptr.reset(ggml_init(params));
         ctx0 = ctx0_ptr.get();
         gf = ggml_new_graph_custom(ctx0, ctx->max_nodes, false);
+        const char * patch_mm_env = std::getenv("OMNI_VPM_PATCHMM");
+        patch_mm = patch_mm_env && std::strcmp(patch_mm_env, "1") == 0 &&
+                   vision_patch_mm_supported(img.nx, img.ny, patch_size, batch_size, model.patch_embeddings);
     }
 
     ggml_cgraph * build_minicpmv() {
@@ -712,6 +726,40 @@ struct vision_graph {
         return gf;
     }
 
+    // build the patch projection (inp_raw --> patches)
+    // returns tensor with shape [n_embd, n_patches] (batch=1) or [n_embd, n_patches, batch_size] (batch>1)
+    ggml_tensor * build_inp() {
+        if (patch_mm) {
+            const int64_t k_dim = (int64_t) patch_size * patch_size * 3;
+            ggml_tensor * inp_raw = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, k_dim, n_patches);
+            ggml_set_name(inp_raw, "inp_raw");
+            ggml_set_input(inp_raw);
+            ggml_tensor * weights = ggml_reshape_2d(ctx0, model.patch_embeddings, k_dim, model.patch_embeddings->ne[3]);
+            // Match the im2col activation precision of the convolution path.
+            ggml_tensor * patches = model.patch_embeddings->type == GGML_TYPE_F16
+                ? ggml_cast(ctx0, inp_raw, GGML_TYPE_F16) : inp_raw;
+            ggml_tensor * inp = ggml_mul_mat(ctx0, weights, patches);
+            if (model.patch_bias) {
+                inp = ggml_add(ctx0, inp, model.patch_bias);
+                cb(inp, "patch_bias", -1);
+            }
+            return inp;
+        }
+        ggml_tensor * inp_raw = build_inp_raw();
+        ggml_tensor * inp = ggml_conv_2d(ctx0, model.patch_embeddings, inp_raw, patch_size, patch_size, 0, 0, 1, 1);
+        if (batch_size > 1) {
+            inp = ggml_reshape_3d(ctx0, inp, n_patches, n_embd, batch_size);
+        } else {
+            inp = ggml_reshape_2d(ctx0, inp, n_patches, n_embd);
+        }
+        inp = ggml_cont(ctx0, ggml_transpose(ctx0, inp));
+        if (model.patch_bias) {
+            inp = ggml_add(ctx0, inp, model.patch_bias);
+            cb(inp, "patch_bias", -1);
+        }
+        return inp;
+    }
+
 private:
     //
     // utility functions
@@ -856,24 +904,6 @@ private:
             inpL = build_norm(inpL, model.post_ln_w, model.post_ln_b, norm_t, eps, -1);
         }
         return inpL;
-    }
-
-    // build the input after conv2d (inp_raw --> patches)
-    // returns tensor with shape [n_embd, n_patches] (batch=1) or [n_embd, n_patches, batch_size] (batch>1)
-    ggml_tensor * build_inp() {
-        ggml_tensor * inp_raw = build_inp_raw();
-        ggml_tensor * inp = ggml_conv_2d(ctx0, model.patch_embeddings, inp_raw, patch_size, patch_size, 0, 0, 1, 1);
-        if (batch_size > 1) {
-            inp = ggml_reshape_3d(ctx0, inp, n_patches, n_embd, batch_size);
-        } else {
-            inp = ggml_reshape_2d(ctx0, inp, n_patches, n_embd);
-        }
-        inp = ggml_cont(ctx0, ggml_transpose(ctx0, inp));
-        if (model.patch_bias) {
-            inp = ggml_add(ctx0, inp, model.patch_bias);
-            cb(inp, "patch_bias", -1);
-        }
-        return inp;
     }
 
     ggml_tensor * build_inp_raw(int channels = 3) {
@@ -1667,6 +1697,34 @@ static void normalize_image_u8_to_f32(const vision_image_u8 & src, vision_image_
     }
 }
 
+static std::vector<float> vision_pack_patches(const float * rgb, int nx, int ny, int patch_size) {
+    GGML_ASSERT(rgb && patch_size > 0 && nx > 0 && ny > 0);
+    GGML_ASSERT(nx % patch_size == 0 && ny % patch_size == 0);
+
+    const int patches_x = nx / patch_size;
+    const int patches_y = ny / patch_size;
+    const size_t k_dim = (size_t) patch_size * patch_size * 3;
+    std::vector<float> patches(k_dim * patches_x * patches_y);
+
+    // Match the flattened conv-weight order: kw, kh, channel, output channel.
+    // This replaces the existing HWC -> CHW pass, rather than adding a pass.
+    for (int py = 0; py < patches_y; ++py) {
+        for (int px = 0; px < patches_x; ++px) {
+            const size_t patch = (size_t) py * patches_x + px;
+            for (int c = 0; c < 3; ++c) {
+                for (int kh = 0; kh < patch_size; ++kh) {
+                    const float * src = rgb + 3 * ((size_t) (py * patch_size + kh) * nx + px * patch_size) + c;
+                    float * dst = patches.data() + k_dim * patch + ((size_t) c * patch_size + kh) * patch_size;
+                    for (int kw = 0; kw < patch_size; ++kw) {
+                        dst[kw] = src[3 * kw];
+                    }
+                }
+            }
+        }
+    }
+    return patches;
+}
+
 struct image_manipulation {
     // Bilinear resize function
     static void bilinear_resize(const vision_image_u8& src, vision_image_u8& dst, int target_width, int target_height) {
@@ -2367,21 +2425,30 @@ bool vision_image_batch_encode(vision_ctx * ctx, const int n_threads, const visi
         const int nx = imgs.entries[0]->nx;
         const int ny = imgs.entries[0]->ny;
         const int n = nx * ny;
-        std::vector<float> inp_raw(3 * n * batch_size);
+        const char * patch_mm_env = std::getenv("OMNI_VPM_PATCHMM");
+        const bool patch_mm = patch_mm_env && std::strcmp(patch_mm_env, "1") == 0 &&
+                              vision_patch_mm_supported(nx, ny, patch_size, batch_size, ctx->model.patch_embeddings);
+        if (patch_mm) {
+            GGML_ASSERT(imgs.entries[0]->buf.size() == (size_t) nx * ny * 3);
+            std::vector<float> patches = vision_pack_patches(imgs.entries[0]->buf.data(), nx, ny, patch_size);
+            set_input_f32("inp_raw", patches);
+        } else {
+            std::vector<float> inp_raw(3 * n * batch_size);
 
-        for (int b = 0; b < batch_size; b++) {
-            float * batch_entry = inp_raw.data() + b * (3 * n);
-            for (int y = 0; y < ny; y++) {
-                for (int x = 0; x < nx; x++) {
-                    size_t base_src = 3 * (y * nx + x);
-                    size_t base_dst =      y * nx + x;
-                    batch_entry[          base_dst] = imgs.entries[b]->buf[base_src    ];
-                    batch_entry[1 * n + base_dst]   = imgs.entries[b]->buf[base_src + 1];
-                    batch_entry[2 * n + base_dst]   = imgs.entries[b]->buf[base_src + 2];
+            for (int b = 0; b < batch_size; b++) {
+                float * batch_entry = inp_raw.data() + b * (3 * n);
+                for (int y = 0; y < ny; y++) {
+                    for (int x = 0; x < nx; x++) {
+                        size_t base_src = 3 * (y * nx + x);
+                        size_t base_dst =      y * nx + x;
+                        batch_entry[          base_dst] = imgs.entries[b]->buf[base_src    ];
+                        batch_entry[1 * n + base_dst]   = imgs.entries[b]->buf[base_src + 1];
+                        batch_entry[2 * n + base_dst]   = imgs.entries[b]->buf[base_src + 2];
+                    }
                 }
             }
+            set_input_f32("inp_raw", inp_raw);
         }
-        set_input_f32("inp_raw", inp_raw);
     } 
 
     // set input per projector
