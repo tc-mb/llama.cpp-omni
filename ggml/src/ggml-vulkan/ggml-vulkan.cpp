@@ -7807,6 +7807,11 @@ static bool ggml_vk_dim01_contiguous(const ggml_tensor * tensor) {
         (tensor->ne[3] == 1 || tensor->nb[3] == tensor->nb[2]*tensor->ne[2]);
 }
 
+// Batch stride in elements of a tensor read in place.
+static uint32_t ggml_vk_batch_stride(const ggml_tensor * tensor) {
+    return (uint32_t)(tensor->nb[2] / ggml_type_size(tensor->type) * ggml_blck_size(tensor->type));
+}
+
 static vk_pipeline ggml_vk_get_cpy_pipeline(ggml_backend_vk_context * ctx, const ggml_tensor * src, const ggml_tensor * dst, ggml_type to) {
 
     // Choose "contiguous copy" shader if src/dst are contiguous
@@ -8212,7 +8217,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     }
 
     if (x_non_contig) {
-        ggml_vk_cpy_to_contiguous(ctx, subctx, to_fp16_vk_0, src0, ggml_vk_subbuffer(ctx, d_Qx, qx_buf_offset), ggml_vk_subbuffer(ctx, d_X, 0));
+        ggml_vk_cpy_to_contiguous(ctx, subctx, to_fp16_vk_0, src0, vk_subbuffer{ d_Qx, qx_buf_offset, ggml_nbytes(src0) }, vk_subbuffer{ d_X, 0, x_sz });
     } else if (qx_needs_dequant) {
         const std::vector<uint32_t> pc = { (uint32_t)ne01, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)(ggml_nelements(src0)) };
         ggml_vk_dispatch_pipeline(ctx, subctx, to_fp16_vk_0, { vk_subbuffer{ d_Qx, qx_buf_offset, qx_sz }, vk_subbuffer{ d_X, 0, x_sz } }, pc, { (uint32_t)(x_ne), 1, 1});
@@ -8224,7 +8229,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
             if (ctx->prealloc_y_need_sync) {
                 ggml_vk_sync_buffers(ctx, subctx);
             }
-            ggml_vk_cpy_to_contiguous(ctx, subctx, to_fp16_vk_1, src1, ggml_vk_subbuffer(ctx, d_Qy, qy_buf_offset), ggml_vk_subbuffer(ctx, d_Y, 0));
+            ggml_vk_cpy_to_contiguous(ctx, subctx, to_fp16_vk_1, src1, vk_subbuffer{ d_Qy, qy_buf_offset, ggml_nbytes(src1) }, vk_subbuffer{ d_Y, 0, y_sz });
             ctx->prealloc_y_last_pipeline_used = to_fp16_vk_1.get();
             ctx->prealloc_y_last_tensor_used = src1;
         }
@@ -8235,14 +8240,18 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
             if (ctx->prealloc_y_need_sync) {
                 ggml_vk_sync_buffers(ctx, subctx);
             }
-            ggml_vk_quantize_q8_1(ctx, subctx, ggml_vk_subbuffer(ctx, d_Qy, qy_buf_offset), ggml_vk_subbuffer(ctx, d_Y, 0), y_ne);
+            ggml_vk_quantize_q8_1(ctx, subctx, vk_subbuffer{ d_Qy, qy_buf_offset, ggml_nbytes(src1) }, ggml_vk_subbuffer(ctx, d_Y, 0), y_ne);
             ctx->prealloc_y_last_pipeline_used = to_q8_1.get();
             ctx->prealloc_y_last_tensor_used = src1;
         }
     }
 
-    uint32_t stride_batch_x = ne00*ne01;
-    uint32_t stride_batch_y = ne10*ne11;
+    // Partial quantized tiles rely on the exact range to read zero past the last row.
+    const uint64_t x_range = qx_needs_dequant ? x_sz : ggml_nbytes(src0);
+    const uint64_t y_range = (qy_needs_dequant || quantize_y) ? y_sz : ggml_nbytes(src1);
+
+    uint32_t stride_batch_x = qx_needs_dequant ? ne00*ne01 : ggml_vk_batch_stride(src0);
+    uint32_t stride_batch_y = (qy_needs_dequant || quantize_y) ? ne10*ne11 : ggml_vk_batch_stride(src1);
 
     if (!ggml_vk_dim01_contiguous(src0) && !qx_needs_dequant) {
         stride_batch_x = src0->nb[0] / ggml_type_size(src0->type);
@@ -8255,7 +8264,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     // compute
     ggml_vk_matmul(
         ctx, subctx, pipeline,
-        { d_X, x_buf_offset, x_sz }, { d_Y, y_buf_offset, y_sz },
+        { d_X, x_buf_offset, x_range }, { d_Y, y_buf_offset, y_range },
         ggml_vk_subbuffer(ctx, d_D, d_buf_offset), { ctx->prealloc_split_k, 0, d_sz * split_k },
         ne01, ne11, ne10,
         ne10, ne10, stride_d, stride_batch_x, stride_batch_y, stride_batch_d,
@@ -8508,8 +8517,8 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
     }
 
     // For batch_n, the A matrix is the same for each batch, and B/D use the row stride as the batch stride
-    uint32_t stride_batch_x = batch_n ? 0 : ne00*ne01;
-    uint32_t stride_batch_y = batch_n ? ne10 : (ne10*ne11);
+    uint32_t stride_batch_x = batch_n ? 0 : (qx_needs_dequant ? ne00*ne01 : ggml_vk_batch_stride(src0));
+    uint32_t stride_batch_y = batch_n ? ne10 : ((qy_needs_dequant || quantize_y) ? ne10*ne11 : ggml_vk_batch_stride(src1));
     uint32_t stride_batch_d = batch_n ? ne20 : (ne20*ne21);
 
     if (!ggml_vk_dim01_contiguous(src0) && !qx_needs_dequant) {
@@ -9128,7 +9137,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     }
 
     if (x_non_contig) {
-        ggml_vk_cpy_to_contiguous(ctx, subctx, to_fp16_vk_0, src0, ggml_vk_subbuffer(ctx, d_Qx, qx_buf_offset), ggml_vk_subbuffer(ctx, d_X, 0));
+        ggml_vk_cpy_to_contiguous(ctx, subctx, to_fp16_vk_0, src0, vk_subbuffer{ d_Qx, qx_buf_offset, ggml_nbytes(src0) }, vk_subbuffer{ d_X, 0, x_sz });
     } else if (qx_needs_dequant) {
         const std::vector<uint32_t> pc = { (uint32_t)ne01, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)(ggml_nelements(src0)) };
         ggml_vk_dispatch_pipeline(ctx, subctx, to_fp16_vk_0,
@@ -9140,7 +9149,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
             if (ctx->prealloc_y_need_sync) {
                 ggml_vk_sync_buffers(ctx, subctx);
             }
-            ggml_vk_cpy_to_contiguous(ctx, subctx, to_fp16_vk_1, src1, ggml_vk_subbuffer(ctx, d_Qy, qy_buf_offset), ggml_vk_subbuffer(ctx, d_Y, 0));
+            ggml_vk_cpy_to_contiguous(ctx, subctx, to_fp16_vk_1, src1, vk_subbuffer{ d_Qy, qy_buf_offset, ggml_nbytes(src1) }, vk_subbuffer{ d_Y, 0, y_sz });
             ctx->prealloc_y_last_pipeline_used = to_fp16_vk_1.get();
             ctx->prealloc_y_last_tensor_used = src1;
         }
@@ -9151,15 +9160,18 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
             if (ctx->prealloc_y_need_sync) {
                 ggml_vk_sync_buffers(ctx, subctx);
             }
-            ggml_vk_quantize_q8_1(ctx, subctx, ggml_vk_subbuffer(ctx, d_Qy, qy_buf_offset), ggml_vk_subbuffer(ctx, d_Y, 0), y_ne);
+            ggml_vk_quantize_q8_1(ctx, subctx, vk_subbuffer{ d_Qy, qy_buf_offset, ggml_nbytes(src1) }, ggml_vk_subbuffer(ctx, d_Y, 0), y_ne);
             ctx->prealloc_y_last_pipeline_used = to_q8_1.get();
             ctx->prealloc_y_last_tensor_used = src1;
         }
     }
     ggml_vk_sync_buffers(ctx, subctx);
 
-    uint32_t stride_batch_x = ne00*ne01;
-    uint32_t stride_batch_y = ne10*ne11;
+    const uint64_t x_range = qx_needs_dequant ? x_sz : ggml_nbytes(src0);
+    const uint64_t y_range = (qy_needs_dequant || quantize_y) ? y_sz : ggml_nbytes(src1);
+
+    uint32_t stride_batch_x = qx_needs_dequant ? ne00*ne01 : ggml_vk_batch_stride(src0);
+    uint32_t stride_batch_y = (qy_needs_dequant || quantize_y) ? ne10*ne11 : ggml_vk_batch_stride(src1);
 
     if (!ggml_vk_dim01_contiguous(src0) && !qx_needs_dequant) {
         stride_batch_x = src0->nb[0] / ggml_type_size(src0->type);
@@ -9172,7 +9184,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     // compute
     ggml_vk_matmul_id(
         ctx, subctx, pipeline,
-        { d_X, x_buf_offset, x_sz }, { d_Y, y_buf_offset, y_sz },
+        { d_X, x_buf_offset, x_range }, { d_Y, y_buf_offset, y_range },
         { d_D, d_buf_offset, d_sz }, { d_ids, ids_buf_offset, ids_sz }, expert_count_buf,
         ne01, ne21, ne10, ne10, ne10, ne01,
         stride_batch_x, stride_batch_y, ne20*ne21,
@@ -9353,7 +9365,8 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
         }
     }
 
-    uint32_t stride_batch_y = ne10*ne11;
+    uint32_t stride_batch_x = qx_needs_dequant ? ne00*ne01 : ggml_vk_batch_stride(src0);
+    uint32_t stride_batch_y = (qy_needs_dequant || quantize_y) ? ne10*ne11 : ggml_vk_batch_stride(src1);
 
     if (!ggml_vk_dim01_contiguous(src1) && !qy_needs_dequant) {
         stride_batch_y = src1->nb[2] / ggml_type_size(src1->type);
@@ -9396,7 +9409,7 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
     for (uint32_t expert_i1 = 0; expert_i1 < nei1; ++expert_i1) {
         const vk_mat_vec_id_push_constants pc = {
             (uint32_t)ne00, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)ne01,
-            (uint32_t)(ne00 * ne01), stride_batch_y, (uint32_t)(ne20 * ne21),
+            stride_batch_x, stride_batch_y, (uint32_t)(ne20 * ne21),
             fusion_flags,
             (uint32_t)nei0, (uint32_t)ne11, expert_i1, nbi1
         };
@@ -9747,6 +9760,12 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     vk_subbuffer sinks_buf = sinks ? ggml_vk_tensor_subbuffer(ctx, sinks) : q_buf;
     vk_subbuffer mask_opt_buf = use_mask_opt ? ggml_vk_subbuffer(ctx, ctx->prealloc_y, 0) : q_buf;
 
+    if (use_mask_opt) {
+        // Mask opt bits overwrite a matmul input converted into prealloc_y.
+        ctx->prealloc_y_last_pipeline_used = nullptr;
+        ctx->prealloc_y_last_tensor_used = nullptr;
+    }
+
     uint32_t mask_n_head_log2 = ((sinks != nullptr) << 24) | n_head_log2;
 
     if (use_mask_opt)
@@ -9818,6 +9837,9 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
                                     {q_buf, k_buf, v_buf, mask_buf, sinks_buf, dst_buf, mask_opt_buf},
                                     pc, { workgroups_x, workgroups_y, workgroups_z });
+    }
+    if (use_mask_opt) {
+        ctx->prealloc_y_need_sync = true;
     }
 }
 
@@ -11951,6 +11973,10 @@ static void ggml_vk_soft_max(ggml_backend_vk_context * ctx, vk_context& subctx, 
 
         vk_subbuffer buf_x = { ctx->prealloc_x, 0, tmp_size };
         vk_subbuffer buf_y = { ctx->prealloc_y, 0, tmp_size };
+
+        // Partial results overwrite a matmul input converted into prealloc_y.
+        ctx->prealloc_y_last_pipeline_used = nullptr;
+        ctx->prealloc_y_last_tensor_used = nullptr;
 
         std::array<uint32_t, 3> elements = { num_wgs, nrows_x, 1 };
 
