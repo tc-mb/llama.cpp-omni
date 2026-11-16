@@ -677,6 +677,9 @@ struct llama_model {
     int32_t moe_experts_layer_count() const;
 
     const llama_moe_experts_entry * moe_experts_entry(const char * tensor_name) const;
+    /// Entry of an LES layout loaded without a slot bank (experts mapped in place); nullptr
+    /// when the model has none or the slot runtime streams the experts instead.
+    const llama_moe_experts_entry * moe_packed_entry(const char * tensor_name) const;
 
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
     float get_rope_freq_scale(const llama_cparams & cparams, int il) const;
@@ -741,6 +744,9 @@ struct llama_model_base : public llama_model {
     /// experts manifest 里的形状/类型建出来。仍然放在「自己分配」的 buft 上，
     /// 理由与 create_tensor_own_alloc 相同。
     ggml_tensor * create_expert_tensor_from_manifest(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, enum ggml_type type);
+    /// Routed expert family `tn` as a strided view into its layer's LES carrier, which is
+    /// created (once per layer) as an ordinary mapped weight. See llama_model_loader::packed_expert_view.
+    ggml_tensor * create_packed_expert_view(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, const llama_moe_experts_entry & entry);
 
     // helper: try merged gate_up_exps first, fall back to separate gate and up
     void create_tensor_gate_up_exps(llama_layer & layer, int bid, int64_t n_embd_,
