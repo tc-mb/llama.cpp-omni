@@ -170,6 +170,25 @@ Provide a reference audio file (WAV, mono, any sample rate):
     VoxCPM2-Acoustic-F16.gguf
 ```
 
+### Ultimate Cloning
+
+Combine reference audio (isolated by the 103/104 markers) with a transcribed
+prompt audio used as continuation context. Reference and prompt may be different
+files and need not share a sample rate; each is encoded at its own rate:
+
+```bash
+./build/bin/voxcpm2-cli \
+    -t "This is the target sentence." \
+    -r speaker.wav \
+    --prompt-wav speaker.wav \
+    --prompt-text "The transcript of the reference audio." \
+    -o ultimate.wav \
+    VoxCPM2-BaseLM-F16.gguf VoxCPM2-Acoustic-F16.gguf
+```
+
+The prefill sequence is `[103, reference_audio, 104, prompt_text + target_text,
+101, prompt_audio]`, matching the Python `VoxCPM2Model._generate()` layout.
+
 ### Streaming
 
 ```bash
@@ -188,6 +207,8 @@ Provide a reference audio file (WAV, mono, any sample rate):
 | `-t, --text` | (required) | Input text to synthesize |
 | `-o, --output` | `output.wav` | Output WAV file path |
 | `-r, --reference` | — | Reference WAV for voice cloning |
+| `--prompt-wav` | — | Prompt WAV for continuation or ultimate cloning |
+| `--prompt-text` | — | Transcript paired with `--prompt-wav` |
 | `--stream` | — | Streaming output mode |
 | `--steps` | 200 | Max decode loop steps. For non-streaming text-only TTS, the default is treated as auto and reduced from text length |
 | `--timesteps` | 10 | CFM inference timesteps |

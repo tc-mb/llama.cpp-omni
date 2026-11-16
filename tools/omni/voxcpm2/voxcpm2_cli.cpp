@@ -13,6 +13,9 @@
 //   # Voice cloning
 //   ./voxcpm2-cli -t "This is a cloned voice." -r speaker.wav -o clone.wav base.gguf acoustic.gguf
 //
+//   # Ultimate cloning (reference timbre + transcript-guided prompt continuation)
+//   ./voxcpm2-cli -t "This is the target sentence." -r speaker.wav --prompt-wav speaker.wav --prompt-text "The transcript of the reference audio." -o ultimate.wav base.gguf acoustic.gguf
+//
 //   # Streaming
 //   ./voxcpm2-cli -t "Streaming test." --stream base.gguf acoustic.gguf
 
@@ -63,9 +66,9 @@ static void print_usage(const char * prog) {
         "  -t, --text TEXT      Input text to synthesize\n"
         "  -o, --output PATH    Output WAV file path (default: output.wav)\n"
         "  -r, --reference PATH Reference WAV for voice cloning\n"
-        "  --prompt-wav PATH    Prompt WAV for ultimate cloning\n"
-        "  --prompt-text TEXT   Transcript of prompt WAV for ultimate cloning\n"
-        "  --stream             Streaming mode (output chunks as they arrive)\n"
+        "  --prompt-wav PATH    Prompt WAV for continuation/ultimate cloning\n"
+        "  --prompt-text TEXT   Transcript of prompt WAV (required with --prompt-wav)\n"
+        "  --stream             Streaming mode\n"
         "  --steps N            Max decode steps (default: 200)\n"
         "  --timesteps N        CFM inference timesteps (default: 10)\n"
         "  --cfg F              CFG guidance scale (default: 2.0)\n"
@@ -83,8 +86,11 @@ static void print_usage(const char * prog) {
         "\n"
         "  # Voice cloning\n"
         "  %s -t \"Cloned voice text.\" -r speaker.wav base.gguf acoustic.gguf\n"
+        "\n"
+        "  # Ultimate cloning (reference + prompt audio + prompt transcript)\n"
+        "  %s -t \"Target sentence.\" -r speaker.wav --prompt-wav speaker.wav --prompt-text \"Reference transcript.\" -o ultimate.wav base.gguf acoustic.gguf\n"
         "\n",
-        prog, prog, prog, prog);
+        prog, prog, prog, prog, prog);
 }
 
 static bool parse_args(int argc, char ** argv, CliConfig & cfg) {
@@ -252,8 +258,56 @@ static int run_synthesis(const CliConfig & cfg) {
     std::vector<float> wav;
     auto t_start = std::chrono::steady_clock::now();
 
-    if (!cfg.prompt_wav_path.empty() && !cfg.prompt_text.empty()) {
-        // Continuation-mode voice cloning (reference transcript + prompt audio).
+    if (!cfg.prompt_wav_path.empty() && !cfg.prompt_text.empty() && !cfg.reference_wav_path.empty()) {
+        // Ultimate clone: isolate timbre with reference audio, then continue
+        // from prompt audio whose transcript is prepended to the target text.
+        LOG_INF("Loading reference WAV: %s\n", cfg.reference_wav_path.c_str());
+        int                ref_sr  = 0;
+        std::vector<float> ref_wav = load_wav_mono(cfg.reference_wav_path, ref_sr);
+        if (ref_wav.empty()) {
+            LOG_ERR("Failed to load reference WAV\n");
+            return 1;
+        }
+        LOG_INF("  Reference: %.2fs, %d Hz\n", static_cast<double>(ref_wav.size()) / ref_sr, ref_sr);
+
+        LOG_INF("Loading prompt WAV: %s\n", cfg.prompt_wav_path.c_str());
+        LOG_INF("  Prompt text: \"%s\"\n", cfg.prompt_text.c_str());
+        int                prompt_sr  = 0;
+        std::vector<float> prompt_wav = load_wav_mono(cfg.prompt_wav_path, prompt_sr);
+        if (prompt_wav.empty()) {
+            LOG_ERR("Failed to load prompt WAV\n");
+            return 1;
+        }
+        LOG_INF("  Prompt: %.2fs, %d Hz\n", static_cast<double>(prompt_wav.size()) / prompt_sr, prompt_sr);
+
+        // The two WAVs are independent files, so each keeps its own rate.
+        params.reference_sample_rate = ref_sr;
+        params.prompt_sample_rate    = prompt_sr;
+        if (cfg.streaming) {
+            LOG_INF("Generating (ultimate clone streaming)...\n");
+            std::vector<float> all_wav;
+            if (!runtime.generate_ultimate_clone_streaming(
+                    cfg.text, cfg.prompt_text, ref_wav, prompt_wav,
+                    [&all_wav](const std::vector<float> & chunk, bool is_final) {
+                        all_wav.insert(all_wav.end(), chunk.begin(), chunk.end());
+                        LOG_INF("  Chunk: %zu samples%s\n", chunk.size(), is_final ? " (final)" : "");
+                        return true;
+                    },
+                    params)) {
+                LOG_ERR("Ultimate clone streaming failed: %s\n", runtime.last_error().c_str());
+                return 1;
+            }
+            wav = std::move(all_wav);
+        } else {
+            LOG_INF("Generating (ultimate clone)...\n");
+            wav = runtime.generate_ultimate_clone(cfg.text, cfg.prompt_text, ref_wav, prompt_wav, params);
+            if (wav.empty()) {
+                LOG_ERR("Ultimate cloning failed: %s\n", runtime.last_error().c_str());
+                return 1;
+            }
+        }
+    } else if (!cfg.prompt_wav_path.empty() && !cfg.prompt_text.empty()) {
+        // Continuation-mode voice cloning (prompt transcript + prompt audio).
         LOG_INF("Loading prompt WAV: %s\n", cfg.prompt_wav_path.c_str());
         LOG_INF("  Prompt text: \"%s\"\n", cfg.prompt_text.c_str());
         int                prompt_sr = 0;
