@@ -386,7 +386,7 @@ def pack(args: argparse.Namespace) -> int:
         vtype = field.types[0]
         subtype = field.types[-1] if vtype == GGUFValueType.ARRAY else None
 
-        if name == "tokenizer.chat_template":
+        if name == "tokenizer.chat_template" and args.thinking != "keep":
             template, note = set_thinking(str(field.contents()), args.thinking == "on")
             if note != "rewritten":
                 print(f"warning: chat template not rewritten ({note})")
@@ -546,9 +546,10 @@ def main() -> int:
     p_pack.add_argument("--out", required=True, help="output gguf")
     p_pack.add_argument("--force", action="store_true", help="overwrite the output")
     p_pack.add_argument(
-        "--thinking", choices=("off", "on"), default="off",
+        "--thinking", choices=("off", "on", "keep"), default="off",
         help="bake the assistant turn's thinking mode into the chat template (default: off; "
-             "llama.cpp defaults reasoning to on, which breaks this model)")
+             "llama.cpp defaults reasoning to on, which breaks this model). 'keep' copies the "
+             "source template unchanged, for models that honour enable_thinking themselves")
     p_pack.set_defaults(func=pack)
 
     p_verify = commands.add_parser("verify", help="byte-compare the repack against its source")
