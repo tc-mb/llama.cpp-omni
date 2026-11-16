@@ -6786,6 +6786,10 @@ struct test_flash_attn_constant : public test_flash_attn_ext {
                               quantized ? GGML_TYPE_F16 : GGML_TYPE_F32),
           value(quantized ? 1.0f : 4096.0f) {}
 
+    test_flash_attn_constant(int64_t hsv, int64_t kv, int64_t nb, ggml_type type, float value, float softcap)
+        : test_flash_attn_ext(64, hsv, 1, {1, 1}, kv, nb, false, false, 0, softcap, GGML_PREC_F32, type, type),
+          value(value) {}
+
     std::string op_desc(ggml_tensor *) override { return "FLASH_ATTN_CONSTANT"; }
     bool run_whole_graph() override { return true; }
 
@@ -6798,7 +6802,8 @@ struct test_flash_attn_constant : public test_flash_attn_ext {
 
     double err(const float * a, const float * b, size_t n) override {
         for (size_t i = 0; i < n; i++) {
-            if (fabsf(a[i] - value) > value*1e-3f || fabsf(b[i] - value) > value*1e-3f) {
+            if (!std::isfinite(a[i]) || !std::isfinite(b[i]) ||
+                fabsf(a[i] - value) > value*1e-3f || fabsf(b[i] - value) > value*1e-3f) {
                 printf("constant attention index %zu: got %g / %g, expected %g ", i, a[i], b[i], value);
                 return 1.0;
             }
@@ -9377,6 +9382,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_flash_attn_constant(false));
     test_cases.emplace_back(new test_flash_attn_constant(true));
+    test_cases.emplace_back(new test_flash_attn_constant(64, 64, 2, GGML_TYPE_F16, 4096, 0));
+    test_cases.emplace_back(new test_flash_attn_constant(67, 64, 2, GGML_TYPE_F16, 4096, 0));
+    test_cases.emplace_back(new test_flash_attn_constant(64, 17, 64, GGML_TYPE_F16, 1, 1));
     test_cases.emplace_back(new test_matmul_scratch_reuse(false));
     test_cases.emplace_back(new test_matmul_scratch_reuse(true));
     test_cases.emplace_back(new test_matmul_scratch_reuse(true, 4096));

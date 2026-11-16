@@ -1213,21 +1213,39 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             return true;
         case GGML_OP_FLASH_ATTN_EXT:
             // for new head sizes, add checks here
-            if (op->src[0]->ne[0] != 32 &&
-                op->src[0]->ne[0] != 40 &&
-                op->src[0]->ne[0] != 48 &&
-                op->src[0]->ne[0] != 64 &&
-                op->src[0]->ne[0] != 72 &&
-                op->src[0]->ne[0] != 80 &&
-                op->src[0]->ne[0] != 96 &&
-                op->src[0]->ne[0] != 112 &&
-                op->src[0]->ne[0] != 128 &&
-                op->src[0]->ne[0] != 192 &&
-                op->src[0]->ne[0] != 256 &&
-                op->src[0]->ne[0] != 320 &&
-                op->src[0]->ne[0] != 512 &&
-                op->src[0]->ne[0] != 576) {
-                return false;
+            switch (op->src[0]->ne[0]) {
+                case 32:
+                case 40:
+                case 48:
+                case 64:
+                case 72:
+                case 80:
+                case 96:
+                case 112:
+                case 128:
+                case 256:
+                case 512:
+                    if (op->src[2]->ne[0] != op->src[0]->ne[0]) {
+                        return false;
+                    }
+                    break;
+                case 192:
+                    if (op->src[2]->ne[0] != 128 && op->src[2]->ne[0] != 192) {
+                        return false;
+                    }
+                    break;
+                case 320:
+                    if (op->src[2]->ne[0] != 256) {
+                        return false;
+                    }
+                    break;
+                case 576:
+                    if (op->src[2]->ne[0] != 512) {
+                        return false;
+                    }
+                    break;
+                default:
+                    return false;
             }
             if (op->src[1]->type != op->src[2]->type) {
                 return false;
