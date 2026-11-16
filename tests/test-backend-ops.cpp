@@ -25,6 +25,7 @@
 #include <array>
 #include <cfloat>
 #include <cinttypes>
+#include <cmath>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -4119,6 +4120,58 @@ struct test_mul_mat : public test_case {
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
         return ggml_op_name(GGML_OP_MUL_MAT);
+    }
+};
+
+// Cover raw NVFP4 scale bytes, including encodings the ordinary quantizer never emits.
+struct test_mul_mat_nvfp4_scales : public test_mul_mat {
+    test_mul_mat_nvfp4_scales(int64_t n)
+        : test_mul_mat(GGML_TYPE_NVFP4, GGML_TYPE_F32, 256, n, 256, {1, 1}, {1, 1}) {}
+
+    std::string op_desc(ggml_tensor *) override { return "MUL_MAT_NVFP4_SCALES"; }
+    bool run_whole_graph() override { return true; }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_case::initialize_tensors(ctx);
+        auto a = ggml_get_tensor(ctx, "a");
+        auto b = ggml_get_tensor(ctx, "b");
+        const size_t block_bytes = ggml_type_size(type_a);
+        const int64_t block_size = ggml_blck_size(type_a);
+        // Each block starts with one scale per 16 values; nibble 2 encodes one.
+        std::vector<uint8_t> data(ggml_nbytes(a), 0x22);
+        for (int64_t row = 0; row < m; row++) {
+            for (int64_t block = 0; block < k / block_size; block++) {
+                for (int64_t scale = 0; scale < block_size / 16; scale++) {
+                    data[row*a->nb[1] + block*block_bytes + scale] = uint8_t(row);
+                }
+            }
+        }
+        ggml_backend_tensor_set(a, data.data(), 0, data.size());
+        std::vector<float> rhs(k*n, 0);
+        for (int64_t col = 0; col < n; col++) {
+            // Q8 RHS conversion is exact: its scale is 127/127 = 1.
+            rhs[col*k + 16*col] = 127;
+        }
+        ggml_backend_tensor_set(b, rhs.data(), 0, rhs.size()*sizeof(float));
+    }
+
+    double err(const float * a, const float * b, size_t count) override {
+        for (size_t i = 0; i < count; i++) {
+            const unsigned code = i % m;
+            const unsigned exponent = (code >> 3) & 15;
+            const unsigned mantissa = code & 7;
+            const float scale = code == 0 || code == 127 ? 0.0f
+                : exponent == 0 ? std::ldexp(float(mantissa), -9)
+                : std::ldexp(1.0f + float(mantissa)/8, int(exponent) - 7);
+            const float expected = 127*scale;
+            const float tolerance = std::max(1e-4f, expected*1e-3f);
+            if (!std::isfinite(a[i]) || !std::isfinite(b[i]) ||
+                fabsf(a[i] - expected) > tolerance || fabsf(b[i] - expected) > tolerance) {
+                printf("NVFP4 scale 0x%02x: got %g / %g, expected %g ", code, a[i], b[i], expected);
+                return 1.0;
+            }
+        }
+        return 0.0;
     }
 };
 
@@ -9837,6 +9890,11 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
                 const bool is_cpu    = ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
                 const bool is_vulkan = strcmp(reg_name, "Vulkan") == 0;
                 const bool is_cuda   = strcmp(reg_name, "CUDA") == 0;
+                // Raw scale encodings follow the CPU/Vulkan decoding contract.
+                if (is_cpu || is_vulkan) {
+                    test_cases.emplace_back(new test_mul_mat_nvfp4_scales(1));
+                    test_cases.emplace_back(new test_mul_mat_nvfp4_scales(16));
+                }
                 // Padded MUL_MAT_ID RHS views are gated on CUDA and validated on CPU/Vulkan.
                 if (is_cpu || is_vulkan || is_cuda) {
                     test_cases.emplace_back(new test_mul_mat_rhs_view(4, true));
