@@ -1948,6 +1948,31 @@ struct llama_moe_slot_runtime::impl {
     int first_moe_layer = -1;
     uint64_t n_prefill_ubatch = 0;
     uint64_t n_decode_step = 0;
+
+    // Lookahead recall (decode, window mode): for each (step, layer) that got a prediction from
+    // the layer before, how many of the experts the router actually picked were in it. Same
+    // metric as the offline recall@depth. `rec_unpredicted` counts (step, layer) pairs with no
+    // prediction (layer 1 on the first token of a phase, or a dropped arm).
+    // Off by default (it reads the router's ids on the decode path); LLAMA_MOE_LOG_RECALL=1 turns it on.
+    const bool rec_enabled = [] {
+        const char * e = std::getenv("LLAMA_MOE_LOG_RECALL");
+        return e && *e && std::strcmp(e, "0") != 0;
+    }();
+    std::atomic<uint64_t> rec_hit{0};
+    std::atomic<uint64_t> rec_used{0};
+    std::atomic<uint64_t> rec_unpredicted{0};
+
+    void report_recall(const char * where) {
+        const uint64_t used = rec_used.exchange(0);
+        const uint64_t hit  = rec_hit.exchange(0);
+        const uint64_t none = rec_unpredicted.exchange(0);
+        if (used == 0 && none == 0) {
+            return;
+        }
+        moe_log("lookahead recall@%d (%s): %.1f%% (%llu / %llu used experts), unpredicted layer-steps=%llu",
+            lookahead.depth, where, used ? 100.0 * (double) hit / (double) used : 0.0,
+            (unsigned long long) hit, (unsigned long long) used, (unsigned long long) none);
+    }
     ubatch_acc cur;
     run_stats g_runs;   // 整进程累计；process() 只在 ith==0 上跑，单线程，无需原子
     std::vector<layer_state> layers;
@@ -2141,6 +2166,7 @@ struct llama_moe_slot_runtime::impl {
         was_window = false;
         parked.store(true, std::memory_order_release);
         moe_log("park expert memory: %d metal buffer(s)", n_ok);
+        report_recall("this generation");
     }
 
     void ensure_unparked() {
@@ -2507,6 +2533,19 @@ void llama_moe_slot_runtime::process(
                 if (e >= 0 && e < pimpl->n_expert) {
                     keep[(size_t) e] = 1;
                 }
+            }
+        }
+        if (decode && pimpl->rec_enabled) {
+            if (pred.empty()) {
+                pimpl->rec_unpredicted.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                // `experts` holds this layer's router picks (read above)
+                uint64_t hit = 0;
+                for (int32_t e : experts) {
+                    hit += (e >= 0 && e < pimpl->n_expert && keep[(size_t) e]) ? 1 : 0;
+                }
+                pimpl->rec_hit.fetch_add(hit, std::memory_order_relaxed);
+                pimpl->rec_used.fetch_add(experts.size(), std::memory_order_relaxed);
             }
         }
     }
