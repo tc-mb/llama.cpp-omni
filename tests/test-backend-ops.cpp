@@ -5289,6 +5289,98 @@ struct test_conv_transpose_2d : public test_case {
     }
 };
 
+// Scatter-add oracle independent of the backend's permuted-input dot-product implementation.
+struct test_conv_transpose_2d_oracle : public test_conv_transpose_2d {
+    const bool view;
+    std::vector<double> expected;
+
+    test_conv_transpose_2d_oracle(std::array<int64_t, 4> input, std::array<int64_t, 4> kernel,
+            int stride, ggml_type type, bool view = false)
+        : test_conv_transpose_2d(input, kernel, stride, type), view(view) {}
+
+    std::string vars() override {
+        return test_conv_transpose_2d::vars() + "," + VARS_TO_STR1(view);
+    }
+
+    std::string op_desc(ggml_tensor *) override { return "CONV_TRANSPOSE_2D_ORACLE"; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto shape = ne_input;
+        if (view) {
+            for (int i = 0; i < 4; ++i) shape[i] += 2;
+        }
+        ggml_tensor * input = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, shape.data());
+        ggml_set_name(input, "input_backing");
+        if (view) {
+            input = ggml_view_4d(ctx, input, ne_input[0], ne_input[1], ne_input[2], ne_input[3],
+                                input->nb[1], input->nb[2], input->nb[3], sizeof(float));
+        }
+        ggml_tensor * kernel = ggml_new_tensor(ctx, kernel_type, 4, ne_kernel.data());
+        ggml_set_name(kernel, "kernel");
+        ggml_tensor * out = ggml_conv_transpose_2d_p0(ctx, kernel, input, stride);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_case::initialize_tensors(ctx);
+        ggml_tensor * backing = ggml_get_tensor(ctx, "input_backing");
+        std::vector<float> data(ggml_nelements(backing));
+        for (size_t i = 0; i < data.size(); ++i) data[i] = float(int(i % 41) - 20)/8;
+        ggml_backend_tensor_set(backing, data.data(), 0, ggml_nbytes(backing));
+        ggml_tensor * kernel = ggml_get_tensor(ctx, "kernel");
+        std::vector<float> weights(ggml_nelements(kernel));
+        for (size_t i = 0; i < weights.size(); ++i) weights[i] = float(int(i % 13) - 6)/16;
+        if (kernel_type == GGML_TYPE_F16) {
+            std::vector<ggml_fp16_t> half(weights.size());
+            ggml_fp32_to_fp16_row(weights.data(), half.data(), half.size());
+            ggml_backend_tensor_set(kernel, half.data(), 0, ggml_nbytes(kernel));
+        } else {
+            ggml_backend_tensor_set(kernel, weights.data(), 0, ggml_nbytes(kernel));
+        }
+        ggml_tensor * out = ggml_get_tensor(ctx, "out");
+        const auto input = tensor_to_float(out->src[1]);
+        const auto stored_kernel = tensor_to_float(kernel);
+        expected.assign(ggml_nelements(out), 0);
+        // The dyadic inputs are exact in F16 too; no backend-specific input rounding is needed.
+        for (int64_t batch = 0; batch < ne_input[3]; ++batch) {
+            for (int64_t ic = 0; ic < ne_input[2]; ++ic) {
+                for (int64_t iy = 0; iy < ne_input[1]; ++iy) {
+                    for (int64_t ix = 0; ix < ne_input[0]; ++ix) {
+                        const size_t in = ix + ne_input[0]*(iy + ne_input[1]*(ic + ne_input[2]*batch));
+                        for (int64_t oc = 0; oc < ne_kernel[2]; ++oc) {
+                            for (int64_t ky = 0; ky < ne_kernel[1]; ++ky) {
+                                for (int64_t kx = 0; kx < ne_kernel[0]; ++kx) {
+                                    const size_t k = kx + ne_kernel[0]*(ky + ne_kernel[1]*(oc + ne_kernel[2]*ic));
+                                    const size_t dst = ix*stride + kx + out->ne[0]*
+                                        (iy*stride + ky + out->ne[1]*(oc + out->ne[2]*batch));
+                                    expected[dst] += double(input[in])*stored_kernel[k];
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        if (n != expected.size()) {
+            GGML_ASSERT(n == sentinel_size);
+            return std::equal(a, a + n, b) ? 0.0 : 1.0;
+        }
+        for (size_t i = 0; i < n; ++i) {
+            const double tolerance = 1e-5*(1 + std::abs(expected[i]));
+            if (!std::isfinite(a[i]) || !std::isfinite(b[i]) ||
+                std::abs(a[i] - expected[i]) > tolerance || std::abs(b[i] - expected[i]) > tolerance) {
+                printf("transpose-conv oracle index=%zu expected=%g actual=(%g,%g) ", i, expected[i], a[i], b[i]);
+                return 1.0;
+            }
+        }
+        return 0.0;
+    }
+};
+
 // GGML_OP_IM2COL
 struct test_im2col : public test_case {
     const ggml_type type_input;
@@ -8334,6 +8426,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_conv_transpose_2d({3, 2, 3, 1}, {2, 2, 1, 3}, 1, kernel_type));
         test_cases.emplace_back(new test_conv_transpose_2d({10, 10, 9, 1}, {3, 3, 1, 9}, 2, kernel_type));
         test_cases.emplace_back(new test_conv_transpose_2d({129, 63, 35, 1}, {3, 3, 48, 35}, 1, kernel_type));
+        test_cases.emplace_back(new test_conv_transpose_2d({10, 10, 9, 2}, {3, 3, 1, 9}, 2, kernel_type));
+        test_cases.emplace_back(new test_conv_transpose_2d_oracle({3, 2, 3, 1}, {2, 3, 5, 3}, 1, kernel_type));
+        test_cases.emplace_back(new test_conv_transpose_2d_oracle({3, 2, 3, 3}, {2, 3, 5, 3}, 1, kernel_type));
+        test_cases.emplace_back(new test_conv_transpose_2d_oracle({10, 10, 9, 3}, {3, 3, 5, 9}, 2, kernel_type));
+        test_cases.emplace_back(new test_conv_transpose_2d_oracle({3, 2, 3, 3}, {2, 3, 5, 3}, 3, kernel_type, true));
+        test_cases.emplace_back(new test_conv_transpose_2d_oracle({3, 2, 3, 1}, {2, 3, 5, 3}, 2, kernel_type, true));
     }
 
     test_cases.emplace_back(new test_count_equal(GGML_TYPE_F32, {4,  500, 1, 1}));
