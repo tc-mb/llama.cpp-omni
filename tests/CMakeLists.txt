@@ -243,6 +243,12 @@ endif()
 llama_build_and_test(test-gguf.cpp)
 llama_build_and_test(test-backend-ops.cpp)
 
+if (GGML_CPU AND TARGET ggml-cpu AND NOT GGML_BACKEND_DL)
+    add_executable(test-backward-alias test-backward-alias.cpp)
+    target_link_libraries(test-backward-alias PRIVATE ggml ggml-cpu)
+    llama_test(test-backward-alias LABEL "cpu")
+endif()
+
 if (GGML_CUDA AND TARGET ggml-cuda AND NOT GGML_BACKEND_DL AND (NOT WIN32 OR NOT BUILD_SHARED_LIBS))
     # Internal entry points require a linkable backend, and are not exported by Windows shared builds.
     enable_language(CUDA)
