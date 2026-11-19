@@ -673,6 +673,11 @@ struct llama_model {
     /// 每层**预读暂存区**的 slot 数（= 预读深度 K）。0 = 无。
     /// 与 moe_decode_window() 一起决定每层张量的总宽度（c + K）。
     int32_t moe_prefetch_slots() const;
+    /// The prefill bank and the per-layer decode windows share memory (set by the arch while
+    /// loading tensors). Safe because every decode phase starts by clearing the windows; the
+    /// slot runtime then drains lookahead before a bank step and disables prewarm, the two
+    /// things that would otherwise write window contents that must survive a prefill.
+    bool moe_bank_window_overlap = false;
     /// experts 里的 MoE 层数（用于算 base 容量）。
     int32_t moe_experts_layer_count() const;
 

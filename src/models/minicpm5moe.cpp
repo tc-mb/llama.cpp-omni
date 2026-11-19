@@ -38,10 +38,13 @@ void llama_model_minicpm5moe::load_arch_tensors(llama_model_loader & ml) {
 
     // ── LES：路由专家内联在模型文件里，decode 阶段按层窗口按需读入 ──
     //
-    // decode 窗口物理布局（与 qwen35moe 一致）：每个 (family, 量化档位) 组一个 base，
-    //   base: ne[2] = prefill 容量 + Σ(组内各层窗口宽度)
+    // decode 窗口物理布局：每个 (family, 量化档位) 组一个 base，
+    //   base: ne[2] = max(prefill 容量, Σ(组内各层窗口宽度))
     //     ├─ prefill view（组内共享）: offset 0
-    //     └─ decode view（每层一份） : offset prefill 容量 + 前面各层宽度之和
+    //     └─ decode view（每层一份） : offset 前面各层宽度之和
+    // prefill bank 与 decode 窗口共用同一段内存：decode 阶段开始时窗口总是先清空，prefill
+    // 也用不到窗口，所以不必相加（qwen35moe 仍是相加的布局，它的 prewarm 依赖这一点）。
+    // 保证安全的条件见 llama_model::moe_bank_window_overlap。
     // 组内所有层必须同档位，否则视图按自己的步长寻址、跨层静默互相覆盖。
     const int64_t dec_c = moe_decode_window();
     const int64_t k_pf  = moe_prefetch_slots();
@@ -85,7 +88,7 @@ void llama_model_minicpm5moe::load_arch_tensors(llama_model_loader & ml) {
                 total += width_of(il);
             }
             group_slots[tn(fam_ids[fi], "weight", kv.second.front()).str()] =
-                dec_enabled ? (prefill_cap + total) : prefill_cap;
+                dec_enabled ? std::max(prefill_cap, total) : prefill_cap;
         }
     }
     auto slots_for = [&](const LLM_TN_IMPL & name) -> int64_t {
@@ -246,8 +249,9 @@ void llama_model_minicpm5moe::load_arch_tensors(llama_model_loader & ml) {
                         orig.c_str(), base, 0, prefill_cap, e->bytes_per_expert);
                 }
                 if (dec_enabled) {
+                    moe_bank_window_overlap = true;
                     const std::string n2 = format("%s.dec", ggml_get_name(L.*fams[fi].pf));
-                    int64_t off = prefill_cap;
+                    int64_t off = 0;
                     for (size_t k = 0; k < j; ++k) {
                         off += width_of(members[k]);
                     }

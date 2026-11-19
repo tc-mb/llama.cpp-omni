@@ -2018,6 +2018,11 @@ struct llama_moe_slot_runtime::impl {
         if (!path || !*path) {
             return;
         }
+        if (model.moe_bank_window_overlap) {
+            // prewarm fills the windows before a prefill and expects them to survive it
+            moe_log("prewarm: off (the prefill bank shares memory with the decode windows)");
+            return;
+        }
         FILE * fp = std::fopen(path, "r");
         if (!fp) {
             moe_log("prewarm: 打不开表文件 %s", path);
@@ -2390,6 +2395,12 @@ void llama_moe_slot_runtime::process(
     // 窗口模式里预读 worker 会锁**目标层**的 mutex 去写它的窗口；若本函数已持
     // state.mutex 再等 worker，就成了锁序反转 → 死锁（实际踩到过）。
     // 非窗口模式 worker 只写尾部乒乓区、不碰任何层锁，所以照旧在锁后 take 取结果。
+    // The prefill bank shares memory with the decode windows: no prefetch may still be writing
+    // a window while a bank step installs into the same bytes.
+    if (!window_mode && pimpl->model.moe_bank_window_overlap) {
+        pimpl->lookahead.drain();
+    }
+
     if (lookahead_step && window_mode) {
         std::vector<lookahead_expert_prefetch::hit> ignored;   // 窗口模式不返回 hit
         pimpl->lookahead.take(layer, ignored);
