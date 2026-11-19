@@ -161,8 +161,11 @@ void llama_model_minicpm5moe::load_arch_tensors(llama_model_loader & ml) {
 
         layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
 
-        // attn_q holds the query and the attention gate concatenated per head
-        layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q, "weight", i), {n_embd, 2 * n_head * n_embd_head_k}, 0);
+        // The attention output gate comes in one of two layouts: a separate attn_gate tensor,
+        // or concatenated with the query per head inside attn_q ([query, gate] per head).
+        layer.wqkv_gate = create_tensor(tn(LLM_TENSOR_ATTN_GATE, "weight", i), {n_embd, n_head * n_embd_head_v}, TENSOR_NOT_REQUIRED);
+        layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q, "weight", i),
+                {n_embd, (layer.wqkv_gate ? 1 : 2) * n_head * n_embd_head_k}, 0);
         layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K, "weight", i), {n_embd, n_head_kv * n_embd_head_k}, 0);
         layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V, "weight", i), {n_embd, n_head_kv * n_embd_head_v}, 0);
         layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_head * n_embd_head_v, n_embd}, 0);
@@ -538,18 +541,26 @@ llama_model_minicpm5moe::graph::graph(const llama_model & model, const llm_graph
 
         // self_attention
         {
-            ggml_tensor * q_full = ggml_mul_mat(ctx0, model.layers[il].wq, cur);
-            cb(q_full, "q_full", il);
+            ggml_tensor * Qcur;
+            ggml_tensor * Qgate;
+            if (model.layers[il].wqkv_gate) {
+                // separate attn_gate tensor
+                Qcur  = ggml_reshape_3d(ctx0, ggml_mul_mat(ctx0, model.layers[il].wq, cur), n_embd_head, n_head, n_tokens);
+                Qgate = ggml_mul_mat(ctx0, model.layers[il].wqkv_gate, cur);
+            } else {
+                ggml_tensor * q_full = ggml_mul_mat(ctx0, model.layers[il].wq, cur);
+                cb(q_full, "q_full", il);
 
-            // the q_proj output of each head is [query, gate]
-            const int64_t nb1 = ggml_row_size(q_full->type, 2*n_embd_head);
+                // the q_proj output of each head is [query, gate]
+                const int64_t nb1 = ggml_row_size(q_full->type, 2*n_embd_head);
 
-            ggml_tensor * Qcur = ggml_view_3d(ctx0, q_full, n_embd_head, n_head, n_tokens, nb1, nb1*n_head, 0);
-            ggml_tensor * Qgate = ggml_view_3d(ctx0, q_full, n_embd_head, n_head, n_tokens, nb1, nb1*n_head,
-                    ggml_row_size(q_full->type, n_embd_head));
+                Qcur = ggml_view_3d(ctx0, q_full, n_embd_head, n_head, n_tokens, nb1, nb1*n_head, 0);
+                Qgate = ggml_view_3d(ctx0, q_full, n_embd_head, n_head, n_tokens, nb1, nb1*n_head,
+                        ggml_row_size(q_full->type, n_embd_head));
 
-            Qcur  = ggml_cont(ctx0, Qcur);
-            Qgate = ggml_cont(ctx0, Qgate);
+                Qcur  = ggml_cont(ctx0, Qcur);
+                Qgate = ggml_cont(ctx0, Qgate);
+            }
 
             cb(Qcur,  "Qcur",  il);
             cb(Qgate, "Qgate", il);
