@@ -1168,22 +1168,20 @@ struct vk_op_count_experts_push_constants {
 
 struct vk_op_glu_push_constants {
     uint32_t N;
-    uint32_t ne00;
-    uint32_t ne20;
+    uint32_t width;
+    uint32_t rows;
+    uint32_t planes;
     uint32_t mode;  // 0: default, 1: swapped, 2: split
     float alpha; // for swiglu_oai
     float limit;
-    uint32_t nb01;
-    uint32_t nb02;
-    uint32_t nb03;
-    uint32_t ne01;
-    uint32_t ne02;
-    uint32_t nb11;
-    uint32_t nb12;
-    uint32_t nb13;
-    uint32_t ne11;
-    uint32_t ne12;
+    uint32_t a_stride[4];
+    uint32_t b_stride[4];
+    uint32_t d_stride[4];
+    uint32_t a_offset;
+    uint32_t b_offset;
+    uint32_t d_offset;
 };
+static_assert(sizeof(vk_op_glu_push_constants) == 88);
 
 struct vk_op_unary_push_constants {
     uint32_t ne;
@@ -4743,7 +4741,7 @@ static void ggml_vk_load_shaders(vk_device& device) {
     }
     ggml_vk_create_pipeline(device, device->pipeline_mul_mat_vec_nc_f16_f32, "mul_mat_vec_nc_f16_f32", mul_mat_vec_nc_f16_f32_len, mul_mat_vec_nc_f16_f32_data, "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_nc_push_constants), {1, 1, 1}, {}, 1);
 
-    ggml_vk_create_pipeline(device, device->pipeline_norm_f32, "norm_f32", norm_f32_len, norm_f32_data, "main", 2, sizeof(vk_op_push_constants), {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_norm_f32, "norm_f32", norm_f32_len, norm_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {1, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_group_norm_f32, "group_norm_f32", group_norm_f32_len, group_norm_f32_data, "main", 2, sizeof(vk_op_push_constants), {1, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_f32, "rms_norm_f32", rms_norm_f32_len, rms_norm_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 0}, 1, true);
@@ -4888,8 +4886,8 @@ static void ggml_vk_load_shaders(vk_device& device) {
     ggml_vk_create_pipeline(device, device->pipeline_repeat_i16, "repeat_i16", repeat_i16_len, repeat_i16_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
 
 #define CREATE_UNARY(name)  \
-    ggml_vk_create_pipeline(device, device->pipeline_ ## name [0], #name "_f32", name ## _f32_len, name ## _f32_data, "main", 2, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);  \
-    ggml_vk_create_pipeline(device, device->pipeline_ ## name [1], #name "_f16", name ## _f16_len, name ## _f16_data, "main", 2, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_ ## name [0], #name "_f32", name ## _f32_len, name ## _f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);  \
+    ggml_vk_create_pipeline(device, device->pipeline_ ## name [1], #name "_f16", name ## _f16_len, name ## _f16_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
 
     CREATE_UNARY(elu)
     CREATE_UNARY(gelu)
@@ -4897,7 +4895,6 @@ static void ggml_vk_load_shaders(vk_device& device) {
     CREATE_UNARY(gelu_quick)
     CREATE_UNARY(silu)
     CREATE_UNARY(relu)
-    CREATE_UNARY(xielu)
     CREATE_UNARY(neg)
     CREATE_UNARY(tanh)
     CREATE_UNARY(sigmoid)
@@ -4913,6 +4910,9 @@ static void ggml_vk_load_shaders(vk_device& device) {
     CREATE_UNARY(sgn)
     CREATE_UNARY(exp)
 #undef CREATE_UNARY
+
+    ggml_vk_create_pipeline(device, device->pipeline_xielu[0], "xielu_f32", xielu_f32_len, xielu_f32_data, "main", 2, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_xielu[1], "xielu_f16", xielu_f16_len, xielu_f16_data, "main", 2, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_add1_f16_f16, "add1_f16_f16", add1_f16_f16_len, add1_f16_f16_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_add1_f16_f32, "add1_f16_f32", add1_f16_f32_len, add1_f16_f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {}, 1);
@@ -10504,6 +10504,12 @@ template <> void init_pushconst_tensor_offsets(ggml_backend_vk_context * ctx, vk
     GGML_UNUSED(src3);
 }
 
+template <> void init_pushconst_tensor_offsets(ggml_backend_vk_context * ctx, vk_op_glu_push_constants &p, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor *, const ggml_tensor *, ggml_tensor * dst) {
+    p.a_offset = get_misalign_bytes(ctx, src0) / ggml_type_size(src0->type);
+    p.b_offset = src1 ? get_misalign_bytes(ctx, src1) / ggml_type_size(src1->type) : 0;
+    p.d_offset = get_misalign_bytes(ctx, dst) / ggml_type_size(dst->type);
+}
+
 template <> void init_pushconst_tensor_offsets(ggml_backend_vk_context * ctx, vk_op_sum_rows_push_constants &p, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * src3, ggml_tensor * dst) {
     const uint32_t a_offset = get_misalign_bytes(ctx, src0) / ggml_type_size(src0->type);
     const uint32_t d_offset = get_misalign_bytes(ctx, dst) / ggml_type_size(dst->type);
@@ -10664,7 +10670,8 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
             // Run one element per thread, 128 threads per workgroup
             elements = { (uint32_t)CEIL_DIV(ne00, 128), 1, 1 };
         } else {
-            elements = { (uint32_t)ne01, (uint32_t)ne02, (uint32_t)ne03 };
+            const auto & limits = ctx->device->properties.limits.maxComputeWorkGroupCount;
+            elements = { (uint32_t)ne01, std::min((uint32_t)ne02, limits[1]), std::min((uint32_t)ne03, limits[2]) };
         }
         break;
 
@@ -10674,8 +10681,13 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
         break;
     case GGML_OP_GROUP_NORM:
         {
-            const uint32_t num_groups = dst->op_params[0];
-            elements = { num_groups * (uint32_t)src0->ne[3], 1, 1 };
+            const uint32_t total_workgroups = dst->op_params[0] * (uint32_t)src0->ne[3];
+            const auto & limits = ctx->device->properties.limits.maxComputeWorkGroupCount;
+            const uint32_t groups_x = std::min(total_workgroups, limits[0]);
+            const uint32_t groups_y = std::min<uint64_t>(CEIL_DIV(uint64_t(total_workgroups), groups_x), limits[1]);
+            const uint64_t groups_xy = uint64_t(groups_x) * groups_y;
+            elements = { groups_x, groups_y, uint32_t(CEIL_DIV(uint64_t(total_workgroups), groups_xy)) };
+            GGML_ASSERT(elements[2] <= limits[2]);
         } break;
     case GGML_OP_DIAG_MASK_INF:
         elements = { (uint32_t)ggml_nrows(src0), (uint32_t)ne00, 1 };
@@ -11646,8 +11658,10 @@ static void ggml_vk_silu_back(ggml_backend_vk_context * ctx, vk_context& subctx,
 
 static void ggml_vk_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
     float * op_params = (float *)dst->op_params;
+    vk_op_unary_push_constants p = vk_op_unary_push_constants_init(src0, dst);
+    p.param1 = op_params[0];
 
-    ggml_vk_op_f32<vk_op_push_constants>(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_NORM, { (uint32_t)src0->ne[0], (uint32_t)src0->ne[1], op_params[0], 0.0f, 0.0f, 0.0f });
+    ggml_vk_op_f32(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_NORM, std::move(p));
 }
 
 static void ggml_vk_group_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
@@ -11657,8 +11671,9 @@ static void ggml_vk_group_norm(ggml_backend_vk_context * ctx, vk_context& subctx
     const uint32_t num_groups = int_op_params[0];
     const float eps = float_op_params[1];
     const uint32_t group_size = src0->ne[0] * src0->ne[1] * ((src0->ne[2] + num_groups - 1) / num_groups);
+    const uint32_t num_workgroups = num_groups * src0->ne[3];
 
-    ggml_vk_op_f32<vk_op_push_constants>(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_GROUP_NORM, { group_size, 0, eps, 0.0f, 0.0f, 0.0f });
+    ggml_vk_op_f32<vk_op_push_constants>(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_GROUP_NORM, { group_size, num_workgroups, eps, 0.0f, 0.0f, 0.0f });
 }
 
 static uint32_t ggml_vk_rms_num_partials(ggml_backend_vk_context * ctx, const ggml_tensor *node) {
@@ -11816,8 +11831,12 @@ static void ggml_vk_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx, 
         pc.rope.d_offset = get_misalign_bytes(ctx, tensors[5]) / ggml_type_size(tensors[5]->type);
         offset[5] &= ~(size_t(ctx->device->properties.limits.minStorageBufferOffsetAlignment) - 1);
 
-        std::array<uint32_t, 3> elements;
-        elements = { (uint32_t)rms->src[0]->ne[1], (uint32_t)rms->src[0]->ne[2], (uint32_t)rms->src[0]->ne[3] };
+        const auto & limits = ctx->device->properties.limits.maxComputeWorkGroupCount;
+        const std::array<uint32_t, 3> elements = {
+            (uint32_t)src0->ne[1],
+            std::min((uint32_t)src0->ne[2], limits[1]),
+            std::min((uint32_t)src0->ne[3], limits[2]),
+        };
 
         static_assert(max_tensors == 7);
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
@@ -11854,7 +11873,10 @@ static void ggml_vk_l2_norm(ggml_backend_vk_context * ctx, vk_context& subctx, c
 }
 
 static void ggml_vk_unary(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
-    ggml_vk_op_f32<vk_op_push_constants>(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_UNARY, { (uint32_t)ggml_nelements(src0), 0, 0.0f, 0.0f, 0.0f, 0.0f });
+    vk_op_unary_push_constants p = vk_op_unary_push_constants_init(src0, dst);
+    p.param1 = ggml_is_contiguous(src0) ? 1.0f : 0.0f;
+    p.param2 = ggml_is_contiguous(dst)  ? 1.0f : 0.0f;
+    ggml_vk_op_f32(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_UNARY, p);
 }
 
 static void ggml_vk_xielu(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
@@ -11883,27 +11905,21 @@ static void ggml_vk_glu(ggml_backend_vk_context * ctx, vk_context& subctx, const
         GGML_ASSERT(src0->type == src1->type);
     }
 
-    const uint32_t mode = split ? 2 : (swapped ? 1 : 0);
-
-    ggml_vk_op_f32<vk_op_glu_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_GLU,
-        {
-            (uint32_t)ggml_nelements(dst),
-            (uint32_t)src0->ne[0],
-            (uint32_t)dst->ne[0],
-            mode,
-            alpha,
-            limit,
-            (uint32_t)(src0->nb[1] / src0->nb[0]),
-            (uint32_t)(src0->nb[2] / src0->nb[0]),
-            (uint32_t)(src0->nb[3] / src0->nb[0]),
-            (uint32_t)src0->ne[1],
-            (uint32_t)src0->ne[2],
-            (uint32_t)(dst->nb[1] / dst->nb[0]),
-            (uint32_t)(dst->nb[2] / dst->nb[0]),
-            (uint32_t)(dst->nb[3] / dst->nb[0]),
-            (uint32_t)dst->ne[1],
-            (uint32_t)dst->ne[2]
-        });
+    vk_op_glu_push_constants p{};
+    p.N = (uint32_t)ggml_nelements(dst);
+    p.width = (uint32_t)dst->ne[0];
+    p.rows = (uint32_t)dst->ne[1];
+    p.planes = (uint32_t)dst->ne[2];
+    p.mode = split ? 2 : (swapped ? 1 : 0);
+    p.alpha = alpha;
+    p.limit = limit;
+    const size_t ts = ggml_type_size(src0->type);
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        p.a_stride[i] = src0->nb[i] / ts;
+        p.b_stride[i] = split ? src1->nb[i] / ts : 0;
+        p.d_stride[i] = dst->nb[i] / ts;
+    }
+    ggml_vk_op_f32(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_GLU, p);
 }
 
 static void ggml_vk_diag_mask_inf(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
@@ -16296,6 +16312,11 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
     switch (op->op) {
         case GGML_OP_UNARY:
             switch (ggml_get_unary_op(op)) {
+                case GGML_UNARY_OP_XIELU:
+                    if (!ggml_is_contiguous(op->src[0]) || !ggml_is_contiguous(op)) {
+                        return false;
+                    }
+                    [[fallthrough]];
                 case GGML_UNARY_OP_EXP:
                 case GGML_UNARY_OP_ELU:
                 case GGML_UNARY_OP_GELU:
@@ -16303,7 +16324,6 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 case GGML_UNARY_OP_GELU_QUICK:
                 case GGML_UNARY_OP_SILU:
                 case GGML_UNARY_OP_RELU:
-                case GGML_UNARY_OP_XIELU:
                 case GGML_UNARY_OP_NEG:
                 case GGML_UNARY_OP_TANH:
                 case GGML_UNARY_OP_SIGMOID:
@@ -16317,7 +16337,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 case GGML_UNARY_OP_FLOOR:
                 case GGML_UNARY_OP_TRUNC:
                 case GGML_UNARY_OP_SGN:
-                    return ggml_is_contiguous(op->src[0]) &&
+                    return ggml_is_contiguous_rows(op->src[0]) && ggml_is_contiguous_rows(op) &&
                            (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
                            (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16) &&
                            (op->src[0]->type == op->type);
@@ -16577,12 +16597,11 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
         case GGML_OP_TRANSPOSE:
         case GGML_OP_RMS_NORM:
             return true;
-        case GGML_OP_NORM:
         case GGML_OP_GROUP_NORM:
             return ggml_is_contiguous(op->src[0]);
+        case GGML_OP_NORM:
         case GGML_OP_L2_NORM:
-            return ggml_is_contiguous_rows(op->src[0]) &&
-                   op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
+            return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
         case GGML_OP_ADD:
         case GGML_OP_SUB:
         case GGML_OP_MUL:
@@ -16673,6 +16692,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32
                 && ggml_is_contiguous(op->src[1]) && op->src[1]->type == GGML_TYPE_F32;
         case GGML_OP_SUM:
+            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 &&
+                ggml_is_contiguously_allocated(op->src[0]);
         case GGML_OP_SUM_ROWS:
         case GGML_OP_MEAN:
             return op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous_rows(op->src[0]);

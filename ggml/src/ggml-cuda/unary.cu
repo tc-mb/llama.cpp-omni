@@ -134,6 +134,49 @@ static void unary_cuda(const T * x, T * dst, const int k, cudaStream_t stream) {
     ggml_cuda_kernel_launch(unary_op_kernel<op, T>, launch_params, x, dst, k);
 }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+struct unary_strides {
+    size_t src[GGML_MAX_DIMS];
+    size_t dst[GGML_MAX_DIMS];
+};
+
+template <float (*op)(float), typename T>
+static __global__ void unary_op_kernel_strided(const T * x, T * dst, const int64_t k,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2, const unary_strides strides) {
+    ggml_cuda_pdl_lc();
+    const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
+    if (i >= k) {
+        return;
+    }
+
+    const int64_t row = i / ne0;
+    const int64_t i0 = i % ne0;
+    const int64_t i1 = row % ne1;
+    const int64_t i2 = (row / ne1) % ne2;
+    const int64_t i3 = row / ne1 / ne2;
+    const size_t sx = i0*strides.src[0] + i1*strides.src[1] + i2*strides.src[2] + i3*strides.src[3];
+    const size_t dx = i0*strides.dst[0] + i1*strides.dst[1] + i2*strides.dst[2] + i3*strides.dst[3];
+
+    ggml_cuda_pdl_sync();
+    dst[dx] = (T)op((float)x[sx]);
+}
+
+template <float (*op)(float), typename T>
+static void unary_cuda_strided(const ggml_tensor * src, ggml_tensor * dst, cudaStream_t stream) {
+    const int64_t count = ggml_nelements(src);
+    unary_strides strides;
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        GGML_ASSERT(src->nb[i] % sizeof(T) == 0 && dst->nb[i] % sizeof(T) == 0);
+        strides.src[i] = src->nb[i]/sizeof(T);
+        strides.dst[i] = dst->nb[i]/sizeof(T);
+    }
+    const dim3 grid((count + CUDA_NEG_BLOCK_SIZE - 1) / CUDA_NEG_BLOCK_SIZE);
+    const ggml_cuda_kernel_launch_params launch_params(grid, CUDA_NEG_BLOCK_SIZE, 0, stream);
+    ggml_cuda_kernel_launch(unary_op_kernel_strided<op, T>, launch_params, (const T *)src->data, (T *)dst->data,
+        count, src->ne[0], src->ne[1], src->ne[2], strides);
+}
+#endif
+
 template <float (*op)(float)>
 void ggml_cuda_op_unary(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
@@ -141,11 +184,21 @@ void ggml_cuda_op_unary(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     void * dst_d = dst->data;
     cudaStream_t stream = ctx.stream();
 
-    GGML_ASSERT(ggml_is_contiguous(src0));
-
     GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16);
     GGML_ASSERT( dst->type == GGML_TYPE_F32 ||  dst->type == GGML_TYPE_F16);
     GGML_ASSERT(src0->type == dst->type);
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (dst->op == GGML_OP_UNARY && (!ggml_is_contiguous(src0) || !ggml_is_contiguous(dst))) {
+        if (src0->type == GGML_TYPE_F16) {
+            unary_cuda_strided<op, half>(src0, dst, stream);
+        } else {
+            unary_cuda_strided<op, float>(src0, dst, stream);
+        }
+        return;
+    }
+#endif
+    GGML_ASSERT(ggml_is_contiguous(src0));
 
     if (src0->type == GGML_TYPE_F16) {
         unary_cuda<op>((const half *)src0_d, (half *)dst_d, ggml_nelements(src0), stream);

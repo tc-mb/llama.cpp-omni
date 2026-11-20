@@ -38,14 +38,12 @@ layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
 
 shared FLOAT_TYPE sumsh[BLOCK_SIZE];
 
-void rms_norm(uint num_iters) {
+void rms_norm_row(uint num_iters, uint channel, uint samp) {
     const uint ncols     = p.ne00;
     const uint nrows     = gl_NumWorkGroups.x;
-    const uint nchannels = gl_NumWorkGroups.y;
+    const uint nchannels = p.ne02;
 
     const uint row       = gl_WorkGroupID.x;
-    const uint channel   = gl_WorkGroupID.y;
-    const uint samp      = gl_WorkGroupID.z;
     const uint tid       = gl_LocalInvocationID.x;
 
     const uint stride_row       = p.nb01;
@@ -120,6 +118,18 @@ void rms_norm(uint num_iters) {
         }
     }
 #endif
+}
+
+void rms_norm(uint num_iters) {
+    for (uint samp = gl_WorkGroupID.z; samp < p.ne03; samp += gl_NumWorkGroups.z) {
+        for (uint channel = gl_WorkGroupID.y; channel < p.ne02; channel += gl_NumWorkGroups.y) {
+            rms_norm_row(num_iters, channel, samp);
+            // Protect shared reduction and fused RoPE data before the next row.
+            if (channel + gl_NumWorkGroups.y < p.ne02 || samp + gl_NumWorkGroups.z < p.ne03) {
+                barrier();
+            }
+        }
+    }
 }
 
 void main() {

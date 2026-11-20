@@ -5,35 +5,23 @@ void main() {
         return;
     }
 
-    const uint row = i / p.ne20;
-    const uint col = i - row * p.ne20;
+    const uint row = i / p.width;
+    const uint col = i - row * p.width;
 
-    const uint i3 = row / (p.ne01 * p.ne02);
-    const uint i2 = (row % (p.ne01 * p.ne02)) / p.ne01;
-    const uint i1 = row % p.ne01;
-    const uint src_idx = i3 * p.nb03 + i2 * p.nb02 + i1 * p.nb01 + col;
+    const uint plane = row / p.rows;
+    const uint i3 = plane / p.planes;
+    const uint i2 = plane % p.planes;
+    const uint i1 = row % p.rows;
 
-    const uint dst_i3 = row / (p.ne11 * p.ne12);
-    const uint dst_i2 = (row % (p.ne11 * p.ne12)) / p.ne11;
-    const uint dst_i1 = row % p.ne11;
-    const uint dst_idx = dst_i3 * p.nb13 + dst_i2 * p.nb12 + dst_i1 * p.nb11 + col;
+    const uint ai = p.a_offset + col*p.a_stride[0] + i1*p.a_stride[1] + i2*p.a_stride[2] + i3*p.a_stride[3];
+    const uint di = p.d_offset + col*p.d_stride[0] + i1*p.d_stride[1] + i2*p.d_stride[2] + i3*p.d_stride[3];
 
-    if (p.mode == 0) {
-        // Default
-        const uint offset = p.ne00 / 2;
-        const uint idx = src_idx;
-
-        data_d[dst_idx] = D_TYPE(op(float(data_a[idx]), float(data_a[idx + offset])));
-    } else if (p.mode == 1) {
-        // Swapped
-        const uint offset = p.ne00 / 2;
-        const uint idx = src_idx;
-
-        data_d[dst_idx] = D_TYPE(op(float(data_a[idx + offset]), float(data_a[idx])));
+    if (p.mode == 2) {
+        const uint bi = p.b_offset + col*p.b_stride[0] + i1*p.b_stride[1] + i2*p.b_stride[2] + i3*p.b_stride[3];
+        data_d[di] = D_TYPE(op(float(data_a[ai]), float(data_b[bi])));
     } else {
-        // Split
-        const uint idx = src_idx;
-
-        data_d[dst_idx] = D_TYPE(op(float(data_a[idx]), float(data_b[idx])));
+        const float a = float(data_a[ai]);
+        const float b = float(data_a[ai + p.width*p.a_stride[0]]);
+        data_d[di] = D_TYPE(p.mode == 0 ? op(a, b) : op(b, a));
     }
 }

@@ -3711,12 +3711,14 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
             return false;
         }
 
-        //rms_norm kernel assumes contiguous rows
-        if (!ggml_is_contiguous_rows(mul->src[0]) || !ggml_is_contiguous_rows(mul->src[1])) {
+        //rms_norm kernel assumes contiguous rows with standard element stride
+        if (!ggml_is_contiguous_rows(mul->src[0]) || !ggml_is_contiguous_rows(mul->src[1]) ||
+            mul->src[0]->nb[0] != sizeof(float) || mul->src[1]->nb[0] != sizeof(float)) {
             return false;
         }
 
-        if (add && (!ggml_is_contiguous(add->src[0]) || !ggml_is_contiguous_rows(add->src[1]))) {
+        if (add && (!ggml_is_contiguous(add->src[0]) || !ggml_is_contiguous_rows(add->src[1]) ||
+                    add->src[1]->nb[0] != sizeof(float))) {
             return false;
         }
 
@@ -3785,6 +3787,10 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
             return false;
         }
         if (!ggml_is_contiguous_1(other) || !ggml_is_contiguous_1(unary->src[0]) || !ggml_are_same_shape(other, unary)) {
+            return false;
+        }
+        const size_t ts = ggml_type_size(unary->type);
+        if (other->nb[0] != ts || unary->src[0]->nb[0] != ts || !ggml_is_contiguous(mul)) {
             return false;
         }
 
@@ -5098,13 +5104,19 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 case GGML_UNARY_OP_EXPM1:
                 case GGML_UNARY_OP_SOFTPLUS:
                 case GGML_UNARY_OP_ELU:
-                case GGML_UNARY_OP_XIELU:
                 case GGML_UNARY_OP_FLOOR:
                 case GGML_UNARY_OP_CEIL:
                 case GGML_UNARY_OP_ROUND:
                 case GGML_UNARY_OP_TRUNC:
-                    // TODO: should become:
-                    //return ggml_is_contiguous_rows(op->src[0]);
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+                    if (op->type != op->src[0]->type || (op->type != GGML_TYPE_F32 && op->type != GGML_TYPE_F16)) {
+                        return false;
+                    }
+                    return ggml_is_contiguous_rows(op->src[0]) && ggml_is_contiguous_rows(op);
+#else
+                    return ggml_is_contiguous(op->src[0]);
+#endif
+                case GGML_UNARY_OP_XIELU:
                     return ggml_is_contiguous(op->src[0]);
                 default:
                     return false;
@@ -5325,7 +5337,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_NORM:
         case GGML_OP_RMS_NORM:
         case GGML_OP_L2_NORM:
-            return true;
+            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[0]->nb[0] == sizeof(float) &&
+                   ggml_is_contiguous_rows(op->src[0]) && ggml_is_contiguous(op);
         case GGML_OP_RMS_NORM_BACK:
             return ggml_is_contiguous(op->src[0]);
             break;
@@ -5403,7 +5417,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             //return ggml_is_contiguous_rows(op->src[0]) && ggml_is_contiguous_rows(op->src[1]);
             return ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]);
         case GGML_OP_SUM:
-            return ggml_is_contiguous_rows(op->src[0]);
+            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 &&
+                ggml_is_contiguously_allocated(op->src[0]);
         case GGML_OP_TOP_K:
         case GGML_OP_ARGSORT:
 #ifndef GGML_CUDA_USE_CUB

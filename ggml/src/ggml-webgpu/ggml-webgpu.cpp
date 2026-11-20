@@ -4208,7 +4208,10 @@ static bool ggml_backend_webgpu_device_supports_op(ggml_backend_dev_t dev, const
         case GGML_OP_RMS_NORM:
         case GGML_OP_NORM:
         case GGML_OP_L2_NORM:
-            supports_op = op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32;
+            supports_op = op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 &&
+                          ggml_is_contiguous_rows(src0) &&
+                          (uint64_t) ggml_nrows(src0) <=
+                              ctx->webgpu_global_ctx->capabilities.limits.maxComputeWorkgroupsPerDimension;
             break;
         case GGML_OP_ROPE:
             supports_op = op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16;
@@ -4341,6 +4344,8 @@ static bool ggml_backend_webgpu_device_supports_op(ggml_backend_dev_t dev, const
             supports_op = op->type == GGML_TYPE_F32 && src0->type == op->type;
             break;
         case GGML_OP_SUM:
+            supports_op = op->type == GGML_TYPE_F32 && src0->type == op->type && ggml_is_contiguously_allocated(src0);
+            break;
         case GGML_OP_SUM_ROWS:
             supports_op = op->type == GGML_TYPE_F32 && src0->type == op->type && ggml_is_contiguous_rows(src0);
             break;
