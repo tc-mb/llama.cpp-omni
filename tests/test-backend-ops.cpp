@@ -9483,6 +9483,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_constant(64, 64, 2, GGML_TYPE_F16, 4096, 0));
     test_cases.emplace_back(new test_flash_attn_constant(67, 64, 2, GGML_TYPE_F16, 4096, 0));
     test_cases.emplace_back(new test_flash_attn_constant(64, 17, 64, GGML_TYPE_F16, 1, 1));
+    test_cases.emplace_back(new test_flash_attn_constant(67, 17, 64, GGML_TYPE_F16, 1, 1));
+    test_cases.emplace_back(new test_flash_attn_constant(67, 17, 64, GGML_TYPE_F32, 1, 1));
+
+    // Odd head dimensions exercise tiled attention and its SIMD column tails on x86.
+    test_cases.emplace_back(new test_flash_attn_ext(65, 67, 4, {1, 1}, 113, 75, true, true, 8.0f, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(65, 67, 4, {1, 1}, 17, 75, false, false, 0, 1.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(65, 67, 4, {1, 1}, 113, 75, false, false, 0, 1.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(65, 67, 4, {1, 1}, 113, 75, false, false, 0, 1.0f, GGML_PREC_F32, GGML_TYPE_F32, GGML_TYPE_F32));
     test_cases.emplace_back(new test_matmul_scratch_reuse(false));
     test_cases.emplace_back(new test_matmul_scratch_reuse(true));
     test_cases.emplace_back(new test_matmul_scratch_reuse(true, 4096));
@@ -9777,6 +9785,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     // Qwen3-VL-8B https://github.com/ggml-org/llama.cpp/issues/17012
     test_cases.emplace_back(new test_flash_attn_ext(72, 72, 16, {1, 1}, 5776, 5776, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+
+    test_cases.emplace_back(new test_flash_attn_ext(65, 67, 8, {1, 1}, 1024, 512, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
 
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
