@@ -9661,6 +9661,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // Single-token vector path with enough KV tiles to reuse its shared KQ buffer.
+    test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 1, true, false, 0, 0,
+        GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+
     test_cases.emplace_back(new test_flash_attn_constant(false));
     test_cases.emplace_back(new test_flash_attn_constant(true));
     test_cases.emplace_back(new test_flash_attn_constant(64, 64, 2, GGML_TYPE_F16, 4096, 0));
