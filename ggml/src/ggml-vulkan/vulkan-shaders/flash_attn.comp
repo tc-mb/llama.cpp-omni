@@ -127,20 +127,15 @@ void main() {
         const FLOAT_TYPE qd_inv = qd != FLOAT_TYPE(0.0) ? FLOAT_TYPE(1.0) / qd : FLOAT_TYPE(0.0);
         vals = round(vals * qd_inv);
 
-        Qf[buf_ib].qs[buf_iqs] = pack32(i8vec4(vals));
+        const FLOAT_TYPE thread_sum = vals.x + vals.y + vals.z + vals.w;
+        // Keep subgroup operations outside the bounds check; Q8_0 K does not use the row sum.
+        const FLOAT_TYPE sum = FaTypeK == FA_TYPE_Q8_0 ? FLOAT_TYPE(0.0) : subgroupClusteredAdd(thread_sum, 8);
 
-        // Q8_0 K only needs (qd, _); the asymmetric Q4_*/Q5_* family also stores
-        // the row-sum scaled by qd, used in k_dot_correction.
-        if (FaTypeK == FA_TYPE_Q8_0) {
-            if (buf_iqs == 0) {
-                Qf[buf_ib].ds = FLOAT_TYPEV2(qd, 0.0);
-            }
-        } else {
-            const FLOAT_TYPE thread_sum = vals.x + vals.y + vals.z + vals.w;
-            const FLOAT_TYPE sum = subgroupClusteredAdd(thread_sum, 8);
+        if (r < Br) {
+            Qf[buf_ib].qs[buf_iqs] = pack32(i8vec4(vals));
 
             if (buf_iqs == 0) {
-                Qf[buf_ib].ds = FLOAT_TYPEV2(qd, sum * qd);
+                Qf[buf_ib].ds = FaTypeK == FA_TYPE_Q8_0 ? FLOAT_TYPEV2(qd, 0.0) : FLOAT_TYPEV2(qd, sum * qd);
             }
         }
 #endif
@@ -462,6 +457,7 @@ void main() {
                 }
                 rowmaxf = max(rowmaxf, float(Sf[r][c]));
             }
+            rowmaxf += FATTN_KQ_MAX_OFFSET;
             float Moldf = Mf[r];
 
             // M = max(rowmax, Mold)

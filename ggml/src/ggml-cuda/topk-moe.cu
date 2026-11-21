@@ -146,6 +146,9 @@ __launch_bounds__(4 * WARP_SIZE, 1) __global__ void topk_moe_cuda(const float * 
             const int expert = i + threadIdx.x;
             selection_wt[i / WARP_SIZE] =
                 (n_experts % WARP_SIZE == 0 || expert < n_experts) ? wt[i / WARP_SIZE] + bias[expert] : -INFINITY;
+            if (__isnanf(selection_wt[i / WARP_SIZE])) {
+                selection_wt[i / WARP_SIZE] = -FLT_MAX;
+            }
         }
     }
 

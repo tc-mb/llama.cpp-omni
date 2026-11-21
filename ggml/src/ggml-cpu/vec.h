@@ -44,7 +44,12 @@ inline static ggml_float ggml_sve_sum_f32x2(svfloat32_t sum_lo, svfloat32_t sum_
 #endif
 
 #define GGML_GELU_FP16
+#if !defined(__x86_64__) && !defined(_M_X64) && !defined(__i386__) && !defined(_M_IX86)
+// Keep the existing lookup path on targets outside the validated x86 slice.
+#ifndef GGML_GELU_QUICK_FP16
 #define GGML_GELU_QUICK_FP16
+#endif
+#endif
 
 #define GGML_SOFT_MAX_UNROLL 4
 #define GGML_VEC_DOT_UNROLL  2
@@ -434,6 +439,41 @@ inline static void ggml_vec_mad_f32(const int n, float * GGML_RESTRICT y, const 
         y[i] += x[i]*v;
     }
 #endif
+}
+
+// y (F32) += x (F16)*v
+// on AVX512, AVX with F16C, NEON and RVV, x is widened to F32 in-register and fused into the multiply-add
+inline static void ggml_vec_mad_f16_f32(const int n, float * GGML_RESTRICT y, const ggml_fp16_t * GGML_RESTRICT x, const float v) {
+    int i = 0;
+#if defined(__AVX512F__)
+    const __m512 vx = _mm512_set1_ps(v);
+    for (; i + 16 <= n; i += 16) {
+        const __m512 ax = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)(x + i)));
+        _mm512_storeu_ps(y + i, _mm512_fmadd_ps(ax, vx, _mm512_loadu_ps(y + i)));
+    }
+#elif defined(__AVX__) && defined(__F16C__)
+    const __m256 vx = _mm256_set1_ps(v);
+    for (; i + 8 <= n; i += 8) {
+        const __m256 ax = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(x + i)));
+        _mm256_storeu_ps(y + i, GGML_F32x8_FMA(_mm256_loadu_ps(y + i), ax, vx));
+    }
+#elif defined(__ARM_NEON) && defined(__ARM_FEATURE_FMA) && defined(__ARM_FP16_FORMAT_IEEE)
+    const float32x4_t vx = vdupq_n_f32(v);
+    for (; i + 8 <= n; i += 8) {
+        const float16x8_t ax = vld1q_f16((const __fp16 *)(x + i));
+        vst1q_f32(y + i + 0, vfmaq_f32(vld1q_f32(y + i + 0), vcvt_f32_f16(vget_low_f16 (ax)), vx));
+        vst1q_f32(y + i + 4, vfmaq_f32(vld1q_f32(y + i + 4), vcvt_f32_f16(vget_high_f16(ax)), vx));
+    }
+#elif defined(__riscv_v_intrinsic) && defined(__riscv_zvfhmin)
+    for (int vl; i < n; i += vl) {
+        vl = __riscv_vsetvl_e16m2(n - i);
+        const vfloat32m4_t ax = __riscv_vfwcvt_f_f_v_f32m4(__riscv_vle16_v_f16m2((const _Float16 *)x + i, vl), vl);
+        __riscv_vse32_v_f32m4(y + i, __riscv_vfmacc_vf_f32m4(__riscv_vle32_v_f32m4(y + i, vl), v, ax, vl), vl);
+    }
+#endif
+    for (; i < n; ++i) {
+        y[i] += GGML_CPU_FP16_TO_FP32(x[i])*v;
+    }
 }
 
 inline static void ggml_vec_mad_f16(const int n, ggml_fp16_t * GGML_RESTRICT y, const ggml_fp16_t * GGML_RESTRICT x, const float v) {
@@ -1035,11 +1075,7 @@ inline static void ggml_vec_gelu_quick_f32(const int n, float * y, const float *
     }
 }
 #else
-inline static void ggml_vec_gelu_quick_f32(const int n, float * y, const float * x) {
-    for (int i = 0; i < n; ++i) {
-        y[i] = ggml_gelu_quick_f32(x[i]);
-    }
-}
+void ggml_vec_gelu_quick_f32(const int n, float * y, const float * x);
 #endif
 
 // Sigmoid Linear Unit (SiLU) function
@@ -1206,6 +1242,13 @@ inline static __m512 ggml_v_silu(__m512 x) {
     return _mm512_div_ps(x, one_plus_exp_neg_x);
 }
 
+// gelu_quick(x) = x / (1 + exp(-1.702 x)); x stays the numerator so it cannot overflow
+inline static __m512 ggml_v_gelu_quick(__m512 x) {
+    const __m512 one = _mm512_set1_ps(1);
+    const __m512 exp_cx = ggml_v_expf(_mm512_mul_ps(x, _mm512_set1_ps(GELU_QUICK_COEF)));
+    return _mm512_div_ps(x, _mm512_add_ps(one, exp_cx));
+}
+
 #elif defined(__AVX2__) && defined(__FMA__)
 
 // adapted from arm limited optimized routine
@@ -1261,6 +1304,13 @@ inline static __m256 ggml_v_silu(__m256 x) {
     return _mm256_div_ps(x, one_plus_exp_neg_x);
 }
 
+// gelu_quick(x) = x / (1 + exp(-1.702 x)); x stays the numerator so it cannot overflow
+inline static __m256 ggml_v_gelu_quick(__m256 x) {
+    const __m256 one = _mm256_set1_ps(1);
+    const __m256 exp_cx = ggml_v_expf(_mm256_mul_ps(x, _mm256_set1_ps(GELU_QUICK_COEF)));
+    return _mm256_div_ps(x, _mm256_add_ps(one, exp_cx));
+}
+
 #elif defined(__SSE2__) // __AVX2__ / __ARM_NEON
 
 #if defined(__FMA__)
@@ -1313,6 +1363,13 @@ inline static __m128 ggml_v_silu(__m128 x) {
     const __m128 exp_neg_x = ggml_v_expf(neg_x);
     const __m128 one_plus_exp_neg_x = _mm_add_ps(one, exp_neg_x);
     return _mm_div_ps(x, one_plus_exp_neg_x);
+}
+
+// gelu_quick(x) = x / (1 + exp(-1.702 x)); x stays the numerator so it cannot overflow
+inline static __m128 ggml_v_gelu_quick(__m128 x) {
+    const __m128 one = _mm_set1_ps(1);
+    const __m128 exp_cx = ggml_v_expf(_mm_mul_ps(x, _mm_set1_ps(GELU_QUICK_COEF)));
+    return _mm_div_ps(x, _mm_add_ps(one, exp_cx));
 }
 
 #elif defined(__riscv_v_intrinsic)
@@ -1477,11 +1534,7 @@ inline static void ggml_vec_geglu_quick_f32(const int n, float * y, const float 
     }
 }
 #else
-inline static void ggml_vec_geglu_quick_f32(const int n, float * y, const float * x, const float * g) {
-    for (int i = 0; i < n; ++i) {
-        y[i] = ggml_gelu_quick_f32(x[i]) * g[i];
-    }
-}
+void ggml_vec_geglu_quick_f32(const int n, float * y, const float * x, const float * g);
 #endif
 
 inline static void ggml_vec_geglu_quick_f16(const int n, ggml_fp16_t * y, const ggml_fp16_t * x, const ggml_fp16_t * g) {
