@@ -673,10 +673,18 @@ struct llama_model {
     /// 每层**预读暂存区**的 slot 数（= 预读深度 K）。0 = 无。
     /// 与 moe_decode_window() 一起决定每层张量的总宽度（c + K）。
     int32_t moe_prefetch_slots() const;
+    /// The prefill bank and the per-layer decode windows share memory (set by the arch while
+    /// loading tensors). Safe because every decode phase starts by clearing the windows; the
+    /// slot runtime then drains lookahead before a bank step and disables prewarm, the two
+    /// things that would otherwise write window contents that must survive a prefill.
+    bool moe_bank_window_overlap = false;
     /// experts 里的 MoE 层数（用于算 base 容量）。
     int32_t moe_experts_layer_count() const;
 
     const llama_moe_experts_entry * moe_experts_entry(const char * tensor_name) const;
+    /// Entry of an LES layout loaded without a slot bank (experts mapped in place); nullptr
+    /// when the model has none or the slot runtime streams the experts instead.
+    const llama_moe_experts_entry * moe_packed_entry(const char * tensor_name) const;
 
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
     float get_rope_freq_scale(const llama_cparams & cparams, int il) const;
@@ -741,6 +749,9 @@ struct llama_model_base : public llama_model {
     /// experts manifest 里的形状/类型建出来。仍然放在「自己分配」的 buft 上，
     /// 理由与 create_tensor_own_alloc 相同。
     ggml_tensor * create_expert_tensor_from_manifest(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, enum ggml_type type);
+    /// Routed expert family `tn` as a strided view into its layer's LES carrier, which is
+    /// created (once per layer) as an ordinary mapped weight. See llama_model_loader::packed_expert_view.
+    ggml_tensor * create_packed_expert_view(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, const llama_moe_experts_entry & entry);
 
     // helper: try merged gate_up_exps first, fall back to separate gate and up
     void create_tensor_gate_up_exps(llama_layer & layer, int bid, int64_t n_embd_,

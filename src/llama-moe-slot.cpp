@@ -1,6 +1,7 @@
 #include "llama-moe-slot.h"
 
 #include "ggml-backend.h"
+#include "ggml-cpp.h"
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-moe-experts.h"
@@ -1137,6 +1138,13 @@ struct llama_moe_slot_runtime::impl {
                 layers[il].window_start = 0;
                 layers[il].window_width = w;
                 layer_width[il] = w;
+                // Per-layer slot state is sized by the prefill bank; a decode window wider
+                // than the bank (c + K > bank) would index past it in process().
+                auto & st = layers[il];
+                if (st.enabled && (size_t) w > st.slot_to_expert.size()) {
+                    st.slot_to_expert.resize((size_t) w, kSlotFree);
+                    st.slot_age.resize((size_t) w, 0);
+                }
             }
             // 打印一下分布，确认按层生效
             std::string dist;
@@ -1214,6 +1222,46 @@ struct llama_moe_slot_runtime::impl {
                 (int) decode_window, (int) prefetch_slots, (int) n_moe_layers, total,
                 (double) total * (double) layers[0].pack_bytes / 1024.0 / 1024.0,
                 (int) n_slots);
+    }
+
+    /// Hand layer `target`'s predicted experts to the lookahead machinery (decode only).
+    /// Called from the layer-(target-1) CPU op: process() for a MoE layer, or the
+    /// prediction-only op of a leading dense layer (build_lookahead_only).
+    void arm_lookahead(int32_t target, const std::vector<int32_t> & pred) {
+        if (target < 0 || (size_t) target >= layers.size()) {
+            return;
+        }
+        // 「缓存 + 预测」的结合点（零 I/O）：把预测留给**目标层**，
+        // 它下一步淘汰时可以避开这些条目。不是预读 —— 不读任何字节。
+        {
+            std::lock_guard<std::mutex> lk(pred_mtx);
+            predicted[(size_t) target] = pred;
+        }
+        // arm 前先去掉**目标层缓存里已有**的预测专家。
+        //
+        // 它们本来就不需要读（worker 也会查表跳过），但会让 arm 的批次看起来更大、
+        // worker 跑得更久 —— 而 arm 在 worker 忙时是**直接丢弃**的（pfskip）。
+        // 实测每 token 约 9 次 arm 因此被丢（40 次里的 22%），等于白扔预测。
+        // 先过滤就只把「真需要读的」交给 worker，批次更小、完成更快、丢得更少。
+        std::vector<int32_t> need_read;
+        need_read.reserve(pred.size());
+        {
+            auto & tgt = layers[(size_t) target];
+            std::lock_guard<std::mutex> lk(tgt.mutex);
+            for (int32_t e : pred) {
+                if (e >= 0 && e < n_expert && tgt.expert_to_slot[(size_t) e] < 0) {
+                    need_read.push_back(e);
+                }
+            }
+        }
+        lookahead.n_pred_cached.fetch_add(pred.size() - need_read.size(), std::memory_order_relaxed);
+        if (!need_read.empty()) {
+            lookahead.arm(target, need_read);
+        }
+        // 记下「给层 target 的预测」，供 target 层的扫描记录用。
+        if (sweep_fp && (size_t) target < sweep_pred.size()) {
+            sweep_pred[(size_t) target] = pred;
+        }
     }
 
     ~impl() {
@@ -1941,8 +1989,38 @@ struct llama_moe_slot_runtime::impl {
     int first_moe_layer = -1;
     uint64_t n_prefill_ubatch = 0;
     uint64_t n_decode_step = 0;
+
+    // Lookahead recall (decode, window mode): for each (step, layer) that got a prediction from
+    // the layer before, how many of the experts the router actually picked were in it. Same
+    // metric as the offline recall@depth. `rec_unpredicted` counts (step, layer) pairs with no
+    // prediction (layer 1 on the first token of a phase, or a dropped arm).
+    // Off by default (it reads the router's ids on the decode path); LLAMA_MOE_LOG_RECALL=1 turns it on.
+    const bool rec_enabled = [] {
+        const char * e = std::getenv("LLAMA_MOE_LOG_RECALL");
+        return e && *e && std::strcmp(e, "0") != 0;
+    }();
+    std::atomic<uint64_t> rec_hit{0};
+    std::atomic<uint64_t> rec_used{0};
+    std::atomic<uint64_t> rec_unpredicted{0};
+
+    void report_recall(const char * where) {
+        const uint64_t used = rec_used.exchange(0);
+        const uint64_t hit  = rec_hit.exchange(0);
+        const uint64_t none = rec_unpredicted.exchange(0);
+        if (used == 0 && none == 0) {
+            return;
+        }
+        moe_log("lookahead recall@%d (%s): %.1f%% (%llu / %llu used experts), unpredicted layer-steps=%llu",
+            lookahead.depth, where, used ? 100.0 * (double) hit / (double) used : 0.0,
+            (unsigned long long) hit, (unsigned long long) used, (unsigned long long) none);
+    }
     ubatch_acc cur;
     run_stats g_runs;   // 整进程累计；process() 只在 ith==0 上跑，单线程，无需原子
+    // predictor_state(): per-context predictor state (see the header)
+    ggml_context_ptr        pred_ctx;
+    ggml_backend_buffer_ptr pred_buf;
+    ggml_tensor *           pred_state = nullptr;
+    uint64_t                pred_step  = 0;
     std::vector<layer_state> layers;
     std::vector<map_userdata> userdata;
     std::unordered_map<std::string, int> fds;
@@ -1984,6 +2062,11 @@ struct llama_moe_slot_runtime::impl {
     void prewarm_init() {
         const char * path = std::getenv("LLAMA_MOE_PREWARM");
         if (!path || !*path) {
+            return;
+        }
+        if (model.moe_bank_window_overlap) {
+            // prewarm fills the windows before a prefill and expects them to survive it
+            moe_log("prewarm: off (the prefill bank shares memory with the decode windows)");
             return;
         }
         FILE * fp = std::fopen(path, "r");
@@ -2134,6 +2217,7 @@ struct llama_moe_slot_runtime::impl {
         was_window = false;
         parked.store(true, std::memory_order_release);
         moe_log("park expert memory: %d metal buffer(s)", n_ok);
+        report_recall("this generation");
     }
 
     void ensure_unparked() {
@@ -2236,6 +2320,30 @@ bool llama_moe_slot_runtime::lookahead_prefetch_enabled() const {
     return pimpl->lookahead.enabled;
 }
 
+ggml_tensor * llama_moe_slot_runtime::predictor_state(int64_t ne0, int64_t ne1, ggml_backend_buffer_type_t buft) {
+    if (pimpl->pred_state) {
+        if (pimpl->pred_state->ne[0] != ne0 || pimpl->pred_state->ne[1] != ne1) {
+            throw std::runtime_error("predictor_state: shape changed after first use");
+        }
+        return pimpl->pred_state;
+    }
+    ggml_init_params ip = { ggml_tensor_overhead(), nullptr, true };
+    pimpl->pred_ctx.reset(ggml_init(ip));
+    pimpl->pred_state = ggml_new_tensor_2d(pimpl->pred_ctx.get(), GGML_TYPE_F32, ne0, ne1);
+    ggml_set_name(pimpl->pred_state, "moe_pred_prev_state");
+    pimpl->pred_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(pimpl->pred_ctx.get(), buft));
+    if (!pimpl->pred_buf) {
+        throw std::runtime_error("predictor_state: buffer allocation failed");
+    }
+    ggml_backend_buffer_clear(pimpl->pred_buf.get(), 0);
+    pimpl->pred_step = 0;
+    return pimpl->pred_state;
+}
+
+uint64_t & llama_moe_slot_runtime::predictor_step() {
+    return pimpl->pred_step;
+}
+
 int llama_moe_slot_runtime::lookahead_prefetch_depth() const {
     return pimpl->lookahead.enabled ? (int) pimpl->lookahead.depth : 0;
 }
@@ -2278,6 +2386,44 @@ void llama_moe_slot_runtime::set_lookahead_prefetch_depth(int depth) {
 
 void llama_moe_slot_runtime::set_lookahead_pred(ggml_tensor * pred_ids) {
     pimpl->lookahead_pending = pred_ids;
+}
+
+// Prediction-only op for a layer without experts (a leading dense layer of minicpm5moe): hands
+// the next MoE layer's predicted experts to the lookahead machinery. Output = input copy,
+// only there so the op stays in the graph. Single-token decode only.
+void llama_moe_slot_runtime::map_custom_lookahead_only(ggml_tensor * dst, const ggml_tensor * pred, int ith, int nth, void * userdata) {
+    GGML_UNUSED(nth);
+    if (ith != 0) {
+        return;
+    }
+    auto * data = static_cast<llama_moe_slot_runtime::impl::map_userdata *>(userdata);
+    auto * p = data->runtime->pimpl.get();
+    const int target = data->layer;   // userdata of the *target* layer
+    const int n = (int) pred->ne[0];
+    memcpy(dst->data, pred->data, (size_t) n * sizeof(int32_t));
+    if (!p->lookahead.enabled) {
+        return;
+    }
+    // Slot mode: the first window-mode process() of a decode phase (in the first MoE layer,
+    // i.e. `target`) clears every layer's mappings and republishes prewarmed experts. Arming
+    // before that would let the worker write into a slot that is then cleared and republished
+    // under a different expert (wrong weights, no error). So skip the first token of a phase;
+    // from the second token on, was_window is set and arming is safe. Without decode windows
+    // (ping-pong bank tail) there is no such switch.
+    if (p->decode_window > 0 && !p->was_window) {
+        return;
+    }
+    p->ensure_unparked();
+    std::vector<int32_t> ids;
+    p->read_i32_ids(pred, ids);
+    p->arm_lookahead(target, ids);
+}
+
+ggml_tensor * llama_moe_slot_runtime::build_lookahead_only(ggml_context * ctx, ggml_tensor * pred, int target_layer) {
+    if (!pred || !uses_layer(target_layer) || !pimpl->lookahead.enabled) {
+        return nullptr;
+    }
+    return ggml_map_custom1(ctx, pred, map_custom_lookahead_only, 1, &pimpl->userdata[(size_t) target_layer]);
 }
 
 ggml_tensor * llama_moe_slot_runtime::build_slot_ids_tensor(
@@ -2357,6 +2503,12 @@ void llama_moe_slot_runtime::process(
     // 窗口模式里预读 worker 会锁**目标层**的 mutex 去写它的窗口；若本函数已持
     // state.mutex 再等 worker，就成了锁序反转 → 死锁（实际踩到过）。
     // 非窗口模式 worker 只写尾部乒乓区、不碰任何层锁，所以照旧在锁后 take 取结果。
+    // The prefill bank shares memory with the decode windows: no prefetch may still be writing
+    // a window while a bank step installs into the same bytes.
+    if (!window_mode && pimpl->model.moe_bank_window_overlap) {
+        pimpl->lookahead.drain();
+    }
+
     if (lookahead_step && window_mode) {
         std::vector<lookahead_expert_prefetch::hit> ignored;   // 窗口模式不返回 hit
         pimpl->lookahead.take(layer, ignored);
@@ -2502,6 +2654,19 @@ void llama_moe_slot_runtime::process(
                 }
             }
         }
+        if (decode && pimpl->rec_enabled) {
+            if (pred.empty()) {
+                pimpl->rec_unpredicted.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                // `experts` holds this layer's router picks (read above)
+                uint64_t hit = 0;
+                for (int32_t e : experts) {
+                    hit += (e >= 0 && e < pimpl->n_expert && keep[(size_t) e]) ? 1 : 0;
+                }
+                pimpl->rec_hit.fetch_add(hit, std::memory_order_relaxed);
+                pimpl->rec_used.fetch_add(experts.size(), std::memory_order_relaxed);
+            }
+        }
     }
 
     std::vector<llama_moe_slot_runtime::impl::pending_install> pending;
@@ -2619,40 +2784,7 @@ void llama_moe_slot_runtime::process(
     if (lookahead_step && lookahead_pred) {
         std::vector<int32_t> pred;
         pimpl->read_i32_ids(lookahead_pred, pred);
-        // 「缓存 + 预测」的结合点（零 I/O）：把预测留给**目标层**，
-        // 它下一步淘汰时可以避开这些条目。不是预读 —— 不读任何字节。
-        {
-            std::lock_guard<std::mutex> lk(pimpl->pred_mtx);
-            pimpl->predicted[(size_t) layer + 1] = pred;
-        }
-        // arm 前先去掉**目标层缓存里已有**的预测专家。
-        //
-        // 它们本来就不需要读（worker 也会查表跳过），但会让 arm 的批次看起来更大、
-        // worker 跑得更久 —— 而 arm 在 worker 忙时是**直接丢弃**的（pfskip）。
-        // 实测每 token 约 9 次 arm 因此被丢（40 次里的 22%），等于白扔预测。
-        // 先过滤就只把「真需要读的」交给 worker，批次更小、完成更快、丢得更少。
-        std::vector<int32_t> need_read;
-        need_read.reserve(pred.size());
-        {
-            auto & tgt = pimpl->layers[(size_t) layer + 1];
-            std::lock_guard<std::mutex> lk(tgt.mutex);
-            for (int32_t e : pred) {
-                if (e >= 0 && e < pimpl->n_expert && tgt.expert_to_slot[(size_t) e] < 0) {
-                    need_read.push_back(e);
-                }
-            }
-        }
-        pimpl->lookahead.n_pred_cached.fetch_add(pred.size() - need_read.size(),
-                                                 std::memory_order_relaxed);
-        if (!need_read.empty()) {
-            pimpl->lookahead.arm(layer + 1, need_read);
-        }
-        // 记下「给层 layer+1 的预测」，供 layer+1 的扫描记录用。
-        // 注意预测本身是用层 layer 的 hidden 算的（见 qwen35moe.cpp），所以
-        // 层 0 永远拿不到预测 —— 预读覆盖率的结构性上界是 39/40。
-        if (pimpl->sweep_fp && layer + 1 < (int) pimpl->sweep_pred.size()) {
-            pimpl->sweep_pred[layer + 1] = pred;
-        }
+        pimpl->arm_lookahead(layer + 1, pred);
     }
 
     // 命中率扫描：decode 记录整批的 E（真实用到）；prefill 只记**最后一个 token** 的 E

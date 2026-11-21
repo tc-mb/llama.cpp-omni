@@ -6,6 +6,7 @@
 
 // note: almost all graphs require at least sqrtf, so include cmath globally
 #include <cmath>
+#include <mutex>
 
 // ref: https://github.com/ggml-org/llama.cpp/pull/28068
 static inline ggml_tensor * build_gdn_l2_norm(ggml_context * ctx, ggml_tensor * x, float eps) {
@@ -1398,7 +1399,9 @@ struct llama_model_minicpm : public llama_model_base {
 
 
 struct llama_model_minicpm5moe : public llama_model_base {
-    llama_model_minicpm5moe(const struct llama_model_params & params) : llama_model_base(params) {}
+    // defined in minicpm5moe.cpp, where `predictor` is complete
+    llama_model_minicpm5moe(const struct llama_model_params & params);
+    ~llama_model_minicpm5moe() override;
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
@@ -1407,6 +1410,15 @@ struct llama_model_minicpm5moe : public llama_model_base {
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+
+    // optional trained expert predictor for lookahead prefetch (LLAMA_MOE_PREDICTOR),
+    // loaded on first use once the routers' device buffers exist
+    struct predictor;
+    const predictor * get_predictor() const;
+
+private:
+    mutable std::once_flag              pred_once;
+    mutable std::unique_ptr<predictor>  pred;
 };
 
 
