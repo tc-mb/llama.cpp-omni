@@ -205,7 +205,7 @@ a caller can size an expert cache before committing to a ~15 GiB load.
 ## 7. Tooling
 
 ```
-tools/moe/convert_les_gguf.py pack   --model <in.gguf> --out <out.gguf> [--thinking off|on]
+tools/moe/convert_les_gguf.py pack   --model <in.gguf> --out <out.gguf> [--thinking off|on|keep]
 tools/moe/convert_les_gguf.py verify --model <in.gguf> --packed <out.gguf>
 tools/moe/convert_les_gguf.py probe  --packed <out.gguf>
 ```
@@ -230,11 +230,18 @@ quantised upstream: re-running `llama-quantize` would change the bytes, which is
 | --- | --- |
 | `off` (default) | `<\|im_start\|>assistant\n<think>\n\n</think>\n\n` — the model answers directly |
 | `on` | `<\|im_start\|>assistant\n<think>\n` — the model thinks first |
+| `keep` | untouched: the source template is copied verbatim |
 
 This is a conversion-time choice rather than a runtime switch because `common_chat_templates`
 defaults `enable_thinking` to **true**: a template that merely honours that variable thinks by
 default, which is the failure this model hits in llama.cpp. Baking the prefix keeps the produced
 file's behaviour independent of a runtime default.
+
+`keep` is for a model whose template already handles the toggle, so the mode can be picked at
+runtime instead of at conversion time. It is only safe when the template guards the variable,
+e.g. `{%- if enable_thinking is defined %}`; without that guard the runtime default of **true**
+applies and the model always thinks. Baking a prefix leaves nothing to a runtime default, so
+`off` and `on` stay the safe choice for any other template.
 
 ## 8. Compatibility
 
