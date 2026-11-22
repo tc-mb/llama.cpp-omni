@@ -1127,8 +1127,17 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_VIEW:
         case GGML_OP_TRANSPOSE:
         case GGML_OP_PERMUTE:
-        case GGML_OP_CONCAT:
             return true;
+        case GGML_OP_CONCAT:
+            {
+                // kernel_concat copies one float-sized value per element.
+                // Other scalar types need a type-generic copy kernel first.
+                const enum ggml_type src0_type = op->src[0]->type;
+                const enum ggml_type src1_type = op->src[1]->type;
+                return src0_type == src1_type &&
+                       src0_type == op->type &&
+                       (src0_type == GGML_TYPE_F32 || src0_type == GGML_TYPE_I32);
+            }
         case GGML_OP_ADD:
         case GGML_OP_SUB:
         case GGML_OP_MUL:
@@ -1140,7 +1149,8 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_CONV_TRANSPOSE_1D:
             return true;
         case GGML_OP_CONV_TRANSPOSE_2D:
-            return ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
+            return op->src[1]->ne[3] == 1 &&
+                ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
                 (op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_F32) &&
                 op->src[1]->type == GGML_TYPE_F32 &&
                 op->type == GGML_TYPE_F32;
@@ -1157,9 +1167,13 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_CUMSUM:
         case GGML_OP_MEAN:
         case GGML_OP_SOFT_MAX:
-        case GGML_OP_GROUP_NORM:
         case GGML_OP_L2_NORM:
             return has_simdgroup_reduction && ggml_is_contiguous_rows(op->src[0]);
+        case GGML_OP_GROUP_NORM:
+            return has_simdgroup_reduction &&
+                op->src[0]->type == GGML_TYPE_F32 &&
+                op->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous_rows(op->src[0]);
         case GGML_OP_COUNT_EQUAL:
             return has_simdgroup_reduction &&
                 op->src[0]->type == GGML_TYPE_I32 &&
@@ -1204,21 +1218,39 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             return true;
         case GGML_OP_FLASH_ATTN_EXT:
             // for new head sizes, add checks here
-            if (op->src[0]->ne[0] != 32 &&
-                op->src[0]->ne[0] != 40 &&
-                op->src[0]->ne[0] != 48 &&
-                op->src[0]->ne[0] != 64 &&
-                op->src[0]->ne[0] != 72 &&
-                op->src[0]->ne[0] != 80 &&
-                op->src[0]->ne[0] != 96 &&
-                op->src[0]->ne[0] != 112 &&
-                op->src[0]->ne[0] != 128 &&
-                op->src[0]->ne[0] != 192 &&
-                op->src[0]->ne[0] != 256 &&
-                op->src[0]->ne[0] != 320 &&
-                op->src[0]->ne[0] != 512 &&
-                op->src[0]->ne[0] != 576) {
-                return false;
+            switch (op->src[0]->ne[0]) {
+                case 32:
+                case 40:
+                case 48:
+                case 64:
+                case 72:
+                case 80:
+                case 96:
+                case 112:
+                case 128:
+                case 256:
+                case 512:
+                    if (op->src[2]->ne[0] != op->src[0]->ne[0]) {
+                        return false;
+                    }
+                    break;
+                case 192:
+                    if (op->src[2]->ne[0] != 128 && op->src[2]->ne[0] != 192) {
+                        return false;
+                    }
+                    break;
+                case 320:
+                    if (op->src[2]->ne[0] != 256) {
+                        return false;
+                    }
+                    break;
+                case 576:
+                    if (op->src[2]->ne[0] != 512) {
+                        return false;
+                    }
+                    break;
+                default:
+                    return false;
             }
             if (op->src[1]->type != op->src[2]->type) {
                 return false;

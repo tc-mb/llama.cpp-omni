@@ -33,7 +33,8 @@ struct block_q8_1_mmq {
     // To avoid shared memory bank conflicts each block is padded with 16 bytes.
     // This padding is also used to store block scales/partial sums.
     // The scales multiplied with the quantized data are equal to the unquantized values.
-    // The partial sums are obtained by summing up a subgroup of the contained values (prior to quantization)
+    // The partial sums are the quantized integer subgroup sums multiplied by their FP32 scale,
+    //     then rounded to the stored precision,
     //     and are only needed for performance reasons.
     //
     // The exact data stored depends on the x data type.

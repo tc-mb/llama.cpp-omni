@@ -10,19 +10,16 @@ layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};
 layout (push_constant) uniform parameter
 {
     uint N;
-    uint ne00;
-    uint ne20;
+    uint width;
+    uint rows;
+    uint planes;
     uint mode;
     float alpha;
     float limit;
-    uint nb01;
-    uint nb02;
-    uint nb03;
-    uint ne01;
-    uint ne02;
-    uint nb11;
-    uint nb12;
-    uint nb13;
-    uint ne11;
-    uint ne12;
+    uint a_stride[4];
+    uint b_stride[4];
+    uint d_stride[4];
+    uint a_offset;
+    uint b_offset;
+    uint d_offset;
 } p;
