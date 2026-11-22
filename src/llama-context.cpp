@@ -205,6 +205,24 @@ llama_context::llama_context(
 
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
 
+    // A prefill ubatch picks up to n_expert_used experts per token, so one layer may need
+    // n_ubatch * n_expert_used distinct experts at once. When the slot bank holds fewer slots
+    // than experts they may not fit, and the slot runtime throws in the middle of the graph.
+    // Cap n_ubatch at bank / n_expert_used. A bank that holds every expert needs no cap.
+    if (model.moe_slot_bank_enabled()) {
+        const uint32_t bank   = (uint32_t) model.moe_slot_bank_size();
+        const uint32_t n_exp  = model.hparams.n_expert;
+        const uint32_t n_used = std::max<uint32_t>(1, model.hparams.n_expert_used);
+        if (bank < n_exp) {
+            const uint32_t ub_max = std::max<uint32_t>(1, bank / n_used);
+            if (cparams.n_ubatch > ub_max) {
+                LLAMA_LOG_WARN("%s: n_ubatch %u -> %u (MoE slot bank %u < %u experts, top-%u)\n",
+                        __func__, cparams.n_ubatch, ub_max, bank, n_exp, n_used);
+                cparams.n_ubatch = ub_max;
+            }
+        }
+    }
+
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
 

@@ -1137,6 +1137,13 @@ struct llama_moe_slot_runtime::impl {
                 layers[il].window_start = 0;
                 layers[il].window_width = w;
                 layer_width[il] = w;
+                // Per-layer slot state is sized by the prefill bank; a decode window wider
+                // than the bank (c + K > bank) would index past it in process().
+                auto & st = layers[il];
+                if (st.enabled && (size_t) w > st.slot_to_expert.size()) {
+                    st.slot_to_expert.resize((size_t) w, kSlotFree);
+                    st.slot_age.resize((size_t) w, 0);
+                }
             }
             // 打印一下分布，确认按层生效
             std::string dist;
