@@ -2,34 +2,33 @@
 #include "llama-moe-experts.h"
 #include "llama-moe-slot.h"
 
-void llama_model_minicpm5moe::load_arch_hparams(llama_model_loader & ml) {
+void llama_model_minicpm5_moe::load_arch_hparams(llama_model_loader & ml) {
+    if (hparams.n_embd_head_k_full != hparams.n_embd_head_v_full) {
+        throw std::runtime_error("MiniCPM5 MoE requires equal key and value head sizes");
+    }
+
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+    ml.get_key(LLM_KV_LEADING_DENSE_BLOCK_COUNT,   hparams.n_layer_dense_lead);
+    ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,  hparams.n_ff_exp);
+    ml.get_key(LLM_KV_EXPERT_SHARED_COUNT,         hparams.n_expert_shared);
+    ml.get_key(LLM_KV_EXPERT_WEIGHTS_SCALE,        hparams.expert_weights_scale);
+    ml.get_key(LLM_KV_EXPERT_WEIGHTS_NORM,         hparams.expert_weights_norm);
+    ml.get_key(LLM_KV_EXPERT_GATING_FUNC,          hparams.expert_gating_func, false);
 
-    if (!ml.get_key(LLM_KV_LEADING_DENSE_BLOCK_COUNT, hparams.n_layer_dense_lead, false)) {
-        hparams.n_layer_dense_lead = 1;
-    }
-
-    ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp);
-    ml.get_key(LLM_KV_EXPERT_SHARED_COUNT,        hparams.n_expert_shared, false);
-    ml.get_key(LLM_KV_EXPERT_WEIGHTS_SCALE,       hparams.expert_weights_scale, false);
-    ml.get_key(LLM_KV_EXPERT_WEIGHTS_NORM,        hparams.expert_weights_norm, false);
-
-    if (!ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false)) {
-        hparams.n_ff_shexp = hparams.n_ff_exp * hparams.n_expert_shared;
-    }
-
-    ml.get_key(LLM_KV_EXPERT_GATING_FUNC, hparams.expert_gating_func, false);
+    // the reference routing is sigmoid + renormalized top-k + fixed scale; see modeling_minicpm.py
     if (hparams.expert_gating_func == LLAMA_EXPERT_GATING_FUNC_TYPE_NONE) {
         hparams.expert_gating_func = LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID;
     }
 
-    switch (hparams.n_layer) {
-        case 28: type = LLM_TYPE_15B; break;
-        default: type = LLM_TYPE_UNKNOWN;
-    }
+    // modeling_minicpm.py casts the router inputs and weights to F32 before the matmul
+    hparams.expert_router_f32 = true;
+
+    hparams.n_ff_shexp = hparams.n_ff_exp * hparams.n_expert_shared;
+
+    type = LLM_TYPE_UNKNOWN;
 }
 
-void llama_model_minicpm5moe::load_arch_tensors(llama_model_loader & ml) {
+void llama_model_minicpm5_moe::load_arch_tensors(llama_model_loader & ml) {
     LLAMA_LOAD_LOCALS;
 
     const int64_t n_ff_exp   = hparams.n_ff_exp;
@@ -148,11 +147,12 @@ void llama_model_minicpm5moe::load_arch_tensors(llama_model_loader & ml) {
 
         layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
 
-        // attn_q holds the query and the attention gate concatenated per head
-        layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q, "weight", i), {n_embd, 2 * n_head * n_embd_head_k}, 0);
-        layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K, "weight", i), {n_embd, n_head_kv * n_embd_head_k}, 0);
-        layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V, "weight", i), {n_embd, n_head_kv * n_embd_head_v}, 0);
-        layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_head * n_embd_head_v, n_embd}, 0);
+        // attention projections
+        create_tensor_qkv(layer, i, n_embd, n_embd_head_k * n_head, n_embd_k_gqa, n_embd_v_gqa, 0);
+        layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_head_k * n_head, n_embd}, 0);
+
+        // attention gating
+        layer.wqkv_gate = create_tensor(tn(LLM_TENSOR_ATTN_GATE, "weight", i), {n_embd, n_embd_head_k * n_head}, 0);
 
         layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
 
@@ -162,10 +162,10 @@ void llama_model_minicpm5moe::load_arch_tensors(llama_model_loader & ml) {
             layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd, n_ff}, 0);
         } else {
             if (n_expert == 0) {
-                throw std::runtime_error("n_expert must be > 0 for MINICPM5MOE");
+                throw std::runtime_error("n_expert must be > 0 for minicpm5_moe");
             }
             if (n_expert_used == 0) {
-                throw std::runtime_error("n_expert_used must be > 0 for MINICPM5MOE");
+                throw std::runtime_error("n_expert_used must be > 0 for minicpm5_moe");
             }
 
             layer.ffn_gate_inp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP, "weight", i), {n_embd, n_expert}, 0);
@@ -255,11 +255,11 @@ void llama_model_minicpm5moe::load_arch_tensors(llama_model_loader & ml) {
     }
 }
 
-std::unique_ptr<llm_graph_context> llama_model_minicpm5moe::build_arch_graph(const llm_graph_params & params) const {
+std::unique_ptr<llm_graph_context> llama_model_minicpm5_moe::build_arch_graph(const llm_graph_params & params) const {
     return std::make_unique<graph>(*this, params);
 }
 
-llama_model_minicpm5moe::graph::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
+llama_model_minicpm5_moe::graph::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
     const int64_t n_embd_head = hparams.n_embd_head_v();
 
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
@@ -289,26 +289,14 @@ llama_model_minicpm5moe::graph::graph(const llama_model & model, const llm_graph
 
         // self_attention
         {
-            ggml_tensor * q_full = ggml_mul_mat(ctx0, model.layers[il].wq, cur);
-            cb(q_full, "q_full", il);
+            ggml_tensor * attn_inp = cur;  // save input for gate computation
 
-            // the q_proj output of each head is [query, gate]
-            const int64_t nb1 = ggml_row_size(q_full->type, 2*n_embd_head);
+            auto [Qcur, Kcur, Vcur] = build_qkv(model.layers[il], cur,
+                    n_embd_head, n_head, n_head_kv, il);
 
-            ggml_tensor * Qcur = ggml_view_3d(ctx0, q_full, n_embd_head, n_head, n_tokens, nb1, nb1*n_head, 0);
-            ggml_tensor * Qgate = ggml_view_3d(ctx0, q_full, n_embd_head, n_head, n_tokens, nb1, nb1*n_head,
-                    ggml_row_size(q_full->type, n_embd_head));
-
-            Qcur  = ggml_cont(ctx0, Qcur);
-            Qgate = ggml_cont(ctx0, Qgate);
-
-            cb(Qcur,  "Qcur",  il);
-            cb(Qgate, "Qgate", il);
-
-            ggml_tensor * Kcur = ggml_reshape_3d(ctx0, ggml_mul_mat(ctx0, model.layers[il].wk, cur), n_embd_head, n_head_kv, n_tokens);
-            ggml_tensor * Vcur = ggml_reshape_3d(ctx0, ggml_mul_mat(ctx0, model.layers[il].wv, cur), n_embd_head, n_head_kv, n_tokens);
-            cb(Kcur, "Kcur", il);
-            cb(Vcur, "Vcur", il);
+            // compute gate from input
+            ggml_tensor * gate = build_lora_mm(model.layers[il].wqkv_gate, attn_inp, model.layers[il].wqkv_gate_s);
+            cb(gate, "attn_gate_proj", il);
 
             Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                     ext_factor, attn_factor, beta_fast, beta_slow);
@@ -318,17 +306,19 @@ llama_model_minicpm5moe::graph::graph(const llama_model & model, const llm_graph
             cb(Kcur, "Kcur_rope", il);
 
             cur = build_attn(inp_attn,
-                    nullptr, nullptr, nullptr,
+                    nullptr, nullptr, nullptr,  // wo will be applied after gating
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
             cb(cur, "attn_out", il);
 
-            Qgate = ggml_reshape_2d(ctx0, Qgate, n_embd_head * n_head, n_tokens);
-
-            cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, Qgate));
+            // attention gating: attn_out * sigmoid(gate) BEFORE o_proj
+            gate = ggml_sigmoid(ctx0, gate);
+            cb(gate, "attn_gate_sig", il);
+            cur = ggml_mul(ctx0, cur, gate);
             cb(cur, "attn_out_gated", il);
 
+            // now apply output projection
             cur = build_lora_mm(model.layers[il].wo, cur, model.layers[il].wo_s);
-            cb(cur, "attn_out_proj", il);
+            cb(cur, "attn_o_proj", il);
         }
 
         if (il == n_layer - 1 && inp_out_ids) {

@@ -215,6 +215,11 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_EXPERTS_PER_GROUP,          uint32_t(1));
     }
 
+    if (arch == LLM_ARCH_MINICPM5_MOE) {
+        ms.add_kv(LLM_KV_EXPERT_WEIGHTS_SCALE, 3.66f);
+        ms.add_kv(LLM_KV_EXPERT_WEIGHTS_NORM,  true);
+    }
+
     ms.add_kv(LLM_KV_POSNET_EMBEDDING_LENGTH,   n_embd);
     ms.add_kv(LLM_KV_POSNET_BLOCK_COUNT,        n_layer);
     ms.add_kv(LLM_KV_CONVNEXT_EMBEDDING_LENGTH, n_embd);
@@ -357,6 +362,7 @@ static bool moe_mandatory(const llm_arch arch) {
         case LLM_ARCH_KIMI_LINEAR:
         case LLM_ARCH_STEP35:
         case LLM_ARCH_MISTRAL4:
+        case LLM_ARCH_MINICPM5_MOE:
             return true;
         default:
             return false;

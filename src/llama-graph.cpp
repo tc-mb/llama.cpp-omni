@@ -1509,6 +1509,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     if (probs_in == nullptr) {
         logits = build_lora_mm(gate_inp, cur); // [n_expert, n_tokens]
+        if (hparams.expert_router_f32) {
+            // the reference computes the router in F32; see modeling_minicpm.py
+            ggml_mul_mat_set_prec(logits, GGML_PREC_F32);
+        }
         cb(logits, "ffn_moe_logits", il);
     } else {
         logits = probs_in;

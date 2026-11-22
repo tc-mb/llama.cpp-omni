@@ -96,6 +96,7 @@ struct llama_hparams {
     float    expert_weights_scale = 0.0f;
     bool     expert_weights_norm  = false;
     uint32_t expert_gating_func   = LLAMA_EXPERT_GATING_FUNC_TYPE_NONE;
+    bool     expert_router_f32    = false;   // compute the router logits in F32
     uint32_t moe_every_n_layers   = 0;
     uint32_t moe_latent_size      = 0;
     uint32_t nextn_predict_layers = 0;

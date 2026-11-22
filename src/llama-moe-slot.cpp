@@ -2686,7 +2686,7 @@ void llama_moe_slot_runtime::process(
     const int n_hit = n_unique - n_miss;
 
     // ubatch 级的记账与阶段判定都以**第一个 MoE 层**为起点，不是 layer 0：
-    // 有些架构（如 minicpm5moe）前面的层是 dense FFN，process() 根本不会被调到，
+    // 有些架构（如 minicpm5_moe）前面的层是 dense FFN，process() 根本不会被调到，
     // 用 layer 0 判会让累加器永远不重置，读到上一个 ubatch 的陈旧 token 数。
     if (layer == pimpl->first_moe_layer) {
         if (pimpl->cur.n_layers > 0) {
