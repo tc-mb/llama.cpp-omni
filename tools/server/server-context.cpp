@@ -837,6 +837,7 @@ private:
 
                     // draft models (DFlash/DSpark/EAGLE3) are dense, not the qwen35moe target
                     params_dft.moe_slot_bank = 0;
+                    params_dft.moe_predictor = false;
                     params_dft.moe_k_prefill = 0;
                     params_dft.moe_k_decode  = 0;
                     params_dft.moe_k_decode_cycle.clear();
@@ -940,6 +941,7 @@ private:
             // draft models (DFlash/DSpark/EAGLE3) are dense, not the qwen35moe target;
             // inheriting the slot bank would make the draft load look for a layout it does not have
             params_dft.moe_slot_bank = 0;
+            params_dft.moe_predictor = false;
             params_dft.moe_k_prefill = 0;
             params_dft.moe_k_decode  = 0;
             params_dft.moe_k_decode_cycle.clear();

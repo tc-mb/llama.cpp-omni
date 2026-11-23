@@ -12,6 +12,10 @@ MiniCPM-V 4.7 35B-A3B addresses this with **LES (Lookahead Expert Scheduling)**,
 
 - **Weight access optimization.** Expert loading is optimized along two axes, quantization and storage layout. Precise layer-wise mixed-precision quantization reduces weight storage and transfer cost while preserving model capability. Repacking the expert weights into contiguous storage reduces scattered reads and improves sequential read efficiency on flash. Together they lower what expert loading demands of on-device storage and bandwidth.
 
+Optional, not part of the optimizations above: a model may ship a small trained predictor that replaces
+the cross-layer routing guess for prefetch. It changes only what is prefetched, never the output, and
+a model without one runs the same way. See `les-gguf-format.md`.
+
 ## Adapted DSpark speculative sampling
 
 Speculative sampling is integrated into the on-device inference pipeline, working alongside LES expert scheduling and weight access optimizations to further improve decode efficiency.

@@ -213,6 +213,8 @@ a caller can size an expert cache before committing to a ~15 GiB load.
 
 ```
 tools/moe/convert_les_gguf.py pack   --model <in.gguf> --out <out.gguf> [--thinking off|on|keep]
+                                     [--predictor <predictor.gguf>]
+tools/moe/convert_les_gguf.py attach --packed <les.gguf> --predictor <predictor.gguf> --out <out.gguf>
 tools/moe/convert_les_gguf.py verify --model <in.gguf> --packed <out.gguf>
 tools/moe/convert_les_gguf.py probe  --packed <out.gguf>
 ```
@@ -249,6 +251,58 @@ runtime instead of at conversion time. It is only safe when the template guards 
 e.g. `{%- if enable_thinking is defined %}`; without that guard the runtime default of **true**
 applies and the model always thinks. Baking a prefix leaves nothing to a runtime default, so
 `off` and `on` stay the safe choice for any other template.
+
+### Optional: trained expert predictor
+
+This is an optional add-on, not part of the LES core path. A file without it works exactly as
+before: each block's own router predicts what to prefetch, with no extra weights and no training.
+
+A model may ship a trained predictor of the next block's expert set. When present it lives in the
+same file, in the resident region, never in an expert carrier:
+
+```
+blk.<b>.ffn_gate_inp_pred.weight       f32 [n_embd, n_expert]
+blk.<b>.ffn_gate_inp_pred_prev.weight  f32 [n_embd, n_expert]  (optional)
+```
+
+Block `b` is a routed block; its predictor scores
+
+```
+sigmoid(W_pred[b] . ffn_norm[b-1](t) [+ W_prev[b] . ffn_norm[b](t-1)]) + exp_probs_b[b]
+```
+
+and the top-k ids feed lookahead prefetch. The bias is the model's own `blk.<b>.exp_probs_b.bias`;
+the predictor file normally carries an identical copy, and `pack`/`attach` verify that it is
+bit-identical and drop it rather than storing it twice.
+
+The predictor never picks the experts a token is actually computed with: routing still uses
+`ffn_gate_inp`, so a file carrying a predictor produces the same output with `--moe-predictor` as
+without it. It changes only which experts are read early.
+
+`--predictor` on `pack` packs it in one pass. `attach` inserts it into a file that is already
+packed: it copies resident tensors and expert carriers byte for byte and only inserts the predictor
+tensors before the first carrier, so it avoids re-quantising or re-packing the multi-GB expert
+region. Both take the standalone predictor gguf as input only while converting; the file they
+produce carries the weights itself, and nothing reads a predictor gguf at runtime.
+
+There are three ways to run such a model, and they differ only in how expert bytes are reached:
+
+| run | how experts are reached | who predicts the next block |
+| --- | --- | --- |
+| plain MoE, no `--moe-slot-bank` | mapped with the file | nobody, there is no prefetch |
+| `--moe-slot-bank N` | streamed through the bank | block `b`'s own router applied to `ffn_norm[b-1]` |
+| `--moe-slot-bank N --moe-predictor` | streamed through the bank | the trained head, `W_pred[b]` |
+
+The middle row is the plain LES path and needs nothing extra: the same router the block will run
+anyway scores the previous block's `ffn_norm`. It is a guess, though, because the real router for
+block `b` reads `ffn_norm[b]`, which is only computed after block `b`'s attention. The trained head
+is fitted to approximate that true score from the signal available earlier, and adds the previous
+token's `ffn_norm[b]` through `W_prev`, which plain LES cannot see. Whether it predicts better than
+plain LES is a property of the exported head, so measure it on the target model rather than assuming.
+
+`--moe-predictor` requires a slot bank, because prefetch only exists there. With experts mapped in
+place the flag is rejected, and a file without the trained tensors is rejected too rather than
+silently falling back.
 
 ## 8. Compatibility
 

@@ -319,10 +319,15 @@ extern "C" {
         //
         // There is exactly one expert layout: the one the model file declares in its
         // own `les.moe.layout` metadata. A model either has routed experts or it does
-        // not, so `moe_slot_bank > 0` is the whole switch — there is no source to
-        // select. `moe_slot_bank == 0` on a model that does declare the layout, or a
-        // non-zero bank on one that does not, is rejected at load time.
+        // not, so `moe_slot_bank` only picks how the expert bytes are reached: non-zero
+        // streams them through a slot bank, zero maps them with the file. A non-zero
+        // bank on a model that declares no layout is rejected at load time.
         int32_t moe_slot_bank;
+
+        // Use the trained expert predictor in the model file to decide what to prefetch,
+        // instead of asking each block's own router. Needs --moe-slot-bank, and the file
+        // must carry the predictor. Only affects prefetch, never the output.
+        bool moe_expert_predictor;
 
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights

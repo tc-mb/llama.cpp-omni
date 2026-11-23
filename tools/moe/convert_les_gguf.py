@@ -71,6 +71,72 @@ class PackError(SystemExit):
 
 
 # ---------------------------------------------------------------------------------------------
+# 专家预测器
+# ---------------------------------------------------------------------------------------------
+
+def read_predictor(path: Path, arch: str, model: GGUFReader) -> list[tuple[str, np.ndarray, GGMLQuantizationType]]:
+    """读预测器 gguf，返回要并进主文件的张量。
+
+    只接受预测器自己的张量。`exp_probs_b_pred.bias` 与主模型的 `exp_probs_b.bias`
+    逐位相同（训练就是把主模型的 bias 导出来的），所以不重复存：这里校验一致后丢弃，
+    引擎侧直接用主模型的 bias。不一致就报错 —— 那说明多了一个真正的新量，需要另外处理。
+    """
+    pred = GGUFReader(path)
+    tensors = {t.name: t for t in pred.tensors}
+
+    arch_key = "general.architecture"
+    pred_arch = str(pred.fields[arch_key].contents()) if arch_key in pred.fields else None
+    # 预测器是单独导出的，arch 一般叫 "<model>_predictor" 之类。真正的校验是下面的
+    # 张量形状对照主模型的 ffn_gate_inp，arch 只是个便宜的早期检查。
+    if pred_arch != arch and not (pred_arch or "").endswith("_predictor"):
+        raise PackError(f"predictor arch is {pred_arch!r}, model is {arch!r}")
+
+    model_tensors = {t.name: t for t in model.tensors}
+    out = []
+    seen = set()
+    for name, tensor in tensors.items():
+        if not name.startswith("blk.") or "." not in name[len("blk."):]:
+            raise PackError(f"unexpected predictor tensor: {name}")
+        layer_text, _, rest = name[len("blk."):].partition(".")
+        if not layer_text.isdigit():
+            raise PackError(f"predictor tensor with a bad layer index: {name}")
+        layer = int(layer_text)
+
+        if rest == "exp_probs_b_pred.bias":
+            # Bias 与主模型逐位相同，不重复存。
+            model_name = f"blk.{layer}.exp_probs_b.bias"
+            if model_name not in model_tensors:
+                raise PackError(f"{name}: model has no {model_name} to compare against")
+            if not np.array_equal(np.asarray(tensor.data), np.asarray(model_tensors[model_name].data)):
+                raise PackError(f"{name}: differs from the model's {model_name}; "
+                                "this predictor is not a plain refit of the model router")
+            continue
+
+        if rest not in ("ffn_gate_inp_pred.weight", "ffn_gate_inp_pred_prev.weight"):
+            raise PackError(f"unexpected predictor tensor: {name}")
+        if tensor.tensor_type != GGMLQuantizationType.F32:
+            raise PackError(f"{name}: expected F32, got {tensor.tensor_type.name}")
+        # 形状必须与主模型的 router 一致：一个预测该层 router 的线性层。
+        router = f"blk.{layer}.ffn_gate_inp.weight"
+        if router not in model_tensors:
+            raise PackError(f"{name}: model has no {router} to check the shape against")
+        if tuple(int(v) for v in tensor.shape) != tuple(int(v) for v in model_tensors[router].shape):
+            raise PackError(f"{name}: shape {tuple(tensor.shape)} does not match {router} "
+                            f"{tuple(model_tensors[router].shape)}")
+        if name in seen:
+            raise PackError(f"duplicate predictor tensor: {name}")
+        seen.add(name)
+        # 显式拷贝：reader 出作用域后 memmap 可能失效
+        out.append((name, np.array(tensor.data), tensor.tensor_type))
+
+    if not out:
+        raise PackError(f"predictor {path} carries no tensors to pack")
+    if not any(n.endswith("ffn_gate_inp_pred.weight") for n, _, _ in out):
+        raise PackError(f"predictor {path} has only _prev weights")
+    return out
+
+
+# ---------------------------------------------------------------------------------------------
 # 读源文件
 # ---------------------------------------------------------------------------------------------
 
@@ -406,6 +472,15 @@ def pack(args: argparse.Namespace) -> int:
         writer.add_tensor(tensor.name, tensor.data, raw_shape=tensor.data.shape,
                           raw_dtype=tensor.tensor_type, tensor_endianess=source.endianess)
 
+    # 预测器也属于常驻区：它只有 27 x 2 x n_embd x n_expert 个 f32，必须在专家区之前，
+    # 否则会被当成专家区的一部分，靠按需换页读。
+    n_pred = 0
+    if args.predictor is not None:
+        for name, data, dtype in read_predictor(Path(args.predictor).expanduser().resolve(), arch, source):
+            writer.add_tensor(name, data, raw_shape=data.shape, raw_dtype=dtype,
+                              tensor_endianess=source.endianess)
+            n_pred += 1
+
     total_expert_bytes = 0
     for layer_entry in layout["layers"]:
         layer = layer_entry["layer"]
@@ -421,8 +496,84 @@ def pack(args: argparse.Namespace) -> int:
     writer.write_tensors_to_file()
     writer.close()
 
-    print(f"arch={arch}  resident_tensors={len(resident)}  layers={len(layout['layers'])}")
+    print(f"arch={arch}  resident_tensors={len(resident)}  predictor_tensors={n_pred}  layers={len(layout['layers'])}")
     print(f"expert_bytes={total_expert_bytes / 2**30:.2f} GiB  output={out} "
+          f"({out.stat().st_size / 2**30:.2f} GiB)")
+    return 0
+
+
+def is_carrier(name: str) -> bool:
+    if not name.startswith("blk.") or not name.endswith(".moe_exps_packed.weight"):
+        return False
+    return name[len("blk."):-len(".moe_exps_packed.weight")].isdigit()
+
+
+def attach(args: argparse.Namespace) -> int:
+    """把预测器张量并进一个已经打好的 LES gguf。
+
+    重新量化/重打包专家要几十分钟且会改变量化误差；这里只是按字节搬运 —— 常驻张量
+    原样复制，预测器插在常驻区和专家区之间，专家载体原样复制。布局 KV 不含绝对偏移，
+    所以搬运后仍然有效。
+    """
+    src = Path(args.packed).expanduser().resolve()
+    pred_path = Path(args.predictor).expanduser().resolve()
+    out = Path(args.out).expanduser().resolve()
+    if not src.exists():
+        raise PackError(f"packed gguf not found: {src}")
+    if not pred_path.exists():
+        raise PackError(f"predictor gguf not found: {pred_path}")
+    if out.exists() and not args.force:
+        raise PackError(f"output exists: {out} (pass --force to overwrite)")
+
+    source = GGUFReader(src)
+    if "les.moe.layout" not in source.fields:
+        raise PackError(f"{src} is not an LES gguf (no les.moe.layout)")
+    arch = str(source.fields["general.architecture"].contents())
+
+    names = [t.name for t in source.tensors]
+    already = [n for n in names if n.endswith("ffn_gate_inp_pred.weight")
+               or n.endswith("ffn_gate_inp_pred_prev.weight")]
+    if already:
+        raise PackError(f"{src} already carries predictor tensors (e.g. {already[0]})")
+
+    pred = read_predictor(pred_path, arch, source)
+
+    writer = GGUFWriter(out, arch, use_temp_file=True)
+    writer.add_custom_alignment(REGION_ALIGN)
+
+    from gguf import GGUFValueType
+    for name, field in source.fields.items():
+        if name.startswith("GGUF."):
+            continue
+        # 构造器和 add_custom_alignment 已经写了这两个
+        if name in ("general.architecture", "general.alignment"):
+            continue
+        vtype = field.types[0]
+        subtype = field.types[-1] if vtype == GGUFValueType.ARRAY else None
+        writer.add_key_value(name, field.contents(), vtype, sub_type=subtype)
+
+    def put(tensor):
+        writer.add_tensor(tensor.name, tensor.data, raw_shape=tensor.data.shape,
+                          raw_dtype=tensor.tensor_type, tensor_endianess=source.endianess)
+
+    # 预测器插在第一个载体之前，保住「第一个专家区的偏移 = 预读上界」这个前提。
+    inserted = False
+    for tensor in source.tensors:
+        if not inserted and is_carrier(tensor.name):
+            for name, data, dtype in pred:
+                writer.add_tensor(name, data, raw_shape=data.shape, raw_dtype=dtype,
+                                  tensor_endianess=source.endianess)
+            inserted = True
+        put(tensor)
+    if not inserted:
+        raise PackError(f"{src} has no packed expert carrier to insert before")
+
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+
+    print(f"attached {len(pred)} predictor tensors  output={out} "
           f"({out.stat().st_size / 2**30:.2f} GiB)")
     return 0
 
@@ -430,7 +581,6 @@ def pack(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------------------------
 # verify / probe
 # ---------------------------------------------------------------------------------------------
-
 def verify(args: argparse.Namespace) -> int:
     """逐字节比对：常驻张量对源文件，每个专家区对源文件的交织结果。"""
     src = Path(args.model).expanduser().resolve()
@@ -546,11 +696,23 @@ def main() -> int:
     p_pack.add_argument("--out", required=True, help="output gguf")
     p_pack.add_argument("--force", action="store_true", help="overwrite the output")
     p_pack.add_argument(
+        "--predictor", default=None,
+        help="trained expert predictor gguf to pack into the same file (stays resident)")
+    p_pack.add_argument(
         "--thinking", choices=("off", "on", "keep"), default="off",
         help="bake the assistant turn's thinking mode into the chat template (default: off; "
              "llama.cpp defaults reasoning to on, which breaks this model). 'keep' copies the "
              "source template unchanged, for models that honour enable_thinking themselves")
     p_pack.set_defaults(func=pack)
+
+    p_attach = commands.add_parser(
+        "attach", help="merge a trained expert predictor into an existing LES gguf "
+                       "(byte copy, no requantization)")
+    p_attach.add_argument("--packed", required=True, help="LES gguf to attach to")
+    p_attach.add_argument("--predictor", required=True, help="trained expert predictor gguf")
+    p_attach.add_argument("--out", required=True, help="output gguf")
+    p_attach.add_argument("--force", action="store_true", help="overwrite the output")
+    p_attach.set_defaults(func=attach)
 
     p_verify = commands.add_parser("verify", help="byte-compare the repack against its source")
     p_verify.add_argument("--model", required=True)

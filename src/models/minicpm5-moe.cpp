@@ -178,6 +178,13 @@ void llama_model_minicpm5_moe::load_arch_tensors(llama_model_loader & ml) {
             layer.ffn_gate_inp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP, "weight", i), {n_embd, n_expert}, 0);
             layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias", i), {n_expert}, TENSOR_NOT_REQUIRED);
 
+            // Trained expert predictor (optional): an approximate router for the *next* block,
+            // used only to prefetch. Kept f32; it is a small file next to the experts.
+            layer.ffn_gate_inp_pred = create_tensor(
+                    tn(LLM_TENSOR_FFN_GATE_INP_PRED, "weight", i), {n_embd, n_expert}, TENSOR_NOT_REQUIRED);
+            layer.ffn_gate_inp_pred_prev = create_tensor(
+                    tn(LLM_TENSOR_FFN_GATE_INP_PRED_PREV, "weight", i), {n_embd, n_expert}, TENSOR_NOT_REQUIRED);
+
             layer.ffn_down_exps = create_routed_tensor(
                 tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp_layer, n_embd, n_expert}, 0);
 
@@ -260,11 +267,68 @@ void llama_model_minicpm5_moe::load_arch_tensors(llama_model_loader & ml) {
             }
         }
     }
+
+    bool file_has_pred = false;
+    for (uint32_t il = hparams.n_layer_dense_lead; il < hparams.n_layer; ++il) {
+        file_has_pred = file_has_pred || layers[il].ffn_gate_inp_pred != nullptr;
+    }
+    if (params.moe_expert_predictor) {
+        for (uint32_t il = hparams.n_layer_dense_lead; il < hparams.n_layer; ++il) {
+            if (!layers[il].ffn_gate_inp_pred) {
+                throw std::runtime_error(format(
+                        "moe_expert_predictor is on but the model file has no %s",
+                        tn(LLM_TENSOR_FFN_GATE_INP_PRED, "weight", il).str().c_str()));
+            }
+        }
+        LLAMA_LOG_INFO("%s: lookahead uses the trained expert predictor\n", __func__);
+    } else if (file_has_pred && moe_slot_bank_enabled()) {
+        LLAMA_LOG_INFO("%s: the file carries a trained expert predictor; pass --moe-predictor to use it, "
+                "otherwise each block's own router predicts what to prefetch\n", __func__);
+    }
 }
 
 std::unique_ptr<llm_graph_context> llama_model_minicpm5_moe::build_arch_graph(const llm_graph_params & params) const {
     return std::make_unique<graph>(*this, params);
 }
+
+// Picks the predictor state bank for this ubatch: read the one the previous ubatch wrote,
+// write the other. The row lists are graph inputs, so the choice costs no graph rebuild.
+class minicpm5_moe_pred_state_input : public llm_graph_input_i {
+public:
+    minicpm5_moe_pred_state_input(uint64_t & step, int n_layer) : step(step), n_layer(n_layer) {}
+
+    void set_input(const llama_ubatch * ubatch) override {
+        GGML_UNUSED(ubatch);
+        const int64_t wr_bank = (int64_t) (step & 1);
+        const int64_t rd_bank = 1 - wr_bank;
+        std::vector<int32_t> rd(n_layer);
+        std::vector<int64_t> wr(n_layer);
+        for (int il = 0; il < n_layer; ++il) {
+            rd[il] = (int32_t) (rd_bank * n_layer + il);
+            wr[il] = wr_bank * n_layer + il;
+        }
+        // A prefill graph makes no prediction, so rd_rows is not in it and has no buffer.
+        if (rd_rows->buffer) {
+            ggml_backend_tensor_set(rd_rows, rd.data(), 0, rd.size() * sizeof(int32_t));
+        }
+        if (wr_rows->buffer) {
+            ggml_backend_tensor_set(wr_rows, wr.data(), 0, wr.size() * sizeof(int64_t));
+        }
+        step++;
+    }
+
+    bool can_reuse(const llm_graph_params & params) override {
+        GGML_UNUSED(params);
+        return true;   // fixed shape [n_layer]; the values are set every step
+    }
+
+    ggml_tensor * rd_rows = nullptr;   // I32 [n_layer], for ggml_get_rows
+    ggml_tensor * wr_rows = nullptr;   // I64 [n_layer], for ggml_set_rows
+
+private:
+    uint64_t & step;   // the context's slot runtime counter (predictor_step)
+    const int n_layer;
+};
 
 llama_model_minicpm5_moe::graph::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
     const int64_t n_embd_head = hparams.n_embd_head_v();
@@ -285,6 +349,78 @@ llama_model_minicpm5_moe::graph::graph(const llama_model & model, const llm_grap
     auto * inp_attn = build_attn_inp_kv();
 
     ggml_tensor * inp_out_ids = build_inp_out_ids();
+
+    // Trained expert predictor: an approximate router for the *next* block's experts.
+    // It only decides what to prefetch; the real router still picks the experts, so the
+    // output does not depend on whether it is on. Without the trained weights the next
+    // block's own router answers the same question, which is the plain LES behaviour.
+    const bool lookahead   = moe_slots && moe_slots->lookahead_prefetch_enabled();
+    const bool trained     = model.moe_expert_predictor_enabled();
+    // `_prev` state is only read by the trained head; keep it for every ubatch (prefill
+    // included) so the first decode step already has the last prefill token.
+    const bool keep_prev   = lookahead && trained && !cparams.warmup;
+    const bool predict     = lookahead && ubatch.n_tokens == 1;
+
+    // current_prev: the previous token's ffn_norm per block. Two banks, one per ubatch parity:
+    // each ubatch reads the bank the previous ubatch wrote and writes the other, so no row is
+    // read and written by the same graph regardless of the order the backend runs the nodes.
+    ggml_tensor * prev_state   = nullptr;
+    ggml_tensor * prev_rd_rows = nullptr;
+    ggml_tensor * prev_wr_rows = nullptr;
+    if (keep_prev) {
+        ggml_backend_buffer_type_t buft = model.moe_expert_predictor_buft();
+        if (buft) {
+            prev_state = moe_slots->predictor_state(n_embd, 2 * n_layer, buft);
+            auto inp = std::make_unique<minicpm5_moe_pred_state_input>(moe_slots->predictor_step(), n_layer);
+            inp->rd_rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_layer);
+            inp->wr_rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, n_layer);
+            ggml_set_input(inp->rd_rows);
+            ggml_set_input(inp->wr_rows);
+            prev_rd_rows = inp->rd_rows;
+            prev_wr_rows = inp->wr_rows;
+            res->add_input(std::move(inp));
+        }
+    }
+
+    // Predict block `target`'s experts from the ffn_norm of block target-1 (`x`).
+    // With the trained head:
+    //   sigmoid(W_pred[target] * x [+ W_prev[target] * ffn_norm_target(t-1)]) + exp_probs_b[target]
+    // Without it, block `target`'s own router scores `x`, which is what the plain LES
+    // does. Both mirror build_moe_ffn: the transform matches `gating_op` and the bias is
+    // added after it, because the real router ranks on the biased scores.
+    auto build_prediction = [&](ggml_tensor * x, int target) -> ggml_tensor * {
+        const auto & tgt = model.layers[target];
+        ggml_tensor * logits;
+        if (trained) {
+            logits = ggml_mul_mat(ctx0, tgt.ffn_gate_inp_pred, x);
+            if (prev_state && tgt.ffn_gate_inp_pred_prev) {
+                ggml_tensor * xprev = ggml_get_rows(ctx0, prev_state,
+                        ggml_view_1d(ctx0, prev_rd_rows, 1, (size_t) target * prev_rd_rows->nb[0]));
+                logits = ggml_add(ctx0, logits, ggml_mul_mat(ctx0, tgt.ffn_gate_inp_pred_prev, xprev));
+            }
+        } else {
+            logits = build_lora_mm(tgt.ffn_gate_inp, x);
+            if (hparams.expert_router_f32) {
+                ggml_mul_mat_set_prec(logits, GGML_PREC_F32);
+            }
+        }
+        ggml_tensor * scores;
+        switch ((llama_expert_gating_func_type) hparams.expert_gating_func) {
+            case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX:
+                scores = ggml_soft_max(ctx0, logits);
+                break;
+            case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT:
+                scores = logits;
+                break;
+            default:
+                scores = ggml_sigmoid(ctx0, logits);
+                break;
+        }
+        if (tgt.ffn_exp_probs_b) {
+            scores = ggml_add(ctx0, scores, tgt.ffn_exp_probs_b);
+        }
+        return ggml_cont(ctx0, ggml_argsort_top_k(ctx0, scores, moe_slots->lookahead_prefetch_depth()));
+    };
 
     for (int il = 0; il < n_layer; ++il) {
         res->t_layer_inp[il] = inpL;
@@ -339,7 +475,23 @@ llama_model_minicpm5_moe::graph::graph(const llama_model & model, const llm_grap
         cur = build_norm(ffn_inp, model.layers[il].ffn_norm, NULL, LLM_NORM_RMS, il);
         cb(cur, "ffn_norm", il);
 
+        if (prev_state && model.layers[il].ffn_gate_inp_pred_prev && cur->ne[1] > 0) {
+            // keep this block's ffn_norm for the next token's _prev term, in the bank this
+            // ubatch writes (no prediction in this graph reads it)
+            ggml_tensor * last = ggml_view_2d(ctx0, cur, cur->ne[0], 1, cur->nb[1], (cur->ne[1] - 1) * cur->nb[1]);
+            ggml_build_forward_expand(gf, ggml_set_rows(ctx0, prev_state, last,
+                ggml_view_1d(ctx0, prev_wr_rows, 1, (size_t) il * prev_wr_rows->nb[0])));
+        }
+
         if ((uint32_t) il < hparams.n_layer_dense_lead) {
+            // a dense block has no per-layer CPU op to carry the prediction, so the next
+            // (MoE) block's prediction gets an op of its own
+            if (predict && il + 1 < n_layer && model.layers[il + 1].ffn_gate_inp) {
+                ggml_tensor * hand_off = moe_slots->build_lookahead_only(ctx0, build_prediction(cur, il + 1), il + 1);
+                if (hand_off) {
+                    ggml_build_forward_expand(gf, hand_off);
+                }
+            }
             cur = build_ffn(cur,
                     model.layers[il].ffn_up,   NULL, NULL,
                     model.layers[il].ffn_gate, NULL, NULL,
@@ -347,6 +499,16 @@ llama_model_minicpm5_moe::graph::graph(const llama_model & model, const llm_grap
                     NULL, LLM_FFN_SILU, LLM_FFN_PAR, il);
             cb(cur, "ffn_out", il);
         } else {
+            // the prediction for block il+1 rides on this block's slot-mapping CPU op
+            ggml_tensor * prediction = nullptr;
+            if (predict && il + 1 < n_layer && model.layers[il + 1].ffn_gate_inp) {
+                prediction = build_prediction(cur, il + 1);
+                ggml_build_forward_expand(gf, prediction);
+            }
+            if (moe_slots) {
+                moe_slots->set_lookahead_pred(prediction);
+            }
+
             // LES：decode 用每层独立的窗口张量（base 上的 view），prefill 用共享窗口。
             // 两者 ne[2] 不同，必须按阶段选。
             const auto & L = model.layers[il];

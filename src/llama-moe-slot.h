@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ggml.h"
+#include "ggml-backend.h"
 
 #include <memory>
 
@@ -29,6 +30,17 @@ public:
     // Safe between llama_decode calls; in-flight prefetch is drained first.
     void set_lookahead_prefetch_depth(int depth);
     void set_lookahead_pred(ggml_tensor * pred_ids);
+    /// For a layer without routed experts (a leading dense layer) whose next layer has them:
+    /// a CPU op that hands `pred` (target_layer's predicted expert ids) to lookahead prefetch.
+    /// Expand the returned tensor into the graph; nullptr when lookahead is off.
+    ggml_tensor * build_lookahead_only(ggml_context * ctx, ggml_tensor * pred, int target_layer);
+    /// Per-context state for a trained expert predictor (minicpm5_moe current_prev keeps the
+    /// previous token's ffn_norm here). It lives in this runtime, one per llama_context, so two
+    /// contexts on one model never share it. Allocated in `buft` and zero-filled on first use;
+    /// later calls must ask for the same shape.
+    ggml_tensor * predictor_state(int64_t ne0, int64_t ne1, ggml_backend_buffer_type_t buft);
+    /// Ubatches this context has run with the predictor state; its parity picks the bank written.
+    uint64_t & predictor_step();
     ggml_tensor * build_slot_ids_tensor(
         ggml_context * ctx,
         ggml_tensor * expert_ids,
@@ -80,6 +92,12 @@ public:
     void prewarm_experts();
 
 private:
+    static void map_custom_lookahead_only(
+        ggml_tensor * dst,
+        const ggml_tensor * pred,
+        int ith,
+        int nth,
+        void * userdata);
     static void map_custom(
         ggml_tensor * dst,
         const ggml_tensor * src,

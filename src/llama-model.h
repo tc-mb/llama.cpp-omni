@@ -294,6 +294,9 @@ struct llama_layer {
     // ff MoE
     struct ggml_tensor * ffn_gate_inp      = nullptr;
     struct ggml_tensor * ffn_gate_inp_s    = nullptr; // gemma4
+    // trained expert predictor: an approximate router used for lookahead prefetch only
+    struct ggml_tensor * ffn_gate_inp_pred      = nullptr;
+    struct ggml_tensor * ffn_gate_inp_pred_prev = nullptr;
     struct ggml_tensor * ffn_gate_exps     = nullptr;
     struct ggml_tensor * ffn_down_exps     = nullptr;
     struct ggml_tensor * ffn_up_exps       = nullptr;
@@ -652,6 +655,11 @@ struct llama_model {
 
     bool moe_slot_bank_enabled() const;
     int32_t moe_slot_bank_size() const;
+    /// The trained expert predictor is loaded and enabled (used for lookahead only).
+    bool moe_expert_predictor_enabled() const;
+    /// Buffer type of the predictor weights; the per-context `_prev` state lives there too.
+    /// Only valid when moe_expert_predictor_enabled().
+    ggml_backend_buffer_type_t moe_expert_predictor_buft() const;
     /// 每层 decode 窗口宽度（slot 数），0 = 未启用。
     /// 由 `LLAMA_MOE_DECODE_WINDOW` 决定（`auto` = bank / MoE 层数）。
     int32_t moe_decode_window() const;
