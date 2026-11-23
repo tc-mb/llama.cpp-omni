@@ -79,6 +79,7 @@ struct llama_hparams {
     std::array<uint32_t, LLAMA_MAX_LAYERS> n_head_arr;
     std::array<uint32_t, LLAMA_MAX_LAYERS> n_head_kv_arr;
     std::array<uint32_t, LLAMA_MAX_LAYERS> n_ff_arr;
+    std::array<uint32_t, LLAMA_MAX_LAYERS> n_ff_exp_arr = {}; // per-layer routed expert FFN size
 
     uint32_t n_layer_dense_lead = 0;
     uint32_t n_lora_q           = 0;

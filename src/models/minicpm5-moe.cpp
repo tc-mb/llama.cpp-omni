@@ -9,7 +9,9 @@ void llama_model_minicpm5_moe::load_arch_hparams(llama_model_loader & ml) {
 
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
     ml.get_key(LLM_KV_LEADING_DENSE_BLOCK_COUNT,   hparams.n_layer_dense_lead);
-    ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,  hparams.n_ff_exp);
+    // the routed expert FFN size may be a single value or one value per layer
+    ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer);
+    hparams.n_ff_exp = hparams.n_ff_exp_arr[0];
     ml.get_key(LLM_KV_EXPERT_SHARED_COUNT,         hparams.n_expert_shared);
     ml.get_key(LLM_KV_EXPERT_WEIGHTS_SCALE,        hparams.expert_weights_scale);
     ml.get_key(LLM_KV_EXPERT_WEIGHTS_NORM,         hparams.expert_weights_norm);
@@ -31,8 +33,6 @@ void llama_model_minicpm5_moe::load_arch_hparams(llama_model_loader & ml) {
 void llama_model_minicpm5_moe::load_arch_tensors(llama_model_loader & ml) {
     LLAMA_LOAD_LOCALS;
 
-    const int64_t n_ff_exp   = hparams.n_ff_exp;
-    const int64_t n_ff_shexp = hparams.n_ff_shexp;
     const int     n_dense    = (int) hparams.n_layer_dense_lead;
 
     // ── LES：路由专家内联在模型文件里，decode 阶段按层窗口按需读入 ──
@@ -168,25 +168,28 @@ void llama_model_minicpm5_moe::load_arch_tensors(llama_model_loader & ml) {
                 throw std::runtime_error("n_expert_used must be > 0 for minicpm5_moe");
             }
 
+            const int64_t n_ff_exp_layer   = hparams.n_ff_exp_arr[i];
+            const int64_t n_ff_shexp_layer = n_ff_exp_layer * hparams.n_expert_shared;
+
             layer.ffn_gate_inp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP, "weight", i), {n_embd, n_expert}, 0);
             layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias", i), {n_expert}, TENSOR_NOT_REQUIRED);
 
             layer.ffn_down_exps = create_routed_tensor(
-                tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp, n_embd, n_expert}, 0);
+                tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp_layer, n_embd, n_expert}, 0);
 
             layer.ffn_gate_up_exps = create_routed_tensor(
-                tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", i), {n_embd, n_ff_exp * 2, n_expert}, TENSOR_NOT_REQUIRED);
+                tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", i), {n_embd, n_ff_exp_layer * 2, n_expert}, TENSOR_NOT_REQUIRED);
             if (!layer.ffn_gate_up_exps) {
                 layer.ffn_gate_exps = create_routed_tensor(
-                    tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd, n_ff_exp, n_expert}, 0);
+                    tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd, n_ff_exp_layer, n_expert}, 0);
                 layer.ffn_up_exps = create_routed_tensor(
-                    tn(LLM_TENSOR_FFN_UP_EXPS, "weight", i), {n_embd, n_ff_exp, n_expert}, 0);
+                    tn(LLM_TENSOR_FFN_UP_EXPS, "weight", i), {n_embd, n_ff_exp_layer, n_expert}, 0);
             }
 
-            if (n_ff_shexp > 0) {
-                layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd, n_ff_shexp}, 0);
-                layer.ffn_down_shexp = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {n_ff_shexp, n_embd}, 0);
-                layer.ffn_up_shexp   = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {n_embd, n_ff_shexp}, 0);
+            if (n_ff_shexp_layer > 0) {
+                layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd, n_ff_shexp_layer}, 0);
+                layer.ffn_down_shexp = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {n_ff_shexp_layer, n_embd}, 0);
+                layer.ffn_up_shexp   = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {n_embd, n_ff_shexp_layer}, 0);
             }
         }
     }

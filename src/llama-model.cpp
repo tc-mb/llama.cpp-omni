@@ -534,7 +534,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
 
             // the FFN is the same for Qwen 3 Next and Qwen 3.5:
             if (std::regex_match(tensor_name, pattern_ffn_gate_up_weight)) {
-                const int64_t n_ff_exp = hparams.n_ff_exp;
+                const int64_t n_ff_exp = hparams.n_ff_exp_arr[il] > 0 ? hparams.n_ff_exp_arr[il] : hparams.n_ff_exp;
                 GGML_ASSERT(tensor->ne[axis] == 2*n_ff_exp);
                 return {n_ff_exp, n_ff_exp};
             }
@@ -549,7 +549,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             return {n_embd, n_embd_gqa, n_embd_gqa};
         }
         if (std::regex_match(tensor_name, pattern_ffn_gate_up_weight)) {
-            const int64_t n_ff_exp = hparams.n_ff_exp;
+            const int64_t n_ff_exp = hparams.n_ff_exp_arr[il] > 0 ? hparams.n_ff_exp_arr[il] : hparams.n_ff_exp;
             GGML_ASSERT(tensor->ne[axis] == 2*n_ff_exp);
             return {n_ff_exp, n_ff_exp};
         }
