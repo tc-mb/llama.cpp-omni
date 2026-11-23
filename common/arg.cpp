@@ -2277,6 +2277,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_SLOT_BANK"));
     add_opt(common_arg(
+        {"--moe-predictor"},
+        "use the trained expert predictor in the model file for lookahead prefetch, instead of "
+        "each block's own router (needs --moe-slot-bank; never changes the output)",
+        [](common_params & params) {
+            params.moe_predictor = true;
+        }
+    ).set_env("LLAMA_ARG_MOE_PREDICTOR"));
+    add_opt(common_arg(
         {"--moe-k-prefill"}, "N",
         "MoE top-k during prompt eval (default: model metadata). experts must still match training K",
         [](common_params & params, int value) {

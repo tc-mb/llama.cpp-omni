@@ -1358,6 +1358,16 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
             (bytes_all * (size_t) kMoeSlotBankRamBaseline) / 1024.0 / 1024.0);
     }
 
+    // The trained predictor feeds lookahead prefetch, which only exists with a slot bank.
+    if (params.moe_expert_predictor) {
+        if (!moe_slot_bank_enabled()) {
+            throw std::runtime_error("moe_expert_predictor needs a slot bank (--moe-slot-bank)");
+        }
+        if (arch != LLM_ARCH_MINICPM5_MOE) {
+            throw std::runtime_error("moe_expert_predictor is currently supported only for minicpm5_moe");
+        }
+    }
+
     pimpl->n_bytes = ml.n_bytes;
 
     pimpl->desc_str = arch_name() + " " + type_name() + " " + ml.ftype_name();
@@ -2214,6 +2224,24 @@ int32_t llama_model::moe_slot_bank_size() const {
     return pimpl->moe_experts ? params.moe_slot_bank : 0;
 }
 
+bool llama_model::moe_expert_predictor_enabled() const {
+    return params.moe_expert_predictor && moe_slot_bank_enabled() && hparams.n_layer > hparams.n_layer_dense_lead &&
+        layers[hparams.n_layer_dense_lead].ffn_gate_inp_pred != nullptr;
+}
+
+ggml_backend_buffer_type_t llama_model::moe_expert_predictor_buft() const {
+    // The _prev weights are optional; the plain predictor weights are not.
+    for (uint32_t il = hparams.n_layer_dense_lead; il < hparams.n_layer; ++il) {
+        if (layers[il].ffn_gate_inp_pred_prev) {
+            return ggml_backend_buffer_get_type(layers[il].ffn_gate_inp_pred_prev->buffer);
+        }
+        if (layers[il].ffn_gate_inp_pred) {
+            return ggml_backend_buffer_get_type(layers[il].ffn_gate_inp_pred->buffer);
+        }
+    }
+    return nullptr;
+}
+
 int32_t llama_model::moe_experts_layer_count() const {
     return pimpl->moe_experts ? pimpl->moe_experts->layer_count() : 0;
 }
@@ -2593,6 +2621,7 @@ llama_model_params llama_model_default_params() {
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
         /*.moe_slot_bank               =*/ 0,
+        /*.moe_expert_predictor        =*/ false,
         /*.vocab_only                  =*/ false,
         /*.use_mmap                    =*/ true,
         /*.use_direct_io               =*/ false,
