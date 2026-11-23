@@ -1926,6 +1926,26 @@ bool fmFlowMatchingModelLoaderGGUF::build_fused_qkv(int depth, int dim) {
         LOG_ERROR("fmFlowMatchingModelLoaderGGUF::build_fused_qkv: backend is null\n");
         return false;
     }
+    // Vulkan: keep fused QKV off unless explicitly forced with OMNI_T2W_FUSED_QKV=1.
+    // On RDNA4 (RX 9060 XT) the DiT attention built on top of this fused weight
+    // produces clipped, hissy audio, while the unfused three-matmul path on the same
+    // backend is correct (tc-mb/llama.cpp-omni#155).  Conservative on purpose: gate
+    // the whole Vulkan backend rather than trying to match a device name, and drop
+    // this once the backend-side bug is understood.
+    // Backend is matched by name instead of ggml_backend_is_vk() so this translation
+    // unit does not need a ggml-vulkan link dependency; "Vulkan0" is what
+    // ggml_backend_name() reports.
+    {
+        const char * backend_name = ggml_backend_name(backend_);
+        const char * force        = std::getenv("OMNI_T2W_FUSED_QKV");
+        const bool   forced_on    = force != nullptr && std::strcmp(force, "1") == 0;
+        if (!forced_on && backend_name != nullptr && std::strstr(backend_name, "Vulkan") != nullptr) {
+            LOG_INFO("fmFlowMatchingModelLoaderGGUF::build_fused_qkv: fused QKV disabled on %s "
+                     "(issue #155; set OMNI_T2W_FUSED_QKV=1 to force)\n",
+                     backend_name);
+            return false;
+        }
+    }
     if (!fused_qkv_.empty()) {
         return static_cast<int>(fused_qkv_.size()) == depth;
     }
