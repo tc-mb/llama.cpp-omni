@@ -1490,6 +1490,103 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
     }
 }
 
+ggml_tensor * llama_model_loader::create_packed_carrier(
+        const llama_hparams & hparams, const buft_list_t * buft_list_layer, const std::string & name,
+        ggml_type expert_type, const std::initializer_list<int64_t> & expert_ne) {
+    ggml_tensor * meta = require_tensor_meta(name);
+    if (meta->type != GGML_TYPE_I8) {
+        throw std::runtime_error(format("expert carrier '%s' is %s, expected i8", name.c_str(), ggml_type_name(meta->type)));
+    }
+    if (!buft_list_layer || buft_list_layer->empty()) {
+        throw std::runtime_error(format("no buffer types for expert carrier '%s'", name.c_str()));
+    }
+
+    // Place it where a standard expert tensor would go: ask the same MUL_MAT_ID question with
+    // a proxy of the expert family's type and shape (the i8 carrier itself is not a valid
+    // mul_mat_id operand).
+    ggml_tensor proxy;
+    memset(&proxy, 0, sizeof(proxy));
+    proxy.type = expert_type;
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        proxy.ne[i] = i < (int) expert_ne.size() ? expert_ne.begin()[i] : 1;
+    }
+    proxy.nb[0] = ggml_type_size(expert_type);
+    proxy.nb[1] = ggml_row_size(expert_type, proxy.ne[0]);
+    for (int i = 2; i < GGML_MAX_DIMS; ++i) {
+        proxy.nb[i] = proxy.nb[i - 1] * proxy.ne[i - 1];
+    }
+    ggml_backend_buffer_type_t buft = select_weight_buft(hparams, &proxy, GGML_OP_MUL_MAT_ID, buft_list_layer);
+    if (!buft) {
+        throw std::runtime_error(format("failed to find a buffer type for expert carrier '%s'", name.c_str()));
+    }
+    // same rule as create_tensor: no host buffer with mmap
+    auto * buft_dev = ggml_backend_buft_get_device(buft);
+    if (use_mmap && buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev)) {
+        auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        if (!cpu_dev) {
+            throw std::runtime_error("no CPU backend found");
+        }
+        buft = ggml_backend_dev_buffer_type(cpu_dev);
+    }
+    // The experts are strided views into the carrier's raw bytes. An "extra" buffer type
+    // (e.g. CPU_REPACK) would rearrange those bytes on upload, and every view would read the
+    // wrong data, so only a plain buffer type of a device in this list is accepted.
+    bool plain_buft = buft == ggml_backend_cpu_buffer_type();
+    for (const auto & entry : *buft_list_layer) {
+        if (!entry.first) {
+            continue;
+        }
+        if (buft == ggml_backend_dev_buffer_type(entry.first) ||
+                buft == ggml_backend_dev_host_buffer_type(entry.first)) {
+            plain_buft = true;
+            break;
+        }
+    }
+    if (!plain_buft) {
+        throw std::runtime_error(format(
+            "expert carrier '%s': mapping an LES model in place is not supported with buffer type %s "
+            "(load it with a slot bank instead)", name.c_str(), ggml_backend_buft_name(buft)));
+    }
+
+    ggml_context * ctx = ctx_for_buft(hparams, buft);
+    if (ggml_tensor * existing = ggml_get_tensor(ctx, name.c_str())) {
+        return existing;
+    }
+    ggml_tensor * carrier = ggml_dup_tensor(ctx, meta);
+    ggml_set_name(carrier, name.c_str());
+    packed_carrier_ctx[carrier] = ctx;
+    n_created++;
+    return carrier;
+}
+
+ggml_tensor * llama_model_loader::packed_expert_view(
+        ggml_tensor * carrier, const std::string & name, ggml_type type,
+        const std::initializer_list<int64_t> & ne, size_t offset_in_expert, size_t expert_stride) {
+    const auto it = packed_carrier_ctx.find(carrier);
+    if (it == packed_carrier_ctx.end()) {
+        throw std::runtime_error(format("'%s' is not an expert carrier", carrier ? ggml_get_name(carrier) : "(null)"));
+    }
+    if (ne.size() != 3) {
+        throw std::runtime_error(format("expert view '%s' must be 3-D", name.c_str()));
+    }
+    const int64_t ne0 = ne.begin()[0], ne1 = ne.begin()[1], ne2 = ne.begin()[2];
+    const size_t row = ggml_row_size(type, ne0);
+    if (ne2 != carrier->ne[3] || expert_stride != (size_t) carrier->ne[0] ||
+            offset_in_expert + row * (size_t) ne1 > expert_stride) {
+        throw std::runtime_error(format("expert view '%s' does not fit carrier '%s'", name.c_str(), ggml_get_name(carrier)));
+    }
+
+    ggml_tensor * view = ggml_new_tensor_3d(it->second, type, ne0, ne1, ne2);
+    ggml_set_name(view, name.c_str());
+    view->nb[1]     = row;
+    view->nb[2]     = expert_stride;
+    view->nb[3]     = expert_stride * (size_t) ne2;
+    view->view_src  = carrier;
+    view->view_offs = offset_in_expert;
+    view->data      = nullptr;
+    return view;
+}
+
 const llama_model_loader::llama_moe_region * llama_model_loader::take_expert_region(const char * name) {
     if (!name) {
         return nullptr;

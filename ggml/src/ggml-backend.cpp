@@ -1639,12 +1639,18 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         const size_t padding = std::min<size_t>(expert_size, 512);
                         const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
 
+                        // The dst copy keeps the src layout, so a strided expert tensor
+                        // (nb[2] > one expert's rows) ends nbytes before the last full stride.
+                        // Trim the tail gap; the last expert's rows are still covered.
+                        const size_t copy_size = std::min(expert_size_copy + padding_end,
+                                ggml_nbytes(input_cpy) - expert_offset);
+
                         ggml_backend_tensor_set_async(split_backend,
                             input_cpy,
                             (const uint8_t *)input->data + expert_offset, expert_offset,
                             // copy a bit extra at the to ensure there are no NaNs in the padding of the last expert
                             // this is necessary for MMQ in the CUDA backend
-                            expert_size_copy + padding_end);
+                            copy_size);
                     };
 
                     int id = 0;

@@ -98,6 +98,10 @@ void llama_model_minicpm5_moe::load_arch_tensors(llama_model_loader & ml) {
         // slot bank 关闭时专家就是普通权重，走常规加载（能进 mmap 映射区）。
         // 走 own-alloc 会让同一份专家权重再单独映射一遍，常驻内存翻倍。
         if (!moe_slot_bank_enabled()) {
+            // an LES file without a slot bank: a strided view into the mapped carrier
+            if (const auto * packed = moe_packed_entry(tensor_name.str().c_str())) {
+                return create_packed_expert_view(ml, tensor_name, dims, *packed);
+            }
             return create_tensor(tensor_name, dims, flags);
         }
 
