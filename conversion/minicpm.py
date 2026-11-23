@@ -119,9 +119,14 @@ class MiniCPM3Model(TextModel):
 
 @ModelBase.register("MiniCPM5MoEForCausalLM")
 class MiniCPM5MoEModel(TextModel):
-    model_arch = gguf.MODEL_ARCH.MINICPM5MOE
+    model_arch = gguf.MODEL_ARCH.MINICPM5_MOE
 
     merge_expert = True
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if not self.hparams.get("use_gated_attention", False):
+            raise ValueError("MiniCPM5 MoE requires gated attention")
 
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
@@ -132,7 +137,6 @@ class MiniCPM5MoEModel(TextModel):
 
         n_ff_exp = hparams["moe_intermediate_size"]
         self.gguf_writer.add_expert_feed_forward_length(n_ff_exp)
-        self.gguf_writer.add_expert_shared_feed_forward_length(n_ff_exp * hparams.get("n_shared_experts", 1))
 
         if (routed_scaling_factor := hparams.get("routed_scaling_factor")) is not None:
             self.gguf_writer.add_expert_weights_scale(routed_scaling_factor)
@@ -150,6 +154,18 @@ class MiniCPM5MoEModel(TextModel):
     _experts: list[dict[str, Tensor]] | None = None
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if name.endswith("self_attn.q_proj.weight"):
+            n_head = self.hparams["num_attention_heads"]
+            head_dim = self.hparams.get("head_dim", self.hparams["hidden_size"] // n_head)
+            # HF interleaves query and gate rows within each head
+            query, gate = data_torch.reshape(n_head, 2 * head_dim, -1).chunk(2, dim=1)
+            query = query.reshape(n_head * head_dim, -1)
+            gate = gate.reshape(n_head * head_dim, -1)
+            # Q/K already use the NeoX RoPE layout expected by this architecture
+            yield self.format_tensor_name(gguf.MODEL_TENSOR.ATTN_Q, bid), query
+            yield self.format_tensor_name(gguf.MODEL_TENSOR.ATTN_GATE, bid), gate
+            return
+
         # stack the per-expert weights into a single 3d tensor
         if self.merge_expert and "mlp.experts" in name:
             n_experts = self.hparams["n_routed_experts"]

@@ -79,6 +79,7 @@ struct llama_hparams {
     std::array<uint32_t, LLAMA_MAX_LAYERS> n_head_arr;
     std::array<uint32_t, LLAMA_MAX_LAYERS> n_head_kv_arr;
     std::array<uint32_t, LLAMA_MAX_LAYERS> n_ff_arr;
+    std::array<uint32_t, LLAMA_MAX_LAYERS> n_ff_exp_arr = {}; // per-layer routed expert FFN size
 
     uint32_t n_layer_dense_lead = 0;
     uint32_t n_lora_q           = 0;
@@ -96,6 +97,7 @@ struct llama_hparams {
     float    expert_weights_scale = 0.0f;
     bool     expert_weights_norm  = false;
     uint32_t expert_gating_func   = LLAMA_EXPERT_GATING_FUNC_TYPE_NONE;
+    bool     expert_router_f32    = false;   // compute the router logits in F32
     uint32_t moe_every_n_layers   = 0;
     uint32_t moe_latent_size      = 0;
     uint32_t nextn_predict_layers = 0;
