@@ -109,6 +109,9 @@ struct llama_model_loader {
 
     std::map<std::string, llama_tensor_weight, weight_name_comparer> weights_map;
 
+    /// create_packed_carrier(): carrier tensor -> the context it was created in.
+    std::map<const struct ggml_tensor *, struct ggml_context *> packed_carrier_ctx;
+
     /// 被 take_expert_region() 取走的专家区载体张量。
     std::map<std::string, llama_moe_region> moe_regions;
     /// 专家区在文件内的最小偏移；没有时保持 (size_t) -1。
@@ -252,6 +255,29 @@ struct llama_model_loader {
         size_t bytes_per_expert);
 
     struct ggml_tensor * create_tensor_as_view(struct ggml_context * ctx, struct ggml_tensor * base, const std::string & name, const std::initializer_list<int64_t> & ne, size_t offset, bool required = true);
+
+    /// LES layout without a slot bank: create the carrier tensor `name` (a file tensor) as an
+    /// ordinary weight, so it is mapped and loaded with the rest of the file. Its buffer type is
+    /// the one a standard expert tensor of `expert_type` / `expert_ne` would get on this layer.
+    /// Idempotent: the carrier is shared by the gate / up / down views of its layer.
+    struct ggml_tensor * create_packed_carrier(
+        const llama_hparams & hparams,
+        const buft_list_t * buft_list_layer,
+        const std::string & name,
+        enum ggml_type expert_type,
+        const std::initializer_list<int64_t> & expert_ne);
+
+    /// A typed 3-D view of one expert family inside a packed carrier: `ne` = {cols, rows,
+    /// n_expert}, rows contiguous, experts `expert_stride` bytes apart starting at
+    /// `offset_in_expert`. Created in the carrier's context; it gets its data pointer from the
+    /// carrier once the carrier is loaded (see llama_model_base::load_tensors).
+    struct ggml_tensor * packed_expert_view(
+        struct ggml_tensor * carrier,
+        const std::string & name,
+        enum ggml_type type,
+        const std::initializer_list<int64_t> & ne,
+        size_t offset_in_expert,
+        size_t expert_stride);
 
     /// 取出一个专家区载体张量，并从 weights_map 里摘掉。
     ///

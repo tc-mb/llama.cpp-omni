@@ -1019,6 +1019,11 @@ struct llama_model::impl {
 
     bool has_tensor_overrides;
     std::unique_ptr<llama_moe_experts> moe_experts;
+    /// LES layout loaded without a slot bank (experts mapped in place, see load_hparams).
+    std::unique_ptr<llama_moe_experts> moe_packed;
+    /// File offset of the first in-place expert carrier; prefetch stops here so load does not
+    /// pull the expert bytes in. (size_t) -1 when there is nothing to bound.
+    size_t moe_packed_begin = (size_t) -1;
 };
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
@@ -1038,6 +1043,30 @@ llama_model::~llama_model() {
 void llama_model_base::load_stats(llama_model_loader & ml) {
     pimpl->n_elements = ml.n_elements;
     pimpl->n_bytes = ml.n_bytes;
+}
+
+// Capability gate for an LES file: refuse one that asks for something this build cannot do.
+// Interpreting a newer field with older semantics gives a wrong result, silently.
+static void les_check_requires(const gguf_context * gctx) {
+    const int key_requires = gguf_find_key(gctx, "les.moe.requires");
+    if (key_requires < 0) {
+        return;
+    }
+    static const std::unordered_set<std::string> known = {
+        "moe.expert_major_packed_v1",
+    };
+    std::string missing;
+    for (uint32_t i = 0; i < gguf_get_arr_n(gctx, key_requires); ++i) {
+        const std::string capability = gguf_get_arr_str(gctx, key_requires, i);
+        if (!known.count(capability)) {
+            missing += (missing.empty() ? "" : ", ") + capability;
+        }
+    }
+    if (!missing.empty()) {
+        throw std::runtime_error(format(
+            "model requires expert-layout capabilities this build does not implement: %s",
+            missing.c_str()));
+    }
 }
 
 void llama_model_base::load_hparams(llama_model_loader & ml) {
@@ -1234,27 +1263,8 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
                 "moe_slot_bank is non-zero but the model file declares no 'les.moe.layout'");
         }
 
-        // Capability gate: refuse a file that asks for something this build cannot do. This
-        // matters more than "parse and guess" — interpreting a newer field with older
-        // semantics produces a result that is simply wrong, and quietly so.
-        const int key_requires = gguf_find_key(gctx, "les.moe.requires");
-        if (key_requires >= 0) {
-            static const std::unordered_set<std::string> known = {
-                "moe.expert_major_packed_v1",
-            };
-            std::string missing;
-            for (uint32_t i = 0; i < gguf_get_arr_n(gctx, key_requires); ++i) {
-                const std::string capability = gguf_get_arr_str(gctx, key_requires, i);
-                if (!known.count(capability)) {
-                    missing += (missing.empty() ? "" : ", ") + capability;
-                }
-            }
-            if (!missing.empty()) {
-                throw std::runtime_error(format(
-                    "model requires expert-layout capabilities this build does not implement: %s",
-                    missing.c_str()));
-            }
-        }
+        // Capability gate: refuse a file that asks for something this build cannot do.
+        les_check_requires(gctx);
 
         pimpl->moe_experts = llama_moe_experts::from_layout(
                 gguf_get_val_str(gctx, key_layout),
@@ -1278,6 +1288,40 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
                 __func__, pimpl->moe_experts->layer_count(),
                 pimpl->moe_experts->region_names().size(),
                 pimpl->moe_experts->bytes_per_slot_all_layers() / 1024.0 / 1024.0);
+    }
+
+    // Same layout, no slot bank: the experts stay in the file and are mapped with it. Every
+    // expert family becomes a strided view into its layer's carrier (create_packed_expert_view),
+    // so one LES file runs either way. No new flag: the usual mmap switches apply.
+    if (params.moe_slot_bank <= 0 && !pimpl->moe_packed) {
+        const gguf_context * gctx = ml.metadata;
+        const int key_layout = gguf_find_key(gctx, "les.moe.layout");
+        if (key_layout >= 0) {
+            if (arch != LLM_ARCH_MINICPM5_MOE) {
+                throw std::runtime_error(
+                    "an LES expert layout without a slot bank is currently supported only for minicpm5_moe");
+            }
+            les_check_requires(gctx);
+            pimpl->moe_packed = llama_moe_experts::from_layout(
+                    gguf_get_val_str(gctx, key_layout),
+                    ml.files.empty() ? std::string() : ml.files[0]->path());
+            if (pimpl->moe_packed->expert_count() != (int32_t) hparams.n_expert ||
+                pimpl->moe_packed->expert_used_count() != (int32_t) hparams.n_expert_used) {
+                throw std::runtime_error("LES expert layout counts do not match model metadata");
+            }
+            LLAMA_LOG_INFO("%s: LES experts mapped in place (no --moe-slot-bank): %d layers, %d experts, paged on demand\n",
+                    __func__, pimpl->moe_packed->layer_count(), pimpl->moe_packed->expert_count());
+
+            // The carriers stay in weights_map, so nothing bounds the load-time prefetch by
+            // itself. Bound it at the first carrier: the resident prefix is read eagerly, the
+            // expert bytes page in on demand, which is the point of mapping them in place.
+            for (const auto & name : pimpl->moe_packed->region_names()) {
+                const auto it = ml.weights_map.find(name);
+                if (it != ml.weights_map.end()) {
+                    pimpl->moe_packed_begin = std::min(pimpl->moe_packed_begin, it->second.offs);
+                }
+            }
+        }
     }
 
     if (pimpl->moe_experts) {
@@ -1613,7 +1657,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr, ml.expert_region_offset());
+    // Prefetch up to the first streamed or in-place-mapped expert carrier: the resident prefix
+    // is read eagerly, expert bytes come in on demand.
+    const size_t prefetch_limit = ml.expert_region_offset() != (size_t) -1
+            ? ml.expert_region_offset()
+            : pimpl->moe_packed_begin;
+    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr, prefetch_limit);
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers
@@ -1739,6 +1788,14 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     for (auto & [ctx, buf_map] : ctx_buf_maps) {
         if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
             return false;
+        }
+        // Views onto loaded weights (LES expert families mapped in place): with mmap the
+        // weights get their data in load_all_data, after the buffer was set up, so the views
+        // are initialized here.
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->view_src && t->buffer == nullptr && t->view_src->buffer != nullptr) {
+                ggml_backend_view_init(t);
+            }
         }
     }
 
@@ -2273,6 +2330,20 @@ const llama_moe_experts_entry * llama_model::moe_experts_entry(const char * tens
         name.resize(name.size() - 4);
     }
     return pimpl->moe_experts->find(name.c_str());
+}
+
+const llama_moe_experts_entry * llama_model::moe_packed_entry(const char * tensor_name) const {
+    return pimpl->moe_packed && tensor_name ? pimpl->moe_packed->find(tensor_name) : nullptr;
+}
+
+ggml_tensor * llama_model_base::create_packed_expert_view(llama_model_loader & ml, const LLM_TN_IMPL & tn,
+        const std::initializer_list<int64_t> & ne, const llama_moe_experts_entry & entry) {
+    const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;
+    ggml_tensor * carrier = ml.create_packed_carrier(hparams, buft_list_layer, entry.packed_tensor_name, entry.type, ne);
+    if (ggml_nbytes(carrier) != entry.expert_stride * (size_t) entry.expert_count) {
+        throw std::runtime_error(format("expert carrier '%s' size does not match its layout", entry.packed_tensor_name.c_str()));
+    }
+    return ml.packed_expert_view(carrier, tn.str(), entry.type, ne, entry.offset_in_expert, entry.expert_stride);
 }
 
 float llama_model::get_rope_freq_base (const llama_cparams & cparams, int il) const {

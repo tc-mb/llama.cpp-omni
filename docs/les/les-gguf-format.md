@@ -183,7 +183,8 @@ At load time, before any weights are touched:
 
 1. read `les.moe.requires` and reject the file if a listed capability is unknown;
 2. parse `les.moe.layout` and validate the invariants above;
-3. take each carrier tensor out of `weights_map` and record its `(file, offset)`.
+3. with a slot bank only, take each carrier tensor out of `weights_map` and record its
+   `(file, offset)`. Without a bank the carriers stay in `weights_map` and are mapped in place.
 
 Taking the carrier out of `weights_map` is what makes the layout safe with mmap: the mapping range
 is computed from the tensors that remain, so the mapped window covers the resident prefix only,
@@ -194,10 +195,16 @@ From there the expert runtime sees exactly what it needs: one path per layer, on
 and the three tensor families inside that stride. `finalize_pack` validates those three properties
 and the read path is unchanged.
 
-There is no switch to select this layout. A model either declares `les.moe.layout` or it does not,
-so the only thing a caller sets is `moe_slot_bank`: non-zero for a model that has routed experts,
-zero otherwise. A non-zero bank on a model that declares no layout is rejected rather than being
-loaded as a dense model, which would silently run with garbage expert weights.
+There is no switch to select this layout. A model either declares `les.moe.layout` or it does not.
+`moe_slot_bank` then picks how the expert bytes are reached, on the same file:
+
+- non-zero: the experts stream through the slot bank (preadv, bounded RAM);
+- zero: the carriers stay ordinary weights and are mapped with the file, and each expert family
+  becomes a strided view into its layer's carrier. `--no-mmap` / `--mlock` then apply as for any
+  other model.
+
+A non-zero bank on a model that declares no layout is rejected rather than being loaded as a dense
+model, which would silently run with garbage expert weights.
 
 `llama_moe_experts_geometry_from_file()` exposes the per-layer slot sizes from the header alone, so
 a caller can size an expert cache before committing to a ~15 GiB load.
