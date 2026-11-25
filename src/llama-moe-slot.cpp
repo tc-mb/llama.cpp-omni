@@ -721,6 +721,7 @@ struct llama_moe_slot_runtime::impl {
             // 模型侧每层张量的宽度是 c_il + K（缓存区 + 预读暂存区），**按层不同**。
             // 见 qwen35moe.cpp 与 install_prefetch_into_window 的分区说明。
             int n_dec = 0;
+            int n_dec_pack_ok = 0;
             std::string fail;
             for (size_t il = 0; il < model.layers.size() && fail.empty(); ++il) {
                 auto & state = layers[il];
@@ -758,6 +759,7 @@ struct llama_moe_slot_runtime::impl {
                     finalize_pack(state.dec_bindings, state.dec_pack_order, state.dec_pack_ok,
                                   state.dec_pack_base, state.dec_pack_stride, state.dec_pack_path);
                     n_dec++;
+                    n_dec_pack_ok += state.dec_pack_ok;
                 }
             }
             if (!fail.empty()) {
@@ -772,9 +774,8 @@ struct llama_moe_slot_runtime::impl {
                 }
                 decode_window = 0;
             } else {
-                moe_log("decode-cache: %d 层绑定 decode 张量（每层 %d = cache %d + prefetch %d slot，pack %s）",
-                        n_dec, (int) (decode_window + prefetch_slots), (int) decode_window,
-                        (int) prefetch_slots, layers[0].dec_pack_ok ? "ok" : "off");
+                moe_log("decode-cache: %d 层绑定 decode 张量（基础 cache %d + prefetch %d slot，pack %d/%d）",
+                        n_dec, (int) decode_window, (int) prefetch_slots, n_dec_pack_ok, n_dec);
             }
         }
         sweep_init();
@@ -1132,26 +1133,32 @@ struct llama_moe_slot_runtime::impl {
         {
             const std::vector<int32_t> per_layer_c = model.moe_layer_windows();
             layer_width.assign(layers.size(), 0);
+            std::string dist;
+            size_t moe_index = 0;
             for (size_t il = 0; il < layers.size(); ++il) {
-                const int32_t c_il = il < per_layer_c.size() ? per_layer_c[il] : decode_window;
+                auto & st = layers[il];
+                if (!st.enabled) {
+                    continue;
+                }
+                // Configured widths are indexed by routed-layer ordinal. Runtime state
+                // is indexed by model layer and also contains dense layers.
+                const int32_t c_il = moe_index < per_layer_c.size() ? per_layer_c[moe_index] : decode_window;
                 const int32_t w = c_il + prefetch_slots;
-                layers[il].window_start = 0;
-                layers[il].window_width = w;
+                st.window_start = 0;
+                st.window_width = w;
                 layer_width[il] = w;
                 // Per-layer slot state is sized by the prefill bank; a decode window wider
                 // than the bank (c + K > bank) would index past it in process().
-                auto & st = layers[il];
-                if (st.enabled && (size_t) w > st.slot_to_expert.size()) {
+                if ((size_t) w > st.slot_to_expert.size()) {
                     st.slot_to_expert.resize((size_t) w, kSlotFree);
                     st.slot_age.resize((size_t) w, 0);
                 }
+                if (moe_index < 6) {
+                    dist += format("%zu:%d ", moe_index, (int) w);
+                }
+                ++moe_index;
             }
-            // 打印一下分布，确认按层生效
-            std::string dist;
-            for (size_t il = 0; il < layer_width.size() && il < 6; ++il) {
-                dist += format("%zu:%d ", il, (int) layer_width[il]);
-            }
-            moe_log("decode-cache: 按层宽度 %s（前几层 %s）",
+            moe_log("decode-cache: 按层宽度 %s（前几个 MoE 层 %s）",
                     (getenv("LLAMA_MOE_LAYER_WINDOWS") ? "on" : "off（均匀）"), dist.c_str());
         }
 
