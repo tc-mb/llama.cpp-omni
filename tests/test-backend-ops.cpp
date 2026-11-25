@@ -6785,7 +6785,7 @@ struct test_pad_reflect_1d : public test_case {
         : type(type), ne_a(ne_a), pad_0(pad_0), pad_1(pad_1)  {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * a = ggml_new_tensor(ctx, type, 2, ne_a.data());
+        ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne_a.data());
         ggml_set_name(a, "a");
 
         ggml_tensor * out = ggml_pad_reflect_1d(ctx, a, pad_0, pad_1);
@@ -8569,6 +8569,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     test_cases.emplace_back(new test_conv_transpose_1d());
+    // Token2wav ISTFT overlap-add geometry: one output channel, 16 taps, hop 4.
+    test_cases.emplace_back(new test_conv_transpose_1d({33,16,1,1}, {16,1,16,1}, 4, 0, 1));
     test_cases.emplace_back(new test_conv_transpose_1d({3,2,1,1}, {2,3,2,1}, 3, 0, 1));
     test_cases.emplace_back(new test_conv_transpose_1d({3,2,1,1}, {2,3,2,1}, 2, 0, 1));
     test_cases.emplace_back(new test_conv_transpose_1d({3,2,1,1}, {2,3,2,1}, 1, 0, 1));
@@ -9534,8 +9536,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_pad(GGML_TYPE_F32, {4, 70000, 1, 1}, 1, 1, true));
     test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {4, 2, 300, 300}, 1, 1, 0, 0, 0, 0, 0, 0, 0, false));
 
+    for (ggml_op_pool pool : {GGML_OP_POOL_AVG, GGML_OP_POOL_MAX}) {
+        test_cases.emplace_back(new test_pool1d(pool, GGML_TYPE_F32, { 5, 2, 1, 3 }, 1, 1, 2));
+        test_cases.emplace_back(new test_pool1d(pool, GGML_TYPE_F32, { 11, 1, 3, 2 }, 2, 3, 0));
+    }
+    test_cases.emplace_back(new test_pool1d(GGML_OP_POOL_AVG, GGML_TYPE_F32, { 32, 7, 1, 1 }, 5, 5, 0));
+    // Cross the Vulkan linear dispatch split, including the final partial workgroup.
+    test_cases.emplace_back(new test_pool1d(GGML_OP_POOL_AVG, GGML_TYPE_F32, { 65, 35, 117, 1 }, 1, 1, 0));
+    test_cases.emplace_back(new test_pool1d(GGML_OP_POOL_AVG, GGML_TYPE_F16, { 7, 3, 2, 2 }, 3, 2, 1));
+
     test_cases.emplace_back(new test_pad_reflect_1d());
     test_cases.emplace_back(new test_pad_reflect_1d(GGML_TYPE_F32, {3000, 384, 4, 1}));
+    test_cases.emplace_back(new test_pad_reflect_1d(GGML_TYPE_F32, { 7, 5, 2, 2 }, 6, 3));
+    test_cases.emplace_back(new test_pad_reflect_1d(GGML_TYPE_F32, { 1, 3, 1, 2 }, 0, 0));
     test_cases.emplace_back(new test_roll());
     test_cases.emplace_back(new test_arange());
     test_cases.emplace_back(new test_arange(GGML_TYPE_F32, 0.0f, 1048576.0f, 1.0f));

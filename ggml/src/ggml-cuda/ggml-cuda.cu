@@ -37,6 +37,7 @@
 #include "ggml-cuda/opt-step-sgd.cuh"
 #include "ggml-cuda/out-prod.cuh"
 #include "ggml-cuda/pad.cuh"
+#include "ggml-cuda/pool1d.cuh"
 #include "ggml-cuda/pool2d.cuh"
 #include "ggml-cuda/quantize.cuh"
 #include "ggml-cuda/rope.cuh"
@@ -3060,6 +3061,11 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 ggml_cuda_op_conv_transpose_1d(ctx, dst);
             }
             break;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        case GGML_OP_POOL_1D:
+            ggml_cuda_op_pool1d(ctx, dst);
+            break;
+#endif
         case GGML_OP_POOL_2D:
             ggml_cuda_op_pool2d(ctx, dst);
             break;
@@ -5401,6 +5407,17 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_ROPE_BACK: {
             return op->src[0]->nb[0] == ggml_type_size(op->src[0]->type) && ggml_is_contiguous_2(op->src[0]);
         }
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        case GGML_OP_POOL_1D: {
+            const ggml_tensor * src = op->src[0];
+            const int32_t kind = op->op_params[0], k = op->op_params[1], s = op->op_params[2], p = op->op_params[3];
+            return src->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 && src->ne[0] > 0 &&
+                ggml_is_contiguous(src) && ggml_is_contiguous(op) &&
+                (kind == GGML_OP_POOL_AVG || kind == GGML_OP_POOL_MAX) && k > 0 && s > 0 && p >= 0 &&
+                ggml_nelements(src) <= INT_MAX && ggml_nelements(op) <= INT_MAX - CUDA_POOL1D_BLOCK_SIZE &&
+                (op->ne[0] - 1)*s + k <= INT_MAX;
+        }
+#endif
         case GGML_OP_IM2COL:
         case GGML_OP_IM2COL_3D:
         case GGML_OP_CONV_2D:
