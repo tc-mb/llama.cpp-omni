@@ -2330,12 +2330,16 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 n_tasks = n_threads;
             } break;
         case GGML_OP_GET_ROWS:
-        case GGML_OP_SET_ROWS:
             {
                 // FIXME: get_rows can use additional threads, but the cost of launching additional threads
                 // decreases performance with GPU offloading
                 //n_tasks = n_threads;
                 n_tasks = 1;
+            } break;
+        case GGML_OP_SET_ROWS:
+            {
+                // Conversion needs scratch for each worker that visits the node.
+                n_tasks = node->src[0]->type == GGML_TYPE_F16 && node->type != GGML_TYPE_F16 ? n_threads : 1;
             } break;
         case GGML_OP_SCALE:
         case GGML_OP_SET:
@@ -2838,6 +2842,12 @@ struct ggml_cplan ggml_graph_plan(
                 case GGML_OP_COUNT_EQUAL:
                     {
                         cur = ggml_type_size(node->type)*n_tasks;
+                    } break;
+                case GGML_OP_SET_ROWS:
+                    {
+                        if (node->src[0]->type == GGML_TYPE_F16 && node->type != GGML_TYPE_F16) {
+                            cur = sizeof(float) * node->src[0]->ne[0] * n_tasks;
+                        }
                     } break;
                 case GGML_OP_MUL_MAT:
                     {
