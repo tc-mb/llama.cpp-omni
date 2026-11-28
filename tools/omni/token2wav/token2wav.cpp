@@ -63,6 +63,44 @@ bool Token2WavSession::init_from_prompt_bundle(const std::string & encoder_gguf,
     return true;
 }
 
+bool Token2WavSession::set_prompt_bundle(const std::string & prompt_bundle_dir,
+                                         int                 n_timesteps,
+                                         float               temperature) {
+    Token2Mel::PromptBundle prompt;
+    if (!Token2Mel::load_prompt_bundle_dir(prompt_bundle_dir, prompt)) {
+        std::fprintf(stderr, "Token2WavSession.set_prompt_bundle: invalid PromptBundle: %s\n",
+                     prompt_bundle_dir.c_str());
+        return false;
+    }
+
+    // The bundle is fully validated before this call. Stage one invokes this
+    // method during session initialization, before the TTS worker can observe
+    // the mutable stream state; a setup failure therefore aborts that session.
+    if (!t2w.start_stream_with_prompt(prompt, n_timesteps, temperature)) {
+        std::fprintf(stderr, "Token2WavSession.set_prompt_bundle: setup_cache failed: %s\n",
+                     prompt_bundle_dir.c_str());
+        return false;
+    }
+
+    pending_.clear();
+    wave_tmp_.clear();
+    return true;
+}
+
+bool Token2WavSession::reset_to_prompt_cache_gguf(const std::string & prompt_cache_gguf_path,
+                                                  int                 n_timesteps,
+                                                  float               temperature) {
+    if (!t2w.start_stream_with_prompt_cache_gguf(prompt_cache_gguf_path, n_timesteps, temperature)) {
+        std::fprintf(stderr, "Token2WavSession.reset_to_prompt_cache_gguf: failed to load cache: %s\n",
+                     prompt_cache_gguf_path.c_str());
+        return false;
+    }
+
+    pending_.clear();
+    wave_tmp_.clear();
+    return true;
+}
+
 bool Token2WavSession::feed_window(const int32_t *      tokens,
                                    int64_t              n_tokens,
                                    bool                 is_final,
