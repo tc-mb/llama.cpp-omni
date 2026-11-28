@@ -97,6 +97,10 @@ struct T2WThreadInfo {
     std::chrono::steady_clock::time_point start;
     std::chrono::steady_clock::time_point end;
 
+    // Keep drain checks false while either stage is executing or delivering audio.
+    std::atomic<bool> cpp_processing{false};
+    std::atomic<size_t> pending_vocoder{0};
+
     T2WThreadInfo(int maxQueueSize) : MAX_QUEUE_SIZE(maxQueueSize) {}
 };
 
