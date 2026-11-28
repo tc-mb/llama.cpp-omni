@@ -149,12 +149,14 @@ struct lookahead_expert_prefetch {
     int32_t job_bank = -1;
     int32_t job_n = 0;
     int32_t job_expert[kMaxDepth] = {};
+    std::vector<int32_t> job_keep;
     int32_t arm_layer = -1;
     int32_t arm_bank = -1;
     int32_t arm_n = 0;
     int32_t arm_expert[kMaxDepth] = {};
 
-    std::function<void(int, int, int)> read_fn;
+    using read_expert_fn = std::function<bool(int, int, int, const std::vector<int32_t> &)>;
+    read_expert_fn read_fn;
     // 窗口模式下 slot 由窗口 LRU 决定，不由乒乓区算出来 —— 此时传给 read_fn 的
     // slot 用 -1 作哨兵（表示「你按窗口自己挑」）。见 impl 的那个 lambda。
     bool window_mode = false;
@@ -176,7 +178,7 @@ struct lookahead_expert_prefetch {
     std::atomic<uint64_t> n_pred_bytes{0};    // worker 实际读进去的字节
     bool ready = false;
 
-    void init(int32_t slots, int32_t experts, int32_t last_moe, std::function<void(int, int, int)> fn) {
+    void init(int32_t slots, int32_t experts, int32_t last_moe, read_expert_fn fn) {
         n_slots = slots;
         n_expert = experts;
         last_moe_layer = last_moe;
@@ -350,8 +352,9 @@ struct lookahead_expert_prefetch {
         arm_n = 0;
     }
 
-    void arm(int32_t layer_next, const std::vector<int32_t> & pred) {
-        if (!enabled || layer_next < 1 || layer_next > last_moe_layer || pred.empty()) {
+    void arm(int32_t layer_next, const std::vector<int32_t> & candidates,
+             const std::vector<int32_t> & keep) {
+        if (!enabled || layer_next < 1 || layer_next > last_moe_layer || candidates.empty()) {
             return;
         }
 
@@ -373,7 +376,7 @@ struct lookahead_expert_prefetch {
         job_bank = layer_next & 1;
         job_n = 0;
         std::vector<uint8_t> seen((size_t) n_expert, 0);
-        for (int32_t e : pred) {
+        for (int32_t e : candidates) {
             if (job_n >= read_n) {   // 只读 read_n 个（<= depth）；read_n==0 已在上面返回
                 break;
             }
@@ -389,6 +392,9 @@ struct lookahead_expert_prefetch {
         for (int k = job_n; k < kMaxDepth; ++k) {
             job_expert[k] = -1;
         }
+        if (window_mode) {
+            job_keep = keep;
+        }
         job_pending = true;
         n_armed.fetch_add(1, std::memory_order_relaxed);
         cv_go.notify_one();
@@ -400,6 +406,7 @@ struct lookahead_expert_prefetch {
             int32_t bank = -1;
             int32_t n = 0;
             int32_t ex[kMaxDepth];
+            std::vector<int32_t> keep;
             {
                 std::unique_lock<std::mutex> lk(mtx);
                 cv_go.wait(lk, [this]() { return quit || job_pending; });
@@ -412,6 +419,7 @@ struct lookahead_expert_prefetch {
                 bank = job_bank;
                 n = job_n;
                 memcpy(ex, job_expert, sizeof(ex));
+                keep = std::move(job_keep);
             }
             const int32_t base = bank_base(bank);
             const int n_th = std::max(1, std::min(les_io_threads(), n));
@@ -429,9 +437,10 @@ struct lookahead_expert_prefetch {
                         // 窗口模式传 -1：让 impl 按目标层的窗口 LRU 挑 slot。
                         // 预读写进**目标层自己的窗口**，而不是尾部乒乓区 ——
                         // 这样预读成果直接变成那层的缓存命中，不需要再搬一次。
-                        read_fn(layer, ex[k], window_mode ? -1 : (base + k));
-                        n_pred_read.fetch_add(1, std::memory_order_relaxed);
-                        n_pred_published.fetch_add(1, std::memory_order_relaxed);
+                        if (read_fn(layer, ex[k], window_mode ? -1 : (base + k), keep)) {
+                            n_pred_read.fetch_add(1, std::memory_order_relaxed);
+                            n_pred_published.fetch_add(1, std::memory_order_relaxed);
+                        }
                     } catch (...) {
                         ex[k] = -1;
                     }
@@ -698,12 +707,12 @@ struct llama_moe_slot_runtime::impl {
             park_window_enabled() ? "on" : "off");
 
         lookahead.init((int32_t) n_slots, n_expert, last_moe_layer,
-            [this](int layer, int expert, int slot) {
+            [this](int layer, int expert, int slot, const std::vector<int32_t> & keep) {
                 if (slot < 0) {
-                    install_prefetch_into_window(layer, expert);
-                } else {
-                    read_expert_directv(layers[(size_t) layer], expert, slot);
+                    return install_prefetch_into_window(layer, expert, keep);
                 }
+                read_expert_directv(layers[(size_t) layer], expert, slot);
+                return true;
             });
         resolve_decode_window();
         {
@@ -823,7 +832,8 @@ struct llama_moe_slot_runtime::impl {
     ///   false → 在**预读区**里挑（预读用；统一模式下就是整层窗口）
     ///
     /// 返回 -1 = 该专家已在窗口里，或无处可放。
-    int32_t claim_slot_in_window(layer_state & st, int32_t expert, bool cache_only) {
+    int32_t claim_slot_in_window(layer_state & st, int32_t expert, bool cache_only,
+                                 const std::vector<int32_t> * keep = nullptr) {
         if (decode_window <= 0 || expert < 0 || expert >= n_expert) {
             return -1;
         }
@@ -848,7 +858,12 @@ struct llama_moe_slot_runtime::impl {
         if (slot < 0) {
             uint64_t oldest = UINT64_MAX;
             for (int32_t cand = from; cand < hi; ++cand) {
-                if (st.slot_to_expert[(size_t) cand] == kSlotPending) {
+                const int32_t resident = st.slot_to_expert[(size_t) cand];
+                if (resident == kSlotPending) {
+                    continue;
+                }
+                // A speculative read may only evict an unprotected resident.
+                if (keep && std::find(keep->begin(), keep->end(), resident) != keep->end()) {
                     continue;
                 }
                 if (st.slot_age[(size_t) cand] < oldest) {
@@ -883,13 +898,13 @@ struct llama_moe_slot_runtime::impl {
         return true;
     }
 
-    void install_prefetch_into_window(int layer, int32_t expert) {
+    bool install_prefetch_into_window(int layer, int32_t expert, const std::vector<int32_t> & keep) {
         if (layer < 0 || layer >= (int) layers.size() || decode_window <= 0 || prefetch_slots <= 0) {
-            return;
+            return false;
         }
         auto & st = layers[(size_t) layer];
         if (!st.enabled || expert < 0 || expert >= n_expert) {
-            return;
+            return false;
         }
 
         // 只在**预读暂存区** [window_start + c, window_start + c + K) 里分配。
@@ -901,10 +916,10 @@ struct llama_moe_slot_runtime::impl {
         int32_t slot = -1;
         {
             std::lock_guard<std::mutex> lock(st.mutex);
-            slot = claim_slot_in_window(st, expert, /*cache_only=*/false);
+            slot = claim_slot_in_window(st, expert, /*cache_only=*/false, &keep);
         }
         if (slot < 0) {
-            return;
+            return false;
         }
 
         // 锁外读盘：这一步不再阻塞主线程。
@@ -912,6 +927,7 @@ struct llama_moe_slot_runtime::impl {
 
         std::lock_guard<std::mutex> lock(st.mutex);
         publish_slot_in_window(st, expert, slot);
+        return true;
     }
 
     /// ── 缓存预热（LLAMA_MOE_PREWARM）───────────────────────────────────
@@ -1637,7 +1653,8 @@ struct llama_moe_slot_runtime::impl {
         }
         lookahead.n_pred_cached.fetch_add(pred.size() - need_read.size(), std::memory_order_relaxed);
         if (!need_read.empty()) {
-            lookahead.arm(target, need_read);
+            // Cached predictions need no read, but still need eviction protection.
+            lookahead.arm(target, need_read, pred);
         }
         // 记下「给层 target 的预测」，供 target 层的扫描记录用。
         if (sweep_fp && (size_t) target < sweep_pred.size()) {
