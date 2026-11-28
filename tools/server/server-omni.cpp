@@ -9,7 +9,10 @@
 #include "sampling.h"
 #include "session.h"
 #include "ws_handler.h"
+#include "utf8_stream.h"
 
+#include <atomic>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <queue>
@@ -48,8 +51,11 @@ static void res_error(httplib::Response & res, const json & err) {
     res.set_content(err.dump(), "application/json");
 }
 
+// This runs inside cpp-httplib's content provider, where an exception from
+// dump() is not caught and terminates the process. Replace invalid UTF-8
+// instead of throwing; callers already pass complete code points.
 static bool server_sent_event(httplib::DataSink & sink, const json & ev) {
-    std::string str = "data: " + ev.dump() + "\n\n";
+    std::string str = "data: " + ev.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
     return sink.write(str.data(), str.size());
 }
 
@@ -309,8 +315,18 @@ int main(int argc, char ** argv) {
         }
 
         // SSE streaming
+        // cpp-httplib calls ContentProviderWithoutLength in a loop until sink.done()
+        // or the provider returns false. Returning true after a non-empty write WITHOUT
+        // sink.done() re-enters this lambda and starts another stream_decode (burns
+        // force_listen 1/2/3 in ~1ms, then runaway SPEAK).
+        auto decode_once = std::make_shared<std::atomic<bool>>(false);
         res.set_chunked_content_provider("text/event-stream",
-            [&](size_t, httplib::DataSink & sink) -> bool {
+            [&, debug_dir, round_idx, decode_once](size_t, httplib::DataSink & sink) -> bool {
+                if (decode_once->exchange(true)) {
+                    sink.done();
+                    return false;
+                }
+
                 // reset state
                 {
                     std::lock_guard<std::mutex> lock(state.octx->text_mtx);
@@ -324,6 +340,10 @@ int main(int argc, char ** argv) {
                     std::lock_guard<std::mutex> lock(state.octx_mutex);
                     (void) stream_decode(state.octx, dd, ri);
                 }, debug_dir, round_idx);
+
+                // a token piece can end mid-character: hold the tail until the
+                // next piece completes it (an unfinished one at the end is dropped)
+                std::string utf8_pending;
 
                 // poll text queue
                 while (true) {
@@ -343,11 +363,17 @@ int main(int argc, char ** argv) {
                         } else if (frag == "__END_OF_TURN__") {
                             ev = {{"content", ""}, {"stop", true}, {"is_listen", false}, {"end_of_turn", true}};
                         } else {
-                            ev = {{"content", frag}, {"stop", false}, {"is_listen", false}, {"end_of_turn", false}};
+                            const std::string text = sanitize_utf8_stream(utf8_pending, frag);
+                            if (text.empty()) {
+                                lk.lock();
+                                continue;
+                            }
+                            ev = {{"content", text}, {"stop", false}, {"is_listen", false}, {"end_of_turn", false}};
                         }
 
                         if (!server_sent_event(sink, ev)) {
                             if (worker.joinable()) worker.join();
+                            sink.done();
                             return false;
                         }
                         lk.lock();
@@ -358,10 +384,10 @@ int main(int argc, char ** argv) {
 
                 if (worker.joinable()) worker.join();
 
-                // send done
                 static const std::string ev_done = "data: [DONE]\n\n";
                 sink.write(ev_done.data(), ev_done.size());
-                return true;
+                sink.done();
+                return false;
             });
     });
 
