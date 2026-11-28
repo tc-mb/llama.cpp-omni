@@ -801,11 +801,18 @@ static bool is_op_unsupported_case(const ggml_tensor * op) {
     switch (op->op) {
     case GGML_OP_GET_ROWS:
     case GGML_OP_SET_ROWS: {
+        if (op->op == GGML_OP_SET_ROWS && op->src[0]->type != GGML_TYPE_F32) {
+            return true;
+        }
         if (op->ne[3] != 1) {
             return true;
         }
         break;
     }
+    case GGML_OP_RMS_NORM:
+        return op->src[0]->type == GGML_TYPE_BF16;
+    case GGML_OP_UNARY:
+        return ggml_get_unary_op(op) == GGML_UNARY_OP_SILU && op->src[0]->type == GGML_TYPE_BF16;
     case GGML_OP_ADD:
     case GGML_OP_MUL: {
         if (op->src[1]->op == GGML_OP_PERMUTE) {

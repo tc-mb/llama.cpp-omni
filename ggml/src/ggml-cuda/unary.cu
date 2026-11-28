@@ -124,7 +124,7 @@ static __global__ void unary_op_kernel(const T * x, T * dst, const int k) {
     }
 
     ggml_cuda_pdl_sync();
-    dst[i] = (T)op((float)x[i]);
+    dst[i] = ggml_cuda_cast<T>(op(ggml_cuda_cast<float>(x[i])));
 }
 
 template <float (*op)(float), typename T>
@@ -158,7 +158,7 @@ static __global__ void unary_op_kernel_strided(const T * x, T * dst, const int64
     const size_t dx = i0*strides.dst[0] + i1*strides.dst[1] + i2*strides.dst[2] + i3*strides.dst[3];
 
     ggml_cuda_pdl_sync();
-    dst[dx] = (T)op((float)x[sx]);
+    dst[dx] = ggml_cuda_cast<T>(op(ggml_cuda_cast<float>(x[sx])));
 }
 
 template <float (*op)(float), typename T>
@@ -236,6 +236,19 @@ void ggml_cuda_op_gelu_quick(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
 }
 
 void ggml_cuda_op_silu(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    const ggml_tensor * src0 = dst->src[0];
+    if (src0->type == GGML_TYPE_BF16) {
+        GGML_ASSERT(dst->type == GGML_TYPE_BF16);
+        cudaStream_t stream = ctx.stream();
+        if (ggml_is_contiguous(src0) && ggml_is_contiguous(dst)) {
+            unary_cuda<op_silu>((const nv_bfloat16 *)src0->data, (nv_bfloat16 *)dst->data, ggml_nelements(src0), stream);
+        } else {
+            unary_cuda_strided<op_silu, nv_bfloat16>(src0, dst, stream);
+        }
+        return;
+    }
+#endif
     ggml_cuda_op_unary<op_silu>(ctx, dst);
 }
 

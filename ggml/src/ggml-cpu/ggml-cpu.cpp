@@ -439,8 +439,17 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
     }
 
     switch (op->op) {
-        case GGML_OP_CPY:
+        case GGML_OP_RMS_NORM:
+            return (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_BF16) &&
+                src0->type == op->type && src0->nb[0] == ggml_type_size(src0->type) && op->nb[0] == src0->nb[0];
+        case GGML_OP_RMS_NORM_BACK:
+            return src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
         case GGML_OP_SET_ROWS:
+            return (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16) &&
+                (src1->type == GGML_TYPE_I32 || src1->type == GGML_TYPE_I64) &&
+                ((src0->type == GGML_TYPE_F16 && op->type == GGML_TYPE_F16) ||
+                 ggml_get_type_traits_cpu(op->type)->from_float != nullptr);
+        case GGML_OP_CPY:
             return
                 op->type != GGML_TYPE_IQ3_XXS &&
                 op->type != GGML_TYPE_IQ3_S   &&
