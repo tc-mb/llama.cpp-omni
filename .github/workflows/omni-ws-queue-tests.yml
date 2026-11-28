@@ -1,0 +1,21 @@
+name: Omni WebSocket queue
+
+on:
+  push:
+    branches: [master]
+    paths: ['tools/server/ws_handler.cpp', 'tools/server/tests/test_ws_queue.py', '.github/workflows/omni-ws-queue-tests.yml']
+  pull_request:
+    paths: ['tools/server/ws_handler.cpp', 'tools/server/tests/test_ws_queue.py', '.github/workflows/omni-ws-queue-tests.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  fragment-drain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - run: python -m unittest discover -s tools/server/tests -p 'test_ws_queue.py' -v
